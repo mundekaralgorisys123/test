@@ -1,0 +1,103 @@
+{
+    "websites": [
+        {
+            "url": "https://www.jared.com/",
+            "title": "jared",
+            "pagination_pattern": "?loadMore=",
+            "max_pages": 1,
+            "start_page": 1,
+            "selectors": {
+                "product_title": ".product-title",
+                "product_price": ".product-price",
+                "product_image": ".product-image"
+            }
+        },
+        {
+            "url": "https://www.ernestjones.co.uk/",
+            "title": "ernestjones",
+            "pagination_pattern": "?loadMore=",
+            "max_pages": 1,
+            "start_page": 1,
+            "selectors": {
+                "product_title": "h2.product-name",
+                "product_price": "span.price",
+                "product_image": "img.product-image"
+            }
+        },
+        {
+            "url": "https://www.hsamuel.co.uk/",
+            "title": "hsamuel",
+            "pagination_pattern": "?loadMore=",
+            "max_pages": 1,
+            "start_page": 1,
+            "selectors": {
+                "product_title": "h2.product-name",
+                "product_price": "span.price",
+                "product_image": "img.product-image"
+            }
+        },
+        {
+            "url": "https://www.gabrielny.com/",
+            "title": "gabrielny",
+            "pagination_pattern": "?p=",
+            "max_pages": 1,
+            "start_page": 1,
+            "selectors": {
+                "product_title": "h2.product-name",
+                "product_price": "span.price",
+                "product_image": "img.product-image"
+            }
+        },
+        {
+            "url": "https://www.tiffany.co.in/",
+            "pagination_pattern": "&sort=sort_order&order=desc&page=",
+            "title": "tiffany",
+            "max_pages": 1,
+            "start_page": 1,
+            "selectors": {
+                "product_title": "h2.product-name",
+                "product_price": "span.price",
+                "product_image": "img.product-image"
+            }
+        },
+        {
+            "url": "https://www.shaneco.com/",
+            "pagination_pattern": "?sort=relevant&page=",
+            "title": "shaneco",
+            "max_pages": 1,
+            "start_page": 1,
+            "selectors": {
+                "product_title": "h2.product-name",
+                "product_price": "span.price",
+                "product_image": "img.product-image"
+            }
+        }
+
+        ,
+        {
+            "url": "https://www.fhinds.co.uk/",
+            "title": "fhinds",
+            "pagination_pattern": "?p=",
+            "max_pages": 1,
+            "start_page": 1,
+            "selectors": {
+                "product_title": "h2.product-name",
+                "product_price": "span.price",
+                "product_image": "img.product-image"
+            }
+        },
+        {
+            "url": "https://www.kay.com/",
+            "title": "Kay",
+            "pagination_pattern": "?loadMore=",
+            "max_pages": 1,
+            "start_page": 1,
+            "selectors": {
+                "product_title": "h2.product-name",
+                "product_price": "span.price",
+                "product_image": "img.product-image"
+            }
+        }
+    ]
+}
+
