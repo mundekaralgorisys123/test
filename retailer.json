@@ -877,6 +877,14 @@
       "region": "EU",
       "type": "brand",
       "available": "available for scrapping"
+    },
+    {
+      "id": "zamels",
+      "name": "zamels",
+      "url": "https://www.zamels.com.au/",
+      "region": "AU",
+      "type": "brand",
+      "available": "available for scrapping"
     }
   ]
 }
