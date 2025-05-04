@@ -9,21 +9,27 @@ from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError, Error
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
-from flask import Flask
 from dotenv import load_dotenv
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db, create_table
 from limit_checker import update_product_count
 import httpx
-from io import BytesIO
+import traceback
+from typing import List, Tuple
+from urllib.parse import urlparse, urlunparse
 
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
 
+
+PROXY_SERVER = os.getenv("PROXY_SERVER")
+PROXY_USERNAME = os.getenv("PROXY_USERNAME")
+PROXY_PASSWORD = os.getenv("PROXY_PASSWORD")
+
+
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
-
 
 def modify_image_url(image_url):
     """Modify the image URL to replace any _### (e.g., _180, _260, _400, etc.) with _1200 while keeping query parameters."""
@@ -90,19 +96,194 @@ async def scroll_and_wait(page, max_attempts=10, wait_time=1):
     logging.info("Finished scrolling.")
     return True
 
-async def safe_goto_and_wait(page, url, retries=3):
+# async def safe_goto_and_wait(page, url, retries=3):
+#     for attempt in range(retries):
+#         try:
+#             print(f"[Attempt {attempt + 1}] Navigating to: {url}")
+#             await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
+#             product_cards = await page.wait_for_selector(".ss__has-results", timeout=15000)
+#             if product_cards:
+#                 print("[Success] Product cards loaded.")
+#                 return True
+#         except Exception as e:
+#             print(f"[Retry {attempt + 1}] Error: {e}")
+#             await asyncio.sleep(2)
+#     raise Exception(f"[Error] Failed to load product cards on {url} after {retries} attempts.")
+
+
+########################################  safe_goto_and_wait ####################################################################
+
+
+async def safe_goto_and_wait(page, url,isbri_data, retries=2):
     for attempt in range(retries):
         try:
             print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-            product_cards = await page.wait_for_selector(".ss__has-results", timeout=15000)
+            
+            if isbri_data:
+                await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
+            else:
+                await page.goto(url, wait_until="domcontentloaded", timeout=180_000)
+
+            # Wait for the selector with a longer timeout
+            product_cards = await page.wait_for_selector(".ss__has-results", state="attached", timeout=30000)
+
+            # Optionally validate at least 1 is visible (Playwright already does this)
             if product_cards:
                 print("[Success] Product cards loaded.")
+                return
+        except Error as e:
+            logging.error(f"Error navigating to {url} on attempt {attempt + 1}: {e}")
+            if attempt < retries - 1:
+                logging.info("Retrying after waiting a bit...")
+                random_delay(1, 3)  # Add a delay before retrying
+            else:
+                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
+                raise
+        except TimeoutError as e:
+            logging.warning(f"TimeoutError on attempt {attempt + 1} navigating to {url}: {e}")
+            if attempt < retries - 1:
+                logging.info("Retrying after waiting a bit...")
+                random_delay(1, 3)  # Add a delay before retrying
+            else:
+                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
+                raise
+
+
+########################################  get browser with proxy ####################################################################
+      
+
+async def get_browser_with_proxy_strategy(p, url: str):
+    """
+    Dynamically checks robots.txt and selects proxy accordingly
+    Always uses proxies - never scrapes directly
+    """
+    parsed_url = httpx.URL(url)
+    base_url = f"{parsed_url.scheme}://{parsed_url.host}"
+    
+    # 1. Fetch and parse robots.txt
+    disallowed_patterns = await get_robots_txt_rules(base_url)
+    
+    # 2. Check if URL matches any disallowed pattern
+    is_disallowed = check_url_against_rules(str(parsed_url), disallowed_patterns)
+    
+    # 3. Try proxies in order (bri-data first if allowed, oxylabs if disallowed)
+    proxies_to_try = [
+        PROXY_URL if not is_disallowed else {
+            "server": PROXY_SERVER,
+            "username": PROXY_USERNAME,
+            "password": PROXY_PASSWORD
+        },
+        {  # Fallback to the other proxy
+            "server": PROXY_SERVER,
+            "username": PROXY_USERNAME,
+            "password": PROXY_PASSWORD
+        } if not is_disallowed else PROXY_URL
+    ]
+
+    last_error = None
+    for proxy_config in proxies_to_try:
+        browser = None
+        try:
+            isbri_data = False
+            if proxy_config == PROXY_URL:
+                logging.info("Attempting with bri-data proxy (allowed by robots.txt)")
+                browser = await p.chromium.connect_over_cdp(PROXY_URL)
+                isbri_data = True
+            else:
+                logging.info("Attempting with oxylabs proxy (required by robots.txt)")
+                browser = await p.chromium.launch(
+                    proxy=proxy_config,
+                    headless=True,
+                    args=[
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-web-security'
+                    ]
+                )
+
+            context = await browser.new_context()
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                })
+            """)
+            page = await context.new_page()
+            
+            await safe_goto_and_wait(page, url,isbri_data)
+            return browser, page
+
+        except Exception as e:
+            last_error = e
+            error_trace = traceback.format_exc()
+            logging.error(f"Proxy attempt failed:\n{error_trace}")
+            if browser:
+                await browser.close()
+            continue
+
+    error_msg = (f"Failed to load {url} using all proxy options. "
+                f"Last error: {str(last_error)}\n"
+                f"URL may be disallowed by robots.txt or proxies failed.")
+    logging.error(error_msg)
+    raise RuntimeError(error_msg)
+
+
+
+
+async def get_robots_txt_rules(base_url: str) -> List[str]:
+    """Dynamically fetch and parse robots.txt rules"""
+    robots_url = f"{base_url}/robots.txt"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(robots_url, timeout=10)
+            if resp.status_code == 200:
+                return [
+                    line.split(":", 1)[1].strip()
+                    for line in resp.text.splitlines()
+                    if line.lower().startswith("disallow:")
+                ]
+    except Exception as e:
+        logging.warning(f"Couldn't fetch robots.txt: {e}")
+    return []
+
+
+def check_url_against_rules(url: str, disallowed_patterns: List[str]) -> bool:
+    """Check if URL matches any robots.txt disallowed pattern"""
+    for pattern in disallowed_patterns:
+        try:
+            # Handle wildcard patterns
+            if "*" in pattern:
+                regex_pattern = pattern.replace("*", ".*")
+                if re.search(regex_pattern, url):
+                    return True
+            # Handle path patterns
+            elif url.startswith(f"{pattern}"):
+                return True
+            # Handle query parameters
+            elif ("?" in url) and any(
+                f"{param}=" in url 
+                for param in pattern.split("=")[0].split("*")[-1:]
+                if "=" in pattern
+            ):
                 return True
         except Exception as e:
-            print(f"[Retry {attempt + 1}] Error: {e}")
-            await asyncio.sleep(2)
-    raise Exception(f"[Error] Failed to load product cards on {url} after {retries} attempts.")
+            logging.warning(f"Error checking pattern {pattern}: {e}")
+    return False
+
+
+def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    parsed = urlparse(base_url)
+    base = parsed._replace(query='', fragment='')  # Remove existing query/fragment temporarily
+    page_part = f"?page={page_count}" if page_count > 1 else ""
+    
+    # Rebuild base URL
+    url_with_page = urlunparse(base) + page_part
+    
+    # Add back fragment (filter)
+    if parsed.fragment:
+        url_with_page += f"#{parsed.fragment}"
+    
+    return url_with_page
+
+
 
 async def handle_bevilles(url, max_pages):
     """Async version of Bevilles scraper"""
@@ -138,19 +319,13 @@ async def handle_bevilles(url, max_pages):
         browser = None
         page = None
         
-        if page_count>1 :
-            current_url = url + "?page=" + str(page_count)
+        current_url = build_url_with_loadmore(url, page_count)
 
         logging.info(f"Navigating to {current_url}")
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(120000)  # 2 minute timeout
-
-                if not await safe_goto_and_wait(page, current_url):
-                    break
+                browser, page = await get_browser_with_proxy_strategy(p, current_url)
+                log_event(f"Successfully loaded: {current_url}")
 
                 await scroll_and_wait(page, max_attempts=8)
 
@@ -177,6 +352,11 @@ async def handle_bevilles(url, max_pages):
                             image_url = product_urls[0] if product_urls else "N/A"
                         else:
                             image_url = "N/A"
+                            
+                            
+                        if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                            print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                            continue         
 
                         # Extract Kt
                         gold_type_pattern = r"\b\d{1,2}K\s+\w+(?:\s+\w+)?\b"

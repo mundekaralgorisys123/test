@@ -10,18 +10,15 @@ from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError, Error
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image
-from flask import Flask
 from PIL import Image as PILImage
-import requests
-import concurrent.futures
 from utils import get_public_ip, log_event, sanitize_filename
 from dotenv import load_dotenv
 from database import insert_into_db
 from limit_checker import update_product_count
-import aiohttp
 from io import BytesIO
 from openpyxl.drawing.image import Image as XLImage
 import httpx
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 # Load environment variables from .env file
 import traceback
 from typing import List, Tuple
@@ -37,7 +34,7 @@ IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
 
 async def download_and_resize_image(session, image_url):
     try:
-        async with session.get(modify_image_url(image_url), timeout=10) as response:
+        async with session.get((image_url), timeout=10) as response:
             if response.status != 200:
                 return None
             content = await response.read()
@@ -50,34 +47,21 @@ async def download_and_resize_image(session, image_url):
         logging.warning(f"Error downloading/resizing image: {e}")
         return None
 
-def modify_image_url(image_url):
-    """Modify the image URL to replace '_260' with '_1200' while keeping query parameters."""
-    if not image_url or image_url == "N/A":
-        return image_url
 
-    # Extract and preserve query parameters
-    query_params = ""
-    if "?" in image_url:
-        image_url, query_params = image_url.split("?", 1)
-        query_params = f"?{query_params}"
 
-    # Replace '_260' with '_1200' while keeping the rest of the URL intact
-    modified_url = re.sub(r'(_260)(?=\.\w+$)', '_1200', image_url)
-
-    return modified_url + query_params  # Append query parameters if they exist
-
+# Async image downloader
 async def download_image_async(image_url, product_name, timestamp, image_folder, unique_id, retries=3):
     if not image_url or image_url == "N/A":
         return "N/A"
 
     image_filename = f"{unique_id}_{timestamp}.jpg"
     image_full_path = os.path.join(image_folder, image_filename)
-    modified_url = modify_image_url(image_url)
+   
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         for attempt in range(retries):
             try:
-                response = await client.get(modified_url)
+                response = await client.get(image_url)
                 response.raise_for_status()
                 with open(image_full_path, "wb") as f:
                     f.write(response.content)
@@ -87,10 +71,10 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
     logging.error(f"Failed to download {product_name} after {retries} attempts.")
     return "N/A"
 
+
 def random_delay(min_sec=1, max_sec=3):
     """Introduce a random delay to mimic human-like behavior."""
     time.sleep(random.uniform(min_sec, max_sec))
-
 
 
 # async def safe_goto_and_wait(page, url, retries=3):
@@ -101,7 +85,7 @@ def random_delay(min_sec=1, max_sec=3):
 
 
 #             # Wait for the selector with a longer timeout
-#             product_cards = await page.wait_for_selector(".product-scroll-wrapper", state="attached", timeout=30000)
+#             product_cards = await page.wait_for_selector("div.w-full.cursor-pointer.relative", state="attached", timeout=30000)
 
 #             # Optionally validate at least 1 is visible (Playwright already does this)
 #             if product_cards:
@@ -138,7 +122,7 @@ async def safe_goto_and_wait(page, url,isbri_data, retries=2):
                 await page.goto(url, wait_until="networkidle", timeout=180_000)
 
             # Wait for the selector with a longer timeout
-            product_cards = await page.wait_for_selector(".product-scroll-wrapper", state="attached", timeout=30000)
+            product_cards = await page.wait_for_selector("div.w-full.cursor-pointer.relative", state="attached", timeout=30000)
 
             # Optionally validate at least 1 is visible (Playwright already does this)
             if product_cards:
@@ -280,20 +264,43 @@ def check_url_against_rules(url: str, disallowed_patterns: List[str]) -> bool:
         except Exception as e:
             logging.warning(f"Error checking pattern {pattern}: {e}")
     return False
-
-
-
-
-def build_url_with_loadmore(base_url: str, page_count: int) -> str:
-    separator = '&' if '?' in base_url else '?'
-    return f"{base_url}{separator}loadMore={page_count}"            
-
-########################################  Main Function Call ####################################################################
-
             
+def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    """
+    Builds paginated URL while preserving existing parameters
+    Handles both filtered and non-filtered URLs:
+    - Without filters: https://domain.com/path?page=2
+    - With filters: https://domain.com/path?filter=val&page=2
+    """
+    
+    # Parse existing URL components
+    parsed = urlparse(base_url)
+    query_params = parse_qs(parsed.query)
+    
+    # Update page parameter (replace if exists)
+    query_params['page'] = [str(page_count)]
+    
+    # Rebuild query string with proper encoding
+    new_query = []
+    for key in sorted(query_params.keys()):
+        values = query_params[key]
+        for value in values:
+            new_query.append(f"{key}={value}")
+    
+    # Construct new URL
+    return urlunparse((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        parsed.params,
+        '&'.join(new_query),
+        parsed.fragment
+    ))     
 
 
-async def handle_kayoutlet(url, max_pages):
+
+
+async def handle_hoskings(url, max_pages):
     ip_address = get_public_ip()
     logging.info(f"Scraping started for: {url} from IP: {ip_address}, max_pages: {max_pages}")
 
@@ -311,15 +318,15 @@ async def handle_kayoutlet(url, max_pages):
     sheet.append(headers)
 
     all_records = []
-    filename = f"handle_kayoutlet_{datetime.now().strftime('%Y-%m-%d_%H.%M')}.xlsx"
+    filename = f"handle_hoskings_{datetime.now().strftime('%Y-%m-%d_%H.%M')}.xlsx"
     file_path = os.path.join(EXCEL_DATA_PATH, filename)
 
     page_count = 1
     success_count = 0
 
     while page_count <= max_pages:
-        # current_url = f"{url}?loadMore={page_count}"
-        current_url = build_url_with_loadmore(url, page_count)
+        # current_url = f"{url}?page={page_count}"
+        current_url= build_url_with_loadmore(url, page_count)
         logging.info(f"Processing page {page_count}: {current_url}")
         
         # Create a new browser instance for each page
@@ -331,19 +338,24 @@ async def handle_kayoutlet(url, max_pages):
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all products
+            
                 prev_product_count = 0
                 for _ in range(10):
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await asyncio.sleep(random.uniform(1, 2))  # Random delay between scrolls
-                    current_product_count = await page.locator('.product-item').count()
+                    await asyncio.sleep(random.uniform(1, 2))  # Random delay
+
+                    # Count products based on the container that holds individual product cards
+                    current_product_count = await page.locator("div.w-full.cursor-pointer.relative").count()
+
                     if current_product_count == prev_product_count:
-                        break
+                        break  # No new products loaded
                     prev_product_count = current_product_count
 
+                # Get all product elements
+                products = await page.locator("div.w-full.cursor-pointer.relative").all()
+                logging.info(f"✅ Total products found on page {page_count}: {len(products)}")
 
-                product_wrapper = await page.query_selector("div.product-scroll-wrapper")
-                products = await product_wrapper.query_selector_all("div.product-item") if product_wrapper else []
-                logging.info(f"Total products found on page {page_count}: {len(products)}")
+
 
                 page_title = await page.title()
                 current_date = datetime.now().strftime("%Y-%m-%d")
@@ -354,25 +366,46 @@ async def handle_kayoutlet(url, max_pages):
 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
                     try:
-                        product_name = await (await product.query_selector("h2.name.product-tile-description")).inner_text()
-                    except:
+                        product_name_locator = product.locator("a.product-item-meta__title, p.font-normal.text-text-subdued.text-label")
+                        product_name = (await product_name_locator.inner_text()).strip() if await product_name_locator.count() > 0 else "N/A"
+                    except Exception as e:
                         product_name = "N/A"
 
                     try:
-                        price = await (await product.query_selector("div.price")).inner_text()
-                    except:
+                         # Use more precise selector for price container
+                        price_container = product.locator('div.text-label.text-text-subdued.font-bold.mt-1')
+                        
+                        # First try to find sale price (when on sale)
+                        sale_price_loc = price_container.locator('span.text-text-sale:visible')
+                        if await sale_price_loc.count() > 0:
+                            price = (await sale_price_loc.first.inner_text()).strip()
+                        else:
+                            # Fallback to regular price (first span)
+                            regular_price_loc = price_container.locator('span:visible')
+                            price = (await regular_price_loc.first.inner_text()).strip() if await regular_price_loc.count() > 0 else "N/A"
+                    except Exception as e:
                         price = "N/A"
+                        logging.debug(f"Price error: {str(e)}")
 
                     try:
-                        image_url = await (await product.query_selector("img[itemprop='image']")).get_attribute("src")
-                    except:
+                        await product.scroll_into_view_if_needed()
+                        image_locator = product.locator("img[src]:not([src=''])")
+                        await image_locator.first.wait_for(timeout=10000)
+                        if await image_locator.count() > 0:
+                            image_tag = image_locator.first
+                            relative_url = await image_tag.get_attribute("data-src") or await image_tag.get_attribute("src")
+                            image_url = f"https:{relative_url}" if relative_url and relative_url.startswith("//") else relative_url or "N/A"
+                        else:
+                            image_url = "N/A"
+                    except Exception as e:
                         image_url = "N/A"
 
-                    gold_type_match = re.search(r"\b\d+K\s+\w+\s+\w+\b", product_name)
-                    kt = gold_type_match.group() if gold_type_match else "Not found"
 
-                    diamond_weight_match = re.search(r"\d+[-/]?\d*/?\d*\s*ct\s*tw", product_name)
-                    diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                    gold_type_match = re.search(r"(\d{1,2}(K|ct)\s*(Yellow|White|Rose)?\s*Gold|Platinum|Sterling Silver|Rhodium Plate)", product_name, re.IGNORECASE)
+                    kt = gold_type_match.group(1) if gold_type_match else "Not found"
+
+                    diamond_weight_match = re.search(r"(\d+(\.\d+)?)\s*(ct|carat)(\s*TW)?", product_name, re.IGNORECASE)
+                    diamond_weight = f"{diamond_weight_match.group(1)} ct{diamond_weight_match.group(4) if diamond_weight_match.group(4) else ''}" if diamond_weight_match else "N/A"
 
                     unique_id = str(uuid.uuid4())
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
