@@ -17,12 +17,17 @@ DB_CONFIG = {
 
 
 def create_table():
-    """Ensure the Products table exists before inserting data."""
+    """Ensure the Products table exists and contains all necessary columns."""
     try:
         with pymssql.connect(**DB_CONFIG) as conn:
             with conn.cursor() as cursor:
+                # Step 1: Create the table if it doesn't exist
                 create_table_query = """
-                IF NOT EXISTS (SELECT * FROM Webstudy.INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'IBM_Algo_Webstudy_Products' AND TABLE_SCHEMA = 'dbo')
+                IF NOT EXISTS (
+                    SELECT * FROM EmrUsrRep.INFORMATION_SCHEMA.TABLES 
+                    WHERE TABLE_NAME = 'IBM_Algo_Webstudy_Products' 
+                    AND TABLE_SCHEMA = 'dbo'
+                )
                 BEGIN
                     CREATE TABLE dbo.IBM_Algo_Webstudy_Products (
                         unique_id NVARCHAR(255) PRIMARY KEY,
@@ -33,15 +38,33 @@ def create_table():
                         Kt NVARCHAR(255),  
                         Price NVARCHAR(255),
                         TotalDiaWt NVARCHAR(255),
-                        Time DATETIME DEFAULT GETDATE()
+                        Time DATETIME DEFAULT GETDATE(),
+                        AdditionalInfo NVARCHAR(MAX) NULL
                     )
                 END
                 """
                 cursor.execute(create_table_query)
+
+                # Step 2: Add 'AdditionalInfo' column if not exists
+                add_column_query = """
+                IF NOT EXISTS (
+                    SELECT * FROM INFORMATION_SCHEMA.COLUMNS 
+                    WHERE TABLE_NAME = 'IBM_Algo_Webstudy_Products' 
+                    AND COLUMN_NAME = 'AdditionalInfo'
+                )
+                BEGIN
+                    ALTER TABLE dbo.IBM_Algo_Webstudy_Products 
+                    ADD AdditionalInfo NVARCHAR(MAX) NULL
+                END
+                """
+                cursor.execute(add_column_query)
+
                 conn.commit()
-                logging.info("Table 'Products' checked/created successfully.")
+                logging.info("Table and column 'AdditionalInfo' checked/created successfully.")
     except pymssql.DatabaseError as e:
         logging.error(f"Database error: {e}")
+
+
 
 def insert_into_db(data):
     """Insert scraped data into the MSSQL database."""
@@ -52,15 +75,19 @@ def insert_into_db(data):
         with pymssql.connect(**DB_CONFIG) as conn:
             with conn.cursor() as cursor:
                 query = """
-                    INSERT INTO dbo.IBM_Algo_Webstudy_Products (unique_id, CurrentDate, Header, ProductName, ImagePath, Kt, Price, TotalDiaWt)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO dbo.IBM_Algo_Webstudy_Products 
+                    (unique_id, CurrentDate, Header, ProductName, ImagePath, Kt, Price, TotalDiaWt, AdditionalInfo)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """
-                cursor.executemany(query, data)
+
+                # Normalize each row to ensure it has exactly 9 elements (pad with None if shorter)
+                normalized_data = [tuple(row) + (None,) * (9 - len(row)) if len(row) < 9 else tuple(row) for row in data]
+
+                cursor.executemany(query, normalized_data)
                 conn.commit()
-                logging.info(f"Inserted {len(data)} records successfully.")
+                logging.info(f"Inserted {len(normalized_data)} records successfully.")
     except pymssql.DatabaseError as e:
         logging.error(f"Database error: {e}")
-
 
 # Function to fetch scraping settings
 def get_scraping_settings():
@@ -69,7 +96,7 @@ def get_scraping_settings():
         with pymssql.connect(**DB_CONFIG) as conn:
             with conn.cursor(as_dict=True) as cursor:
                 cursor.execute("""
-                    SELECT daily_limit, products_fetched_today, last_reset
+                    SELECT monthly_product_limit,products_fetched_month, last_reset
                     FROM dbo.IBM_Algo_Webstudy_scraping_settings
                 """)
                 data = cursor.fetchone()
@@ -89,7 +116,7 @@ def reset_scraping_limit():
             with conn.cursor() as cursor:
                 update_query = """
                     UPDATE dbo.IBM_Algo_Webstudy_scraping_settings
-                    SET products_fetched_today = 0, is_disabled = 0
+                    SET products_fetched_month = 0, is_disabled = 0
                 """
                 cursor.execute(update_query)
                 conn.commit()

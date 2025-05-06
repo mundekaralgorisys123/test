@@ -1,85 +1,42 @@
-# import json
-# import os
-# from threading import Lock
+import pymssql
+from datetime import datetime
+import hashlib
+import os
+from dotenv import load_dotenv
+from utils import get_public_ip
+# Load environment variables
+load_dotenv()
+# Database Configuration
 
-# IP_FILE = 'ip_usage.json'
-# DEFAULT_LIMIT = 2000  # Default limit for each website
-# lock = Lock()
-
-# # Load or initialize the IP usage data
-# def load_ip_data():
-#     if os.path.exists(IP_FILE):
-#         try:
-#             with open(IP_FILE, 'r') as f:
-#                 return json.load(f)
-#         except json.JSONDecodeError:
-#             # If JSON is invalid, reset the file
-#             print("Corrupted JSON file detected. Resetting...")
-#             return {}
-#     else:
-#         return {}
-
-# # Save the updated IP usage data
-# def save_ip_data(data):
-#     with lock:
-#         with open(IP_FILE, 'w') as f:
-#             json.dump(data, f, indent=4)
-
-# # Check and update the usage for an IP
-# def check_and_update_usage(ip_address, domain, requested_pages):
-#     ip_data = load_ip_data()
-
-#     # Initialize new IP if not present
-#     if ip_address not in ip_data:
-#         ip_data[ip_address] = {}
-
-#     # Initialize domain usage if not present
-#     if domain not in ip_data[ip_address]:
-#         ip_data[ip_address][domain] = {"usage": 0, "limit": DEFAULT_LIMIT}
-
-#     # Calculate new usage
-#     site_usage = ip_data[ip_address][domain]
-#     new_usage = site_usage["usage"] + requested_pages
-
-#     # Check if the requested pages exceed the limit
-#     if new_usage > site_usage["limit"]:
-#         print(f"Limit exceeded for {domain} by IP: {ip_address}")
-#         return False  # Exceeds limit
-
-#     # Update usage and save
-#     ip_data[ip_address][domain]["usage"] = new_usage
-#     save_ip_data(ip_data)
-#     print(f"Updated usage for {domain} by IP: {ip_address}. New usage: {new_usage}")
-#     return True
+DB_CONFIG = {
+    "server": os.getenv("DB_SERVER"),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "database": os.getenv("DB_NAME"),
+}
 
 
 
-# CREATE TABLE scraping_settings (
-#     id INT IDENTITY(1,1) PRIMARY KEY,
-#     setting_name VARCHAR(100) NOT NULL UNIQUE,
-#     daily_limit INT NOT NULL,
-#     products_fetched_today INT DEFAULT 0,
-#     last_reset DATE NOT NULL,
-#     is_disabled BIT DEFAULT 0  -- Use 0 for FALSE
-# );
+def generate_unique_id(url):
+    now = datetime.now().strftime('%Y%m%d%H%M%S')
+    raw = f"{url}-{now}"
+    return hashlib.md5(raw.encode()).hexdigest()  # or use UUID if preferred
 
+def insert_scrape_log(scrape_id, url, status='active'):
+    ip_address = get_public_ip()
+    conn = pymssql.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+    timestamp = datetime.now()
+    cursor.execute("""
+        INSERT INTO scraping_logs (id, url, ip_address, request_time, status)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (scrape_id, url, ip_address, timestamp, status))
+    conn.commit()
+    conn.close()
 
-# INSERT INTO scraping_settings (
-#     setting_name,
-#     daily_limit,
-#     products_fetched_today,
-#     last_reset,
-#     is_disabled
-# ) VALUES (
-#     'daily_product_limit',  -- Setting name for combined limit
-#     4000,                   -- Total daily limit of 4000 products
-#     0,                      -- Start with 0 products fetched today
-#     GETDATE(),              -- Set today's date as last reset
-#     0                       -- Not disabled by default
-# );
-
-
-
-# UPDATE [Webstudy].[dbo].[scraping_settings] 
-# SET [daily_limit] = 300
-# WHERE [setting_name] = 'daily_product_limit';
+def update_scrape_status(scrape_id, status):
+    conn = pymssql.connect(**DB_CONFIG)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE scraping_logs SET status = %s WHERE id = %s", (status, scrape_id))
+    conn.commit()
+    conn.close()

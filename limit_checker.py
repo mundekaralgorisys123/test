@@ -29,81 +29,87 @@ def get_db_connection():
         log_event(f"Database connection failed: {e}")
         raise
 
-def check_daily_limit():
+def check_monthly_limit():
     connection = get_db_connection()
     try:
         with connection.cursor() as cursor:
-            # Check the current limit and count
+            # Check monthly limit settings
             cursor.execute("""
-                SELECT daily_limit, products_fetched_today, last_reset, is_disabled 
+                SELECT monthly_product_limit, products_fetched_month, 
+                       last_reset, is_disabled 
                 FROM IBM_Algo_Webstudy_scraping_settings 
-                WHERE setting_name = 'daily_product_limit'
+                WHERE setting_name = 'monthly_product_limit'
             """)
             result = cursor.fetchone()
             
-            # If nothing is returned, handle the error
             if not result:
-                log_event("No setting found for daily_product_limit")
+                log_event("No monthly limit setting found")
                 return False
             
-            # Convert result to dictionary manually
+            # Convert result to dictionary
             columns = [column[0] for column in cursor.description]
-            result = dict(zip(columns, result))
+            monthly_data = dict(zip(columns, result))
             
-            # Handle datetime type for last_reset
-            if isinstance(result['last_reset'], datetime):
-                last_reset_date = result['last_reset'].date()
-            else:
-                last_reset_date = result['last_reset']
+            # Get current date
+            current_date = datetime.now().date()
             
-            # Reset the count if the date has changed
-            if last_reset_date != date.today():
+            # Extract month/year from last reset
+            last_reset_date = monthly_data['last_reset']
+            if isinstance(last_reset_date, datetime):
+                last_reset_date = last_reset_date.date()
+            
+            # Check if month has changed
+            if last_reset_date.month != current_date.month or last_reset_date.year != current_date.year:
                 cursor.execute("""
                     UPDATE IBM_Algo_Webstudy_scraping_settings 
-                    SET products_fetched_today = 0, last_reset = %s, is_disabled = 0
-                    WHERE setting_name = 'daily_product_limit'
-                """, (date.today(),))
+                    SET products_fetched_month = 0, 
+                        last_reset = %s,
+                        is_disabled = 0
+                    WHERE setting_name = 'monthly_product_limit'
+                """, (current_date,))
                 connection.commit()
-                result['products_fetched_today'] = 0
-                result['is_disabled'] = False
-                print("Daily limit reset for the new day.")
+                monthly_data['products_fetched_month'] = 0
+                monthly_data['is_disabled'] = False
+                log_event("Monthly counter reset for new month")
             
-            # Check if the limit has been reached
-            if result['products_fetched_today'] >= result['daily_limit']:
+            # Check limit
+            if monthly_data['products_fetched_month'] >= monthly_data['monthly_product_limit']:
                 cursor.execute("""
                     UPDATE IBM_Algo_Webstudy_scraping_settings 
                     SET is_disabled = 1
-                    WHERE setting_name = 'daily_product_limit'
+                    WHERE setting_name = 'monthly_product_limit'
                 """)
                 connection.commit()
-                print("Daily limit reached. Scraping is disabled.")
+                log_event("Monthly limit reached - scraping disabled")
                 return False
-            else:
-                print("Daily limit not reached. Scraping is allowed.")
-                return True
+            
+            return True
+            
     except Exception as e:
-        log_event(f"Error in check_daily_limit: {e}")
+        log_event(f"Monthly limit check error: {str(e)}")
         return False
     finally:
         connection.close()
-        
-        
+
 def update_product_count(count):
+    """Update monthly product count in the database"""
     connection = get_db_connection()
     try:
         with connection.cursor() as cursor:
             cursor.execute("""
                 UPDATE IBM_Algo_Webstudy_scraping_settings 
-                SET products_fetched_today = products_fetched_today + %s
-                WHERE setting_name = 'daily_product_limit'
+                SET products_fetched_month = products_fetched_month + %s
+                WHERE setting_name = 'monthly_product_limit'
             """, (count,))
             connection.commit()
-            log_event(f"Update the product count")
+            log_event(f"Updated monthly product count by +{count}")
     except Exception as e:
-        log_event(f"Error in update_product_count: {e}")
+        connection.rollback()
+        log_event(f"Error updating monthly count: {e}")
+        raise
     finally:
         connection.close()
-
+        
 # if __name__ == "__main__":
 #     if check_daily_limit():
 #         # Example: If scraping is allowed, increment the counter by the number of products fetched
@@ -186,3 +192,12 @@ def update_product_count(count):
         
 # # Call the function
 # create_table_and_insert_record()        
+
+
+# CREATE TABLE scraping_logs (
+#     id VARCHAR(100) PRIMARY KEY,         -- Unique hash ID from URL + timestamp
+#     url TEXT,                             -- The target URL being scraped
+#     ip_address VARCHAR(45),              -- IP address of the client (IPv4 or IPv6)
+#     request_time DATETIME,               -- Timestamp of when the scrape was initiated
+#     status VARCHAR(20)                   -- Status of the scrape: 'active', 'inactive', or 'error'
+# );
