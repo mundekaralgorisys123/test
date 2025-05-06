@@ -20,14 +20,16 @@ from playwright.async_api import async_playwright, TimeoutError, Error
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
-
+from proxysetup import get_browser_with_proxy_strategy
 # Load environment
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
 
+# Flask and paths
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
+
 # Resize image if needed
 def resize_image(image_data, max_size=(100, 100)):
     try:
@@ -77,21 +79,11 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
 def random_delay(min_sec=1, max_sec=3):
     time.sleep(random.uniform(min_sec, max_sec))
 
-# Reliable page.goto wrapper
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-            await page.wait_for_selector(".ProductCardWrapper", state="attached", timeout=30000)
-            print("[Success] Product cards loaded.")
-            return
-        except (Error, TimeoutError) as e:
-            logging.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
-            if attempt < retries - 1:
-                random_delay(1, 3)
-            else:
-                raise
+
+
+def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    separator = '&' if '?' in base_url else '?'
+    return f"{base_url}{separator}p={page_count}"   
 
 # Main scraper function
 async def handle_gabriel(url, max_pages):
@@ -114,21 +106,19 @@ async def handle_gabriel(url, max_pages):
     file_path = os.path.join(EXCEL_DATA_PATH, filename)
 
     page_count = 1
-    current_url = url
 
-    while current_url and (page_count <= max_pages):
+
+    while page_count <= max_pages:
+        current_url= build_url_with_loadmore(url, page_count)
         logging.info(f"Processing page {page_count}: {current_url}")
         browser = None
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(120000)
-
-                await safe_goto_and_wait(page, current_url)
-                log_event(f"Successfully loaded: {current_url}")
+                
+                product_wrapper=".ProductCardWrapper"
+                browser, page = await get_browser_with_proxy_strategy(p, current_url,product_wrapper)
+                
 
                 # Scroll to load all items
                 prev_count = 0
@@ -146,18 +136,16 @@ async def handle_gabriel(url, max_pages):
 
                 wrapper = page.locator("div.qd-product-list").first
                 products = await wrapper.locator("div.ProductCard").all() if await wrapper.count() > 0 else []
-                logging.info(f"Total products scraped: {len(products)}")
+
                 records = []
                 image_tasks = []
 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
                     try:
-                        product_name_element = product.locator("h2.ProductName a.ProductCTA")
-                        product_name = (await product_name_element.first.text_content(timeout=60000)).strip() if await product_name_element.count() > 0 else "N/A"
-
-
+                        product_name = await product.locator("a.ProductCTA").inner_text()
                     except:
                         product_name = "N/A"
+
 
                     try:
                         price_wrapper = product.locator('.price-wrapper')
@@ -167,22 +155,19 @@ async def handle_gabriel(url, max_pages):
 
                     try:
                         product_images = await product.locator("img.image-entity").all()
-                        product_urls = [
-                            src for src in await asyncio.gather(*[img.get_attribute("data-src") for img in product_images])
-                            if src and src.startswith("https://")
-                        ]
+                        product_urls = [await img.get_attribute("data-src") for img in product_images if (await img.get_attribute("data-src")).startswith("https://")]
                         image_url = product_urls[0] if product_urls else "N/A"
                     except:
                         image_url = "N/A"
 
+                    try:
+                        metal_el = product.locator("span.metalIcon")
+                        kt = await metal_el.get_attribute("data-originalmetal") if await metal_el.count() > 0 else "N/A"
+                    except:
+                        kt = "N/A"
 
-                    gold_type_pattern = r"\b\d{1,2}K\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSilver\b"
-                    gold_type_match = re.search(gold_type_pattern, product_name, re.IGNORECASE)
-                    kt = gold_type_match.group() if gold_type_match else "Not found"
-
-                    diamond_weight_pattern = r"\b(\d+(\.\d+)?)\s*(?:ct|ctw|carat)\b"
-                    diamond_weight_match = re.search(diamond_weight_pattern, product_name, re.IGNORECASE)
-                    diamond_weight = f"{diamond_weight_match.group(1)} ct" if diamond_weight_match else "N/A"
+                    dia_match = re.search(r"\b(\d+(\.\d+)?)\s*(?:ct|ctw|carat)\b", product_name, re.IGNORECASE)
+                    diamond_weight = f"{dia_match.group(1)} ct" if dia_match else "N/A"
 
                     unique_id = str(uuid.uuid4())
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
@@ -210,11 +195,7 @@ async def handle_gabriel(url, max_pages):
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")
 
-                all_records.extend(records)
-
-                # Prepare next page
-                next_button = page.locator("div.list-pager a.action.next")
-                current_url = await next_button.first.get_attribute("href") if await next_button.count() > 0 else None
+                all_records.extend(records)                
                 wb.save(file_path)
 
         except Exception as e:

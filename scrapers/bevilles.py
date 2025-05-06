@@ -300,7 +300,7 @@ async def handle_bevilles(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     current_date = datetime.now().strftime("%Y-%m-%d")
@@ -342,8 +342,20 @@ async def handle_bevilles(url, max_pages):
                         product_name_tag = await product.query_selector("a.boost-pfs-filter-product-item-title")
                         product_name = (await product_name_tag.inner_text()).strip() if product_name_tag else "N/A"
 
+                        # Price handling - get both original and sale price if available
+                        price = "N/A"
+                        original_price = "N/A"
                         price_tag = await product.query_selector("span.boost-pfs-filter-product-item-sale-price")
-                        price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
+                        if price_tag:
+                            price = (await price_tag.inner_text()).strip()
+                            
+                            # Check for original price (strikethrough)
+                            original_price_tag = await product.query_selector("p.boost-pfs-filter-product-item-price s")
+                            if original_price_tag:
+                                original_price = (await original_price_tag.inner_text()).strip()
+                        
+                        # Format price string to include both original and sale price if available
+                        price_str = f"{original_price} | {price}" if original_price != "N/A" else price
 
                         image_tag = await product.query_selector("img.boost-pfs-filter-product-item-main-image")
                         if image_tag:
@@ -352,7 +364,6 @@ async def handle_bevilles(url, max_pages):
                             image_url = product_urls[0] if product_urls else "N/A"
                         else:
                             image_url = "N/A"
-                            
                             
                         if product_name == "N/A" or price == "N/A" or image_url == "N/A":
                             print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
@@ -367,6 +378,59 @@ async def handle_bevilles(url, max_pages):
                         diamond_weight_pattern = r"(\d+(?:[./-]\d+)?(?:\s*/\s*\d+)?\s*ct(?:\s*tw)?)"
                         diamond_weight_match = re.search(diamond_weight_pattern, product_name, re.IGNORECASE)
                         diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+
+                        # Extract additional info
+                        additional_info = []
+                        
+                        # Check for sale badge
+                        try:
+                            sale_badge = await product.query_selector(".ss__badge-rectangle--sale")
+                            if sale_badge:
+                                sale_text = (await sale_badge.inner_text()).strip()
+                                if sale_text:
+                                    additional_info.append(f"Label: {sale_text}")
+                        except:
+                            pass
+                        
+                        # Check for discount percentage
+                        try:
+                            discount_tag = await product.query_selector(".product-badge.on-sale")
+                            if discount_tag:
+                                discount_text = (await discount_tag.inner_text()).strip()
+                                if discount_text:
+                                    additional_info.append(discount_text)
+                        except:
+                            pass
+                        
+                        # Check for rating
+                        try:
+                            rating_container = await product.query_selector(".ruk_rating_snippet")
+                            if rating_container:
+                                # Count filled stars
+                                filled_stars = await rating_container.query_selector_all(".ruk-icon-percentage-star--100")
+                                rating = len(filled_stars)
+                                
+                                # Get review count
+                                review_count_tag = await rating_container.query_selector(".ruk-rating-snippet-count")
+                                review_count = (await review_count_tag.inner_text()).strip() if review_count_tag else ""
+                                
+                                if rating > 0:
+                                    additional_info.append(f"Rating: {rating}/5 {review_count}")
+                        except:
+                            pass
+                        
+                        # Check for payment options
+                        try:
+                            payment_option = await product.query_selector(".installement-limespot")
+                            if payment_option:
+                                payment_text = (await payment_option.inner_text()).strip()
+                                if payment_text:
+                                    additional_info.append(f"Payment: {payment_text.split('with')[0].strip()}")
+                        except:
+                            pass
+                        
+                        # Join all additional info with pipe separator
+                        additional_info_str = " | ".join(additional_info) if additional_info else "N/A"
 
                         # Schedule image download
                         unique_id = str(uuid.uuid4())
@@ -384,8 +448,9 @@ async def handle_bevilles(url, max_pages):
                             product_name,
                             None,  # Placeholder for image path
                             kt,
-                            price,
-                            diamond_weight
+                            price_str,  # Now includes both original and sale price
+                            diamond_weight,
+                            additional_info_str
                         ))
 
                         sheet.append([
@@ -394,10 +459,11 @@ async def handle_bevilles(url, max_pages):
                             product_name,
                             None,  # Placeholder for image
                             kt,
-                            price,
+                            price_str,
                             diamond_weight,
                             time_only,
-                            image_url
+                            image_url,
+                            additional_info_str
                         ])
 
                     except Exception as e:
@@ -428,7 +494,8 @@ async def handle_bevilles(url, max_pages):
                                     image_path,
                                     record[5],
                                     record[6],
-                                    record[7]
+                                    record[7],
+                                    record[8]
                                 )
                                 break
 
@@ -440,7 +507,7 @@ async def handle_bevilles(url, max_pages):
                 # Save progress after each page
                 wb.save(file_path)
                 logging.info(f"Progress saved after page {page_count}")
-                page_count+=1
+                page_count += 1
                 prev_prod_count += len(products)
         except Exception as e:
             logging.error(f"Error processing page {page_count}: {str(e)}")
@@ -456,6 +523,8 @@ async def handle_bevilles(url, max_pages):
             # Add delay between pages
             await asyncio.sleep(random.uniform(2, 5))
 
+    if not all_records:
+        return None, None, None
     # Final save and database operations
     wb.save(file_path)
     logging.info(f"Data saved to {file_path}")

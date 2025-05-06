@@ -16,7 +16,6 @@ from dotenv import load_dotenv
 from database import insert_into_db
 from limit_checker import update_product_count
 from io import BytesIO
-from openpyxl.drawing.image import Image as XLImage
 import httpx
 import traceback
 from typing import List, Tuple
@@ -249,16 +248,15 @@ def check_url_against_rules(url: str, disallowed_patterns: List[str]) -> bool:
 
 
 
-
 def build_url_with_loadmore(base_url: str, page_count: int) -> str:
     separator = '&' if '?' in base_url else '?'
-    return f"{base_url}{separator}loadMore={page_count}"            
+    return f"{base_url}{separator}loadMore={page_count}"   
+         
 
 ########################################  Main Function Call ####################################################################
 async def handle_kay(url, max_pages):
     ip_address = get_public_ip()
     logging.info(f"Scraping started for: {url} from IP: {ip_address}, max_pages: {max_pages}")
-
     # Prepare directories and files
     os.makedirs(EXCEL_DATA_PATH, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -269,7 +267,7 @@ async def handle_kay(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -319,29 +317,84 @@ async def handle_kay(url, max_pages):
                         product_name = "N/A"
 
                     try:
-                        price = await (await product.query_selector("div.price")).inner_text()
-                    except:
+                        # Extract current price (the offer price if available)
+                        price_el = await product.query_selector("div.price")
+                        current_price_text = await price_el.inner_text() if price_el else ""
+                        #print(f"Current Price Text: {current_price_text}")  # Debugging
+                        current_price = current_price_text.strip().split()[0] if current_price_text else ""  # ensures we get only "$1014.30"
+
+                        # Extract discount if available (e.g., "30% off")
+                        discount_el = await product.query_selector("span.tag-text")
+                        discount_text = await discount_el.inner_text() if discount_el else ""
+                        #print(f"Discount Text: {discount_text}")  # Debugging
+                        discount = discount_text.replace(" off", "").strip() if discount_text else ""  # just "30%"
+
+                        # Extract original price with $ (if offer price is not available)
+                        original_price_el = await product.query_selector("div.original-price")
+                        original_price_text = await original_price_el.inner_text() if original_price_el else ""
+                        #print(f"Original Price Text: {original_price_text}")  # Debugging
+                        original_price = original_price_text.strip().replace("Was", "").strip().split()[0] if original_price_text else ""  # "$1449.00"
+
+                        # Build the final formatted price
+                        if current_price:  # If there is a current price
+                            if discount:
+                                price = f"{current_price} offer of {discount} {original_price}"
+                            else:
+                                price = current_price  # No discount, just current price
+                        elif original_price:  # If there is no current price but original price is available
+                            price = original_price
+                        else:
+                            price = "N/A"  # If neither price is available
+
+                    except Exception as e:
                         price = "N/A"
+                        print(f"Error: {e}")  # Log the error for debugging
 
                     try:
                         image_url = await (await product.query_selector("img[itemprop='image']")).get_attribute("src")
                     except:
                         image_url = "N/A"
+                        
+                        
+                    additional_info = []
+
+                    try:
+                        tag_els = await product.query_selector_all("span.product-tag.groupby-tablet-product-tags")
+                        if tag_els:
+                            for tag_el in tag_els:
+                                tag_text = await tag_el.inner_text()
+                                if tag_text:
+                                    additional_info.append(tag_text.strip())
+                        else:
+                            additional_info.append("N/A")
+
+                    except Exception as e:
+                        additional_info.append("N/A")
+
+                    additional_info_str = " | ".join(additional_info)    
+                    
+                    
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue    
+                    
+                    
 
                     gold_type_match = re.search(r"\b\d+K\s+\w+\s+\w+\b", product_name)
                     kt = gold_type_match.group() if gold_type_match else "Not found"
 
 
-                    diamond_weight_match = re.search(r"\d+[-/]?\d*/?\d*\s*ct\s*tw", product_name)
+                    diamond_weight_match = re.search(r"\d+(?:[-/]\d+)?(?:\s+\d+/\d+)?\s*ct\s+tw", product_name, re.IGNORECASE)
                     diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+
 
                     unique_id = str(uuid.uuid4())
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -358,7 +411,7 @@ async def handle_kay(url, max_pages):
                         
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")
@@ -392,13 +445,20 @@ async def handle_kay(url, max_pages):
         page_count += 1
 
     # # Final save and database operations
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
 
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

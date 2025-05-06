@@ -14,6 +14,7 @@ from database import insert_into_db
 from limit_checker import update_product_count
 import httpx
 from playwright.async_api import async_playwright, TimeoutError
+from html import unescape
 
 # Load .env variables
 load_dotenv()
@@ -23,11 +24,23 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
 
+
+def upgrade_to_high_res_url(image_url):
+    if not image_url or image_url == "N/A":
+        return image_url
+
+    # Replace the cache key to always use high-resolution cache
+    high_res_cache_key = "e30df37fe797367961e091f338eb1dfc"
+    upgraded_url = re.sub(r'cache/[^/]+/', f'cache/{high_res_cache_key}/', image_url)
+    return upgraded_url
+
+
 async def download_image(session, image_url, product_name, timestamp, image_folder, unique_id):
     if not image_url or image_url == "N/A":
         return "N/A"
     image_filename = f"{unique_id}_{timestamp}.jpg"
     image_full_path = os.path.join(image_folder, image_filename)
+    # image_url = upgrade_to_high_res_url(image_url)
 
     for attempt in range(3):
         try:
@@ -41,7 +54,8 @@ async def download_image(session, image_url, product_name, timestamp, image_fold
     logging.error(f"Failed to download {product_name} after 3 attempts.")
     return "N/A"
 
-async def handle_tacori(url, max_pages):
+async def handle_harrywinston(url, max_pages):
+    
     ip_address = get_public_ip()
     logging.info(f"Starting scrape for {url} from IP: {ip_address}")
 
@@ -81,46 +95,49 @@ async def handle_tacori(url, max_pages):
                     logging.warning(f"Failed to load URL {url}: {e}")
                     await browser.close()
                     continue  # move to the next iteration
-                
-                for _ in range(load_more_clicks - 1):
-                    try:
-                        # Use more specific selector with escaped CSS colon
-                        load_more_button = await page.wait_for_selector(
-                            'button.button-white[id="\\:R4mt57ekkm\\:"]:has-text("View More"):not(:disabled)',
-                            timeout=10000,
-                            state="visible"
-                        )
-                        
-                        if await load_more_button.is_visible():
-                            # Scroll into view and click using JavaScript
-                            await page.evaluate("""button => {
-                                button.scrollIntoView({behavior: 'smooth', block: 'center'});
-                                button.click();
-                            }""", load_more_button)
-                            
-                            # Wait for either next load or button disable
-                            await asyncio.sleep(1)
-                            try:
-                                await page.wait_for_load_state('networkidle', timeout=5000)
-                            except TimeoutError:
-                                pass
-                            
-                            # Check if button is still enabled
-                            if await load_more_button.is_disabled():
-                                break
-                            
-                            load_more_attempts += 1
-                            logging.info(f"Clicked 'View More' ({load_more_attempts}/{max_pages})")
-                            
-                    except Exception as e:
-                        logging.warning(f"Stopping pagination: {str(e)}")
-                        break
 
                
-                
-    
-                all_products = await page.query_selector_all("div.plp-card.config")
+                for _ in range(load_more_clicks - 1):
+                    try:
+                        load_more_button = page.locator('div.component-content input[value="Load More"]')
+                        await load_more_button.wait_for(state='visible', timeout=10000)
+                        
+                        if not await load_more_button.is_enabled():
+                            logging.info("Load More button disabled - no more content")
+                            break
 
+                        # Get current product count before clicking
+                        product_items = page.locator('div.product-item')
+                        initial_count = await product_items.count()
+
+                        # Human-like interaction
+                        await load_more_button.scroll_into_view_if_needed()
+                        await asyncio.sleep(1)
+                        await load_more_button.click(delay=100)
+
+                        # Wait for content to load using product count check
+                        try:
+                            await page.wait_for_function(
+                                """([selector, initial]) => {
+                                    const current = document.querySelectorAll(selector).length;
+                                    return current > initial;
+                                }""",
+                                ["div.product-item", initial_count],
+                                timeout=20000
+                            )
+                            logging.info(f"New products loaded successfully (count: {await product_items.count()})")
+                        except Exception as e:
+                            logging.info(f"No new products detected: {str(e)}")
+                            break
+
+                        # Additional safety wait for visual updates
+                        await asyncio.sleep(1)
+
+                    except Exception as e:
+                        logging.info(f"Stopped clicking 'Load More': {str(e)}")
+                        break
+
+                all_products = await page.query_selector_all("ul.search-result-list li div.product__wrapper")
 
                 total_products = len(all_products)
                 new_products = all_products[previous_count:]
@@ -132,49 +149,44 @@ async def handle_tacori(url, max_pages):
 
                 for idx, product in enumerate(new_products):
                     try:
-                        product_info_tag = await product.query_selector('p.MuiTypography-root')
-                        if product_info_tag:
-                            full_text = await product_info_tag.inner_text()
-                            # Remove the price from the end (assuming it always starts with $)
-                            product_lines = full_text.strip().split('\n')
-                            product_line = product_lines[0] if product_lines else full_text.strip()
-                            product_name = product_line.rsplit('$', 1)[0].strip()  # remove price if it's inline
-                        else:
-                            product_name = "N/A"
+                        # Get product name from <h3> tag inside div.product__text
+                        product_name_tag = await product.query_selector('div.product__text h3')
+                        product_name = await product_name_tag.inner_text() if product_name_tag else "N/A"
                     except Exception as e:
                         print(f"Error fetching product name: {e}")
                         product_name = "N/A"
 
-
                     try:
-                        price_tag = await product.query_selector('span.pt-\\[5px\\].block')
-                        price = await price_tag.inner_text() if price_tag else "N/A"
+                        # There is no price in your HTML, so set "N/A"
+                        price = "N/A"
                     except Exception as e:
                         print(f"Error fetching price: {e}")
                         price = "N/A"
 
+                    image_url = "N/A"
+
                     try:
-                        image_elem = await product.query_selector("img")
-                        image_url = "N/A"
+                        image_div = await product.query_selector('div.product__image.lazy-load')
                         
-                        if image_elem:
-                            # First try `src`
-                            image_url = await image_elem.get_attribute("src")
-                            
-                            # If `src` is missing or invalid, fall back to `srcset`
-                            if not image_url or image_url.strip() == "":
-                                srcset = await image_elem.get_attribute("srcset")
-                                if srcset:
-                                    # srcset is like: "<url1> 1x, <url2> 2x"
-                                    image_url = srcset.split(",")[0].split(" ")[0].strip()
-                            
-                            # Ensure absolute URL
-                            if image_url and image_url.startswith("/"):
-                                image_url = "https://www.tacori.com" + image_url
+                        if image_div:
+                            # First try data-src on the <div>
+                            image_url = await image_div.get_attribute("data-src")
+
+                            if not image_url:
+                                print("No data-src found on div, checking style attribute...")
+
+                                # Fallback to style if needed (for future-proofing)
+                                style_attr = await image_div.get_attribute("style") or ""
+                                cleaned_style = unescape(style_attr)
+                                match = re.search(r'url\(["\']?(.*?)["\']?\)', cleaned_style)
+                                if match:
+                                    image_url = match.group(1).strip()
+                        
                     except Exception as e:
-                        print(f"Error fetching image URL: {e}")
+                        print(f"Error extracting image: {e}")
                         image_url = "N/A"
 
+                    # print("Final image URL:", image_url)
 
 
 
@@ -208,7 +220,7 @@ async def handle_tacori(url, max_pages):
             load_more_clicks += 1
 
         # Save Excel
-        filename = f'handle_tacori_{datetime.now().strftime("%Y-%m-%d_%H.%M")}.xlsx'
+        filename = f'handle_harrywinston_{datetime.now().strftime("%Y-%m-%d_%H.%M")}.xlsx'
         file_path = os.path.join(EXCEL_DATA_PATH, filename)
         wb.save(file_path)
         log_event(f"Data saved to {file_path} | IP: {ip_address}")

@@ -21,6 +21,7 @@ from limit_checker import update_product_count
 import aiohttp
 from io import BytesIO
 from openpyxl.drawing.image import Image as XLImage
+from proxysetup import get_browser_with_proxy_strategy
 import httpx
 # Load environment variables from .env file
 from functools import partial
@@ -156,9 +157,13 @@ async def handle_prouds(url, max_pages):
 
     page_count = 1
     success_count = 0
-
+    current_url = url
     while page_count <= max_pages:
-        current_url = f"{url}?p={page_count}"
+        if page_count > 1:
+            if "?" in url:
+                current_url = f"{url}&p={page_count}"
+            else:
+                current_url = f"{url}?p={page_count}"
         logging.info(f"Processing page {page_count}: {current_url}")
         
         # Create a new browser instance for each page
@@ -166,14 +171,8 @@ async def handle_prouds(url, max_pages):
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                
-                # Configure timeouts for this page
-                page = await context.new_page()
-                page.set_default_timeout(120000)  # 2 minute timeout
-                
-                await safe_goto_and_wait(page, current_url)
+                product_wrapper = ".ps-category-items"
+                browser, page =  await get_browser_with_proxy_strategy(p, current_url,product_wrapper)
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all products

@@ -122,7 +122,7 @@ async def safe_goto_and_wait(page, url,isbri_data, retries=2):
             if isbri_data:
                 await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
             else:
-                await page.goto(url, wait_until="networkidle", timeout=180_000)
+                await page.goto(url, wait_until="domcontentloaded", timeout=180_000)
 
             # Wait for the selector with a longer timeout
             product_cards = await page.wait_for_selector(".snize-horizontal-wrapper", state="attached", timeout=30000)
@@ -301,11 +301,7 @@ def build_url_with_loadmore(base_url: str, page_count: int) -> str:
         parsed.fragment
     ))     
 
-
-
-      
-                
-                
+     
 async def handle_medleyjewellery(url, max_pages):
     ip_address = get_public_ip()
     logging.info(f"Scraping started for: {url} from IP: {ip_address}, max_pages: {max_pages}")
@@ -320,7 +316,10 @@ async def handle_medleyjewellery(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = [
+        "Current Date", "Header", "Product Name", "Image", "Kt", "Price", 
+        "Total Dia wt", "Time", "ImagePath", "Additional Info"
+    ]
     sheet.append(headers)
 
     all_records = []
@@ -330,16 +329,12 @@ async def handle_medleyjewellery(url, max_pages):
     page_count = 1
     success_count = 0
 
-    while page_count < max_pages:
-        current_url= build_url_with_loadmore(url, page_count)
+    while page_count <= max_pages:
+        current_url = build_url_with_loadmore(url, page_count)
 
         logging.info(f"Processing page {page_count}: {current_url}")
-        # Create a new browser instance for each page
-        browser = None
-        page = None
         try:
             async with async_playwright() as p:
-                
                 browser, page = await get_browser_with_proxy_strategy(p, current_url)
                 log_event(f"Successfully loaded: {current_url}")
 
@@ -353,13 +348,11 @@ async def handle_medleyjewellery(url, max_pages):
                         break
                     prev_product_count = current_product_count
 
-                # Final scroll to catch stragglers
+                # Final scroll
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await page.wait_for_timeout(3000)
 
-                # Select all products
                 products = await page.query_selector_all("li.snize-product[data-original-product-id]")
-
                 logging.info(f"Total products found on page {page_count}: {len(products)}")
 
                 page_title = await page.title()
@@ -371,56 +364,94 @@ async def handle_medleyjewellery(url, max_pages):
 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
                     try:
-                        # Wait for the title element to be attached (use an appropriate timeout)
+                        # Extract basic product info
                         product_name_element = await product.query_selector("span.snize-title")
-                        if product_name_element:
-                            product_name = await product_name_element.inner_text()
-                        else:
-                            product_name = "N/A"  # Fallback in case the element is not found
-                    except Exception as e:
-                        # Log the error if something goes wrong
-                        logging.error(f"Error extracting product name: {e}")
-                        product_name = "N/A"
+                        product_name = await product_name_element.inner_text() if product_name_element else "N/A"
 
-                    try:
-                        # Wait for the price element to be available
-                        price_element = await product.query_selector("span.snize-price")
-                        if price_element:
-                            price = await price_element.inner_text()
-                            price = price.strip()  # Remove extra spaces if any
-                        else:
-                            price = "N/A"  # Fallback if the price element is not found
-                    except Exception as e:
-                        # Log the error if something goes wrong
-                        logging.error(f"Error extracting price: {e}")
+                        # Extract price information
                         price = "N/A"
+                        try:
+                            price_element = await product.query_selector("span.snize-price")
+                            discounted_price = (await price_element.inner_text()).strip() if price_element else "N/A"
+                            
+                            original_price_element = await product.query_selector("span.snize-discounted-price")
+                            original_price = (await original_price_element.inner_text()).strip() if original_price_element else None
+                            
+                            price = f"{discounted_price}|{original_price}" if original_price else discounted_price
+                        except Exception as price_error:
+                            logging.error(f"Error extracting price for product {row_num}: {str(price_error)}")
 
-                    try:
-                        # Wait for the image element to be available
+                        # Extract image URL
                         image_element = await product.query_selector("span.snize-thumbnail img")
-                        if image_element:
-                            image_url = await image_element.get_attribute("src")
-                        else:
-                            image_url = "N/A"  # Fallback if no image is found
+                        image_url = await image_element.get_attribute("src") if image_element else "N/A"
+
+                        # Extract gold type from product name
+                        kt = "N/A"
+                        try:
+                            gold_type_match = re.findall(r"(\d{1,2}k\s*(?:Yellow|White|Rose)?\s*Gold|Platinum)", product_name, re.IGNORECASE)
+                            kt = ", ".join(gold_type_match) if gold_type_match else "N/A"
+                        except re.error as regex_error:
+                            logging.error(f"Regex error extracting gold type for product {row_num}: {str(regex_error)}")
+
+                        # Extract Diamond Weight
+                        diamond_weight = "N/A"
+                        try:
+                            diamond_weight_match = re.findall(r"(\d+(?:\.\d+)?\s*ct\w*)", product_name, re.IGNORECASE)
+                            diamond_weight = ", ".join(diamond_weight_match) if diamond_weight_match else "N/A"
+                        except re.error as regex_error:
+                            logging.error(f"Regex error extracting diamond weight for product {row_num}: {str(regex_error)}")
+
+                        # Extract additional information (without background/color info)
+                        additional_info_parts = []
+
+                        # 1. Product labels (like "Final Sale")
+                        try:
+                            label_element = await product.query_selector("div.snize-product-label")
+                            if label_element:
+                                label_text = (await label_element.inner_text()).strip()
+                                additional_info_parts.append(f"Label:{label_text}")
+                        except Exception as e:
+                            logging.error(f"Error extracting label for product {row_num}: {str(e)}")
+
+                        # 2. Size information
+                        try:
+                            size_element = await product.query_selector("div.snize-size-select-box .snize-size-active")
+                            if size_element:
+                                size_text = (await size_element.inner_text()).strip()
+                                additional_info_parts.append(f"Size:{size_text}")
+                        except Exception as e:
+                            logging.error(f"Error extracting size for product {row_num}: {str(e)}")
+
+                        # 3. Ratings information
+                        try:
+                            ratings_element = await product.query_selector("span.snize-reviews")
+                            if ratings_element:
+                                ratings_text = (await ratings_element.inner_text()).strip()
+                                additional_info_parts.append(f"Ratings:{ratings_text}")
+                        except Exception as e:
+                            logging.error(f"Error extracting ratings for product {row_num}: {str(e)}")
+
+                        # Combine all additional info with | separator
+                        additional_info = " | ".join(additional_info_parts) if additional_info_parts else "N/A"
+
+                        unique_id = str(uuid.uuid4())
+                        image_tasks.append((row_num, unique_id, asyncio.create_task(
+                            download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
+                        )))
+
+                        records.append((
+                            unique_id, current_date, page_title, product_name, None, 
+                            kt, price, diamond_weight, additional_info
+                        ))
+                        
+                        sheet.append([
+                            current_date, page_title, product_name, None, kt, 
+                            price, diamond_weight, time_only, image_url, additional_info
+                        ])
+
                     except Exception as e:
-                        # Log the error if something goes wrong
-                        logging.error(f"Error extracting image URL: {e}")
-                        image_url = "N/A"
-
-                    gold_type_match = re.findall(r"(\d{1,2}ct\s*(?:Yellow|White|Rose)?\s*Gold|Platinum)", product_name, re.IGNORECASE)
-                    kt = ", ".join(gold_type_match) if gold_type_match else "N/A"
-
-                    # Extract Diamond Weight (supports "1.85ct", "2ct", "1.50ct", etc.)
-                    diamond_weight_match = re.findall(r"(\d+(?:\.\d+)?\s*ct)", product_name, re.IGNORECASE)
-                    diamond_weight = ", ".join(diamond_weight_match) if diamond_weight_match else "N/A"
-
-                    unique_id = str(uuid.uuid4())
-                    image_tasks.append((row_num, unique_id, asyncio.create_task(
-                        download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
-                    )))
-
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                        logging.error(f"Error processing entire product {row_num}: {str(e)}")
+                        continue
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -437,7 +468,10 @@ async def handle_medleyjewellery(url, max_pages):
                         
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (
+                                    record[0], record[1], record[2], record[3], 
+                                    image_path, record[5], record[6], record[7], record[8]
+                                )
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")
@@ -464,7 +498,6 @@ async def handle_medleyjewellery(url, max_pages):
             await asyncio.sleep(random.uniform(2, 5))
             
         page_count += 1
-
 
     # Final save and database operations
     wb.save(file_path)

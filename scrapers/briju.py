@@ -300,7 +300,7 @@ async def handle_briju(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -326,16 +326,14 @@ async def handle_briju(url, max_pages):
                 prev_product_count = 0
                 for _ in range(10):
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await asyncio.sleep(random.uniform(1, 2))  # Random delay between scrolls
-                    current_product_count = await page.locator('.CategoryPage-ProductListWrapper').count()
+                    await asyncio.sleep(random.uniform(1, 2))
+                    current_product_count = await page.locator('.ProductCard').count()
                     if current_product_count == prev_product_count:
                         break
                     prev_product_count = current_product_count
 
-
-                product_wrapper = await page.query_selector("ul.ProductListPage.CategoryProductList-Page")
-
-                products = await product_wrapper.query_selector_all("li.ProductCard ") if product_wrapper else []
+                product_wrapper = await page.query_selector("ul.ProductListPage")
+                products = await product_wrapper.query_selector_all("li.ProductCard") if product_wrapper else []
                 logging.info(f"Total products found on page {page_count}: {len(products)}")
 
                 page_title = await page.title()
@@ -347,32 +345,106 @@ async def handle_briju(url, max_pages):
 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
                     try:
-                        product_name = await (await product.query_selector("h3.ProductCard-Name")).inner_text()
-                    except:
+                        # Product name
+                        name_element = await product.query_selector("h3.ProductCard-Name")
+                        product_name = await name_element.inner_text() if name_element else "N/A"
+                    except Exception as e:
+                        print(f"[Product Name] Error: {e}")
                         product_name = "N/A"
 
+                    # Price handling - comprehensive approach
+                    price_str = "N/A"
+                    original_price = "N/A"
+                    sale_price = "N/A"
                     try:
-                        price = await (await product.query_selector("p.ProductPrice")).inner_text()
-                    except:
-                        price = "N/A"
+                        # Get original price (strikethrough)
+                        original_price_element = await product.query_selector("del.ProductPrice-HighPrice")
+                        original_price = await original_price_element.inner_text() if original_price_element else "N/A"
+                        
+                        # Get sale price
+                        sale_price_element = await product.query_selector("p.ProductPrice ins span")
+                        sale_price = await sale_price_element.inner_text() if sale_price_element else "N/A"
+                        
+                        # Get currency (PLN is hardcoded as it appears to be consistent)
+                        currency = "PLN"
+                        
+                        # Format price string
+                        if original_price != "N/A" and sale_price != "N/A":
+                            price_str = f"{original_price} PLN | {sale_price} PLN"
+                        elif sale_price != "N/A":
+                            price_str = f"{sale_price} PLN"
+                        else:
+                            price_str = original_price if original_price != "N/A" else "N/A"
+                            
+                        # Add discount percentage if available
+                        discount_element = await product.query_selector(".ProductCardLabels-discountText")
+                        if discount_element:
+                            discount_text = await discount_element.inner_text()
+                            price_str += f" ({discount_text.strip()})"
+                    except Exception as e:
+                        print(f"[Price] Error: {e}")
+                        price_str = "N/A"
 
                     try:
-                        # Select the first <img> tag inside <figure.ProductCard-Figure>
-                        image_tag = await product.query_selector("figure.ProductCard-Figure img")
+                        # Image URL - get the first image in the product card
+                        image_element = await product.query_selector("figure.ProductCard-Figure img")
+                        image_url = await image_element.get_attribute("src") if image_element else "N/A"
                         
-                        if image_tag:
-                            # Get the 'src' attribute of the first image
-                            image_url = await image_tag.get_attribute("src")
-                        else:
-                            image_url = "N/A"
+                        # Handle protocol-relative URLs
+                        if image_url and image_url.startswith("//"):
+                            image_url = f"https:{image_url}"
+                        elif image_url and image_url.startswith("/"):
+                            image_url = f"https://www.briju.pl{image_url}"
                     except Exception as e:
-                        # Log the exception if something goes wrong
-                        logging.error(f"Error retrieving image URL: {e}")
+                        print(f"[Image URL] Error: {e}")
                         image_url = "N/A"
 
+                    if product_name == "N/A" or image_url == "N/A":
+                            print(f"Skipping product due to missing data: Name: {product_name}, Image: {image_url}")
+                            continue
 
 
-                    gold_type_match = re.findall(r"(\d{1,2}ct\s*(?:Yellow|White|Rose)?\s*Gold|Platinum)", product_name, re.IGNORECASE)
+                    # Extract additional info
+                    additional_info = []
+                    
+                    if product_name == "N/A" or image_url == "N/A":
+                            print(f"Skipping product due to missing data: Name: {product_name}, Image: {image_url}")
+                            continue
+
+
+                    # Check for discount label
+                    try:
+                        discount_label = await product.query_selector(".ProductCardLabels-Item_discount")
+                        if discount_label:
+                            discount_text = await discount_label.inner_text()
+                            if discount_text.strip():
+                                additional_info.append(f"Discount: {discount_text.strip()}")
+                    except:
+                        pass
+                    
+                    # Check for "New" label
+                    try:
+                        new_label = await product.query_selector(".ProductCard-IsNewLabel")
+                        if new_label:
+                            additional_info.append("New Arrival")
+                    except:
+                        pass
+                    
+                    # Check for omnibus info (lowest price)
+                    try:
+                        omnibus_info = await product.query_selector(".ProductCard-OmnibusInfo")
+                        if omnibus_info:
+                            omnibus_text = await omnibus_info.inner_text()
+                            if omnibus_text.strip():
+                                additional_info.append(omnibus_text.strip())
+                    except:
+                        pass
+                    
+                    # Join all additional info with pipe separator
+                    additional_info_str = " | ".join(additional_info) if additional_info else "N/A"
+
+                    # Extract product details
+                    gold_type_match = re.findall(r"(\d{3}\s*Gold|\d{1,2}ct\s*(?:Yellow|White|Rose)?\s*Gold|Platinum)", product_name, re.IGNORECASE)
                     kt = ", ".join(gold_type_match) if gold_type_match else "N/A"
 
                     # Extract Diamond Weight (supports "1.85ct", "2ct", "1.50ct", etc.)
@@ -384,8 +456,30 @@ async def handle_briju(url, max_pages):
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((
+                        unique_id,
+                        current_date,
+                        page_title,
+                        product_name,
+                        None,  # Placeholder for image path
+                        kt,
+                        price_str,
+                        diamond_weight,
+                        additional_info_str
+                    ))
+                    
+                    sheet.append([
+                        current_date,
+                        page_title,
+                        product_name,
+                        None,  # Placeholder for image
+                        kt,
+                        price_str,
+                        diamond_weight,
+                        time_only,
+                        image_url,
+                        additional_info_str
+                    ])
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -402,7 +496,17 @@ async def handle_briju(url, max_pages):
                         
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (
+                                    record[0],
+                                    record[1],
+                                    record[2],
+                                    record[3],
+                                    image_path,
+                                    record[5],
+                                    record[6],
+                                    record[7],
+                                    record[8]
+                                )
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")
@@ -430,10 +534,12 @@ async def handle_briju(url, max_pages):
             
         page_count += 1
 
+    if not all_records:
+        return None, None, None
 
     # Final save and database operations
     wb.save(file_path)
-    log_event(f"Data saved to {file_path}")
+    log_event(f"Data saved to {file_path} | IP: {ip_address}")
 
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")

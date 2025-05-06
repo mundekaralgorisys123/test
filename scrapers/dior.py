@@ -30,7 +30,6 @@ EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
 
 
-
 # Resize image if needed
 def resize_image(image_data, max_size=(100, 100)):
     try:

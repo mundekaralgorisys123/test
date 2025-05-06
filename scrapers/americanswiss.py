@@ -28,7 +28,6 @@ load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
 
 
-
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')

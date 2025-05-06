@@ -63,6 +63,9 @@ def build_high_res_url(image_url, size="477x477"):
     modified_url = re.sub(r'(_\d+x\d+)(?=\.\w+$)', f'_{size}', image_url)
     return modified_url + query
 
+
+
+
 async def download_image_async(image_url, product_name, timestamp, image_folder, unique_id, retries=3):
     if not image_url or image_url == "N/A":
         return "N/A"
@@ -71,69 +74,35 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
     image_full_path = os.path.join(image_folder, image_filename)
 
     high_res_url = build_high_res_url(image_url, size="477x477")
-    fallback_url = "https:" + image_url if image_url.startswith("//") else image_url
 
     async with httpx.AsyncClient(timeout=10.0) as client:
-        # Try HEAD request to check if high-res image exists
-        try:
-            head_response = await client.head(high_res_url)
-            if head_response.status_code == 200:
-                image_to_download = high_res_url
-            else:
-                image_to_download = fallback_url
-        except Exception as e:
-            logging.warning(f"Could not check high-res image. Falling back. Reason: {e}")
-            image_to_download = fallback_url
-
+        # Try high-resolution first
         for attempt in range(retries):
             try:
-                response = await client.get(image_to_download)
+                response = await client.get(high_res_url)
                 response.raise_for_status()
                 with open(image_full_path, "wb") as f:
                     f.write(response.content)
                 return image_full_path
             except httpx.RequestError as e:
-                logging.warning(f"Retry {attempt + 1}/{retries} - Error downloading {product_name}: {e}")
-
-    logging.error(f"Failed to download {product_name} after {retries} attempts.")
-    return "N/A"
+                logging.warning(f"Retry {attempt + 1}/{retries} - High-res failed for {product_name}: {e}")
+        
+        # Fallback to original image
+        try:
+            response = await client.get(image_url)
+            response.raise_for_status()
+            with open(image_full_path, "wb") as f:
+                f.write(response.content)
+            return image_full_path
+        except httpx.RequestError as e:
+            logging.error(f"Fallback failed for {product_name}: {e}")
+            return "N/A"
 
 
 def random_delay(min_sec=1, max_sec=3):
     """Introduce a random delay to mimic human-like behavior."""
     time.sleep(random.uniform(min_sec, max_sec))
 
-
-# async def safe_goto_and_wait(page, url, retries=3):
-#     for attempt in range(retries):
-#         try:
-#             print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-#             await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-
-
-#             # Wait for the selector with a longer timeout
-#             product_cards = await page.wait_for_selector(".results--container", state="attached", timeout=30000)
-
-#             # Optionally validate at least 1 is visible (Playwright already does this)
-#             if product_cards:
-#                 print("[Success] Product cards loaded.")
-#                 return
-#         except Error as e:
-#             logging.error(f"Error navigating to {url} on attempt {attempt + 1}: {e}")
-#             if attempt < retries - 1:
-#                 logging.info("Retrying after waiting a bit...")
-#                 random_delay(1, 3)  # Add a delay before retrying
-#             else:
-#                 logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-#                 raise
-#         except TimeoutError as e:
-#             logging.warning(f"TimeoutError on attempt {attempt + 1} navigating to {url}: {e}")
-#             if attempt < retries - 1:
-#                 logging.info("Retrying after waiting a bit...")
-#                 random_delay(1, 3)  # Add a delay before retrying
-#             else:
-#                 logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-#                 raise
 
 ########################################  safe_goto_and_wait ####################################################################
 
@@ -293,8 +262,6 @@ def check_url_against_rules(url: str, disallowed_patterns: List[str]) -> bool:
     return False
 
 
-
-
 def build_url_with_loadmore(base_url: str, page_count: int) -> str:
     parsed_url = urlparse(base_url.rstrip('?'))
     query_params = parse_qs(parsed_url.query)
@@ -316,7 +283,7 @@ async def handle_armansfinejewellery(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -339,7 +306,6 @@ async def handle_armansfinejewellery(url, max_pages):
                 browser, page = await get_browser_with_proxy_strategy(p, current_url)
                 log_event(f"Successfully loaded: {current_url}")
 
-                # Scroll to load all products
                 # Scroll to load all products
                 prev_product_count = 0
                 for _ in range(10):
@@ -369,10 +335,28 @@ async def handle_armansfinejewellery(url, max_pages):
                         product_name = "N/A"
 
                     try:
-                        price = await (await product.query_selector("span.money")).inner_text()
-                        price = price.strip()
-                    except:
+                        money_els = await product.query_selector_all("span.money")
                         price = "N/A"
+                        
+                        for money_el in money_els:
+                            price_text = (await money_el.inner_text()).strip()
+                            if price_text:
+                                price = price_text
+                                break
+
+                        # Optionally prepend "From" if the label exists
+                        label_el = await product.query_selector("span.price--label")
+                        if label_el:
+                            label_text = (await label_el.inner_text()).strip()
+                            if label_text.lower() == "from" and price != "N/A":
+                                price = f"From {price}"
+
+                    except Exception as e:
+                        print(f"Price error: {e}")
+                        price = "N/A"
+
+
+
 
 
                     try:
@@ -385,11 +369,50 @@ async def handle_armansfinejewellery(url, max_pages):
                     except Exception as e:
                         image_url = "N/A"
                         logging.warning(f"Failed to extract image: {e}")
+                        
+                        
+                    additional_info = []
 
+                    try:
+                        # Extract price label, e.g., "from"
+                        price_label_elem = await product.query_selector("span.price--label")
+                        if price_label_elem:
+                            price_label = (await price_label_elem.inner_text()).strip()
+                            additional_info.append(price_label)
+                        else:
+                            additional_info.append("No price label")
 
+                        # Check if product has reviews (filled star icons)
+                        rating_icons = await product.query_selector_all("span.spr-starrating i.spr-icon-star")
+                        if rating_icons:
+                            additional_info.append(f"Rating: {len(rating_icons)} stars")
+                        else:
+                            additional_info.append("No rating")
 
+                        # Extract a short description snippet
+                        desc_elem = await product.query_selector("div.productitem--description > p")
+                        if desc_elem:
+                            desc_text = (await desc_elem.inner_text()).strip()
+                            additional_info.append(desc_text[:60] + "..." if len(desc_text) > 60 else desc_text)
+                        else:
+                            additional_info.append("No description")
+
+                    except Exception as e:
+                        additional_info.append("Error extracting info")
+
+                    # Join collected additional info
+                    additional_info_str = " | ".join(additional_info)
+
+                        
+                    if product_name == "N/A" and price == "N/A" and image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue     
+
+                    
+                     
                     gold_type_match = re.findall(r"(\d{1,2}ct\s*(?:Yellow|White|Rose)?\s*Gold|Platinum)", product_name, re.IGNORECASE)
                     kt = ", ".join(gold_type_match) if gold_type_match else "N/A"
+
 
                     # Extract Diamond Weight (supports "1.85ct", "2ct", "1.50ct", etc.)
                     diamond_weight_match = re.findall(r"(\d+(?:\.\d+)?\s*ct)", product_name, re.IGNORECASE)
@@ -400,8 +423,8 @@ async def handle_armansfinejewellery(url, max_pages):
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -418,7 +441,7 @@ async def handle_armansfinejewellery(url, max_pages):
                         
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")
@@ -448,13 +471,25 @@ async def handle_armansfinejewellery(url, max_pages):
 
 
     # Final save and database operations
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
 
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path
+

@@ -18,7 +18,7 @@ from database import insert_into_db, create_table
 from limit_checker import update_product_count
 import random
 import re
-
+from proxysetup import get_browser_with_proxy_strategy
 # Load environment variables
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
@@ -148,9 +148,8 @@ async def handle_fields(initial_url, max_pages):
         logging.info(f"--- Scraping page {page_num}: {current_url}")
 
         async with async_playwright() as p:
-            browser = await p.chromium.connect_over_cdp(PROXY_URL)
-            page = await browser.new_page()
-            await page.goto(current_url, timeout=180000, wait_until="domcontentloaded")
+            product_wrapper = "div.tile-container"
+            browser, page = await get_browser_with_proxy_strategy(p, current_url, product_wrapper)
 
             # On first page only: accept cookies & remove overlays
             if page_num == 1:

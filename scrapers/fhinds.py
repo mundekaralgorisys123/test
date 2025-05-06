@@ -268,7 +268,7 @@ async def handle_fhinds(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -335,6 +335,52 @@ async def handle_fhinds(url, max_pages):
                         image_url = f"https://www.fhinds.co.uk{src}" if src else "N/A"
                     except:
                         image_url = "N/A"
+                        
+                    
+                    additional_info = []
+
+                    # Check delivery availability
+                    try:
+                        delivery_available = await product.query_selector("div.delivery.available span.text")
+                        if delivery_available:
+                            delivery_text = await delivery_available.inner_text()
+                            if delivery_text:
+                                additional_info.append(delivery_text.strip())
+                        else:
+                            additional_info.append("Delivery not available")
+                    except Exception:
+                        additional_info.append("Delivery not available")
+
+                    # Check collection availability
+                    try:
+                        collection_available = await product.query_selector("div.collection.available span.text")
+                        if collection_available:
+                            collection_text = await collection_available.inner_text()
+                            if collection_text:
+                                additional_info.append(collection_text.strip())
+                        else:
+                            additional_info.append("Collection not available")
+                    except Exception:
+                        additional_info.append("Collection not available")
+
+                    # Check for Out of Stock
+                    try:
+                        overlay_el = await product.query_selector("span.overlay-message")
+                        if overlay_el:
+                            overlay_text = await overlay_el.inner_text()
+                            if overlay_text:
+                                additional_info.append(overlay_text.strip())
+                    except Exception:
+                        pass
+
+                    # Join into final string
+                    additional_info_str = " | ".join(info for info in additional_info if info)
+
+                    
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue   
+                        
 
                     gold_type_pattern = r"(\d{1,2}ct\s*(?:Yellow|White|Rose)?\s*Gold|Platinum|Silver)"
                     gold_type_match = re.search(gold_type_pattern, product_name, re.IGNORECASE)
@@ -349,8 +395,8 @@ async def handle_fhinds(url, max_pages):
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
 
                 for row_num, unique_id, task in image_tasks:
                     try:
@@ -365,7 +411,7 @@ async def handle_fhinds(url, max_pages):
                                 image_path = "N/A"
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")
@@ -386,12 +432,19 @@ async def handle_fhinds(url, max_pages):
 
         page_count += 1
 
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
+
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
-
+     # Return necessary information
     return base64_encoded, filename, file_path

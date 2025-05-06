@@ -22,6 +22,7 @@ import aiohttp
 from io import BytesIO
 from openpyxl.drawing.image import Image as XLImage
 import httpx
+from proxysetup import get_browser_with_proxy_strategy
 # Load environment variables from .env file
 from functools import partial
 load_dotenv()
@@ -96,52 +97,6 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
     logging.error(f"Failed to download {product_name} after {retries} attempts.")
     return "N/A"
 
-def random_delay(min_sec=1, max_sec=3):
-    """Introduce a random delay to mimic human-like behavior."""
-    time.sleep(random.uniform(min_sec, max_sec))
-
-async def scroll_and_wait(page):
-    """Scroll down to load lazy-loaded products."""
-    previous_height = await page.evaluate("document.body.scrollHeight")
-    await page.evaluate("window.scrollBy(0, document.body.scrollHeight);")
-    new_height = await page.evaluate("document.body.scrollHeight")
-    return new_height > previous_height  # Returns True if more content is loaded
-
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-
-
-            # Wait for the selector with a longer timeout
-            product_cards = await page.wait_for_selector(".ps-category-items", state="attached", timeout=30000)
-
-            # Optionally validate at least 1 is visible (Playwright already does this)
-            if product_cards:
-                print("[Success] Product cards loaded.")
-                return
-        except Error as e:
-            logging.error(f"Error navigating to {url} on attempt {attempt + 1}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
-        except TimeoutError as e:
-            logging.warning(f"TimeoutError on attempt {attempt + 1} navigating to {url}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
-
-            
-
-
-
 async def handle_goldmark(url, max_pages):
     ip_address = get_public_ip()
     logging.info(f"Scraping started for: {url} from IP: {ip_address}, max_pages: {max_pages}")
@@ -165,9 +120,13 @@ async def handle_goldmark(url, max_pages):
 
     page_count = 1
     success_count = 0
-
+    current_url = url
     while page_count <= max_pages:
-        current_url = f"{url}?p={page_count}"
+        if page_count > 1:
+            if '?' in current_url:
+                current_url = url + f"&p={page_count}"
+            else:
+                current_url = url + f"?p={page_count}"
         logging.info(f"Processing page {page_count}: {current_url}")
         
         # Create a new browser instance for each page
@@ -175,14 +134,8 @@ async def handle_goldmark(url, max_pages):
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                
-                # Configure timeouts for this page
-                page = await context.new_page()
-                page.set_default_timeout(120000)  # 2 minute timeout
-                
-                await safe_goto_and_wait(page, current_url)
+                product_wrapper = '.ps-category-items'
+                browser , page = await get_browser_with_proxy_strategy(p, current_url,product_wrapper)
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all products
@@ -197,6 +150,7 @@ async def handle_goldmark(url, max_pages):
 
 
                 product_wrapper = await page.query_selector("div.ps-category-items")
+                print(f"Product wrapper found: {product_wrapper}")
                 products = await product_wrapper.query_selector_all("div.ps-category-item") if product_wrapper else []
                 logging.info(f"Total products found on page {page_count}: {len(products)}")
 

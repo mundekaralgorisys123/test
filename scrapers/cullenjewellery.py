@@ -19,10 +19,10 @@ from playwright.async_api import async_playwright, TimeoutError
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
 
+app = Flask(__name__)
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
+EXCEL_DATA_PATH = os.path.join(app.root_path, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
-
 
 async def download_image(session, image_url, product_name, timestamp, image_folder, unique_id):
     if not image_url or image_url == "N/A":
@@ -43,6 +43,7 @@ async def download_image(session, image_url, product_name, timestamp, image_fold
     return "N/A"
 
 async def handle_cullenjewellery(url, max_pages):
+    
     ip_address = get_public_ip()
     logging.info(f"Starting scrape for {url} from IP: {ip_address}")
 
@@ -113,36 +114,47 @@ async def handle_cullenjewellery(url, max_pages):
                 page_title = await page.title()
 
                 for idx, product in enumerate(new_products):
+                    # Extract product name from <h2>
+                    # Product name
                     try:
-                        product_name_tag = await product.query_selector("h2.svelte-yv4ygw")
+                        product_name_tag = await product.query_selector("h2.svelte-yv4ygw") or await product.query_selector("h3.svelte-yv4ygw")
                         product_name = await product_name_tag.inner_text() if product_name_tag else "N/A"
                     except Exception as e:
-                        print(f"[Product Name] Error: {e}")
+                        logging.error(f"[Product Name] Error: {e}")
                         product_name = "N/A"
 
+
+                    # Extract price from <div class="price">
                     try:
                         price_tag = await product.query_selector("div.price.svelte-yv4ygw")
                         price = await price_tag.inner_text() if price_tag else "N/A"
                     except Exception as e:
-                        print(f"[Price] Error: {e}")
+                        logging.error(f"[Price] Error: {e}")
                         price = "N/A"
 
 
+
                     try:
-                        # Select the first visible slider (div with class 'slider' that doesn't have the 'hidden' class)
-                        slider = await product.query_selector('div.slider.svelte-t7drm4:not(.hidden)')
+                        # Directly select the image inside the slider div
+                        await product.scroll_into_view_if_needed()
+                        img_element = await product.query_selector('div.slider.svelte-t7drm4 img.fillimage')
                         
-                        # If a visible slider is found, find the image within it
-                        img = await slider.query_selector('img.fillimage') if slider else None
-                        
-                        # Retrieve the 'src' attribute of the image if it exists
-                        image_url = await img.get_attribute('src') if img else "N/A"
-                        
+                        # Safely extract the src attribute
+                        image_url = await img_element.get_attribute("src") if img_element else "N/A"
+
+                        # Optional: Validate URL format
+                        if not image_url.startswith(('http:', 'https:')):
+                            image_url = "N/A"
+
                     except Exception as e:
-                        print(f"[Image URL] Error: {e}")
+                        logging.error(f"[Image URL] Error: {e}")
                         image_url = "N/A"
 
 
+
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue  
 
 
                     # Extract Gold Type (e.g., "14K Yellow Gold").

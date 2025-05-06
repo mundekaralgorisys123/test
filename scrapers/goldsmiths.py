@@ -6,21 +6,19 @@ import uuid
 import base64
 import asyncio
 from datetime import datetime
-
+from proxysetup import get_browser_with_proxy_strategy
 from dotenv import load_dotenv
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
-
 import httpx
 from playwright.async_api import async_playwright
-
+import random
+from openpyxl.drawing.image import Image
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
-# Load environment variables
-load_dotenv()
-PROXY_URL = os.getenv("PROXY_URL")
 
 # Setup paths
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -65,147 +63,180 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
     return "N/A"
 
 
-async def safe_goto_and_wait(page, url):
-    for attempt in range(3):
-        try:
-            logging.info(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-            await page.wait_for_selector(".gridBlock.row", timeout=15_000)
-            count = await page.eval_on_selector_all(".gridBlock.row > *", "els => els.length")
-            logging.info(f"[Success] Product grid loaded with {count} items.")
-            return
-        except Exception as e:
-            logging.warning(f"[Retry {attempt + 1}] Error loading page: {e}")
-            await asyncio.sleep(2)
-    raise Exception(f"[Error] Failed to load product grid on {url} after retries.")
 
+def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    separator = '&' if '?' in base_url else '?'
+    return f"{base_url}{separator}page={page_count}&sort="
 
 async def handle_goldsmiths(url, max_pages):
     ip_address = get_public_ip()
-    logging.info(f"Starting Goldsmiths scraping | IP: {ip_address} | URL: {url}")
+    logging.info(f"Scraping started for: {url} from IP: {ip_address}, max_pages: {max_pages}")
 
+    # Prepare directories and files
     os.makedirs(EXCEL_DATA_PATH, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     image_folder = os.path.join(IMAGE_SAVE_PATH, timestamp)
     os.makedirs(image_folder, exist_ok=True)
 
+    # Create workbook and setup
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
     sheet.append(headers)
 
-    current_date = datetime.now().strftime("%Y-%m-%d")
-    time_only = datetime.now().strftime("%H.%M")
-    current_page = 1
-    current_url = f"{url}?page={current_page}&sort="
-    row_counter = 2  # Start from Excel row 2 (after headers)
+    all_records = []
+    filename = f"handle_goldsmiths_{datetime.now().strftime('%Y-%m-%d_%H.%M')}.xlsx"
+    file_path = os.path.join(EXCEL_DATA_PATH, filename)
 
-    records = []
+    page_count = 1
+    success_count = 0
+
     async with async_playwright() as p:
-        browser = await p.chromium.connect_over_cdp(PROXY_URL)
-        page = await browser.new_page()
-        try:
-            while current_url and current_page <= max_pages:
-                await safe_goto_and_wait(page, current_url)
+        while page_count <= max_pages:
+            current_url= build_url_with_loadmore(url, page_count)
+            # current_url = build_url_with_loadmore(url, page_count)
+            # logging.info(f"Processing page {page_count}: {current_url}")
+            browser = None
+            page = None
+            try:
+                # Use the new proxy strategy function
+                product_wrapper=".gridBlock.row"
+                browser, page = await get_browser_with_proxy_strategy(p, current_url,product_wrapper)
                 log_event(f"Successfully loaded: {current_url}")
 
-                prev_count = 0
-                for _ in range(50):
+                # Scroll to load all products
+                prev_product_count = 0
+                for _ in range(10):
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await asyncio.sleep(2)
-                    try:
-                        await page.wait_for_selector(".productTile", timeout=5000)
-                        current_count = await page.locator(".productTile").count()
-                        if current_count == prev_count:
-                            break
-                        prev_count = current_count
-                    except:
+                    await asyncio.sleep(random.uniform(1, 2))  # Random delay between scrolls
+                    current_product_count = await page.locator('.productTile').count()
+                    if current_product_count == prev_product_count:
                         break
+                    prev_product_count = current_product_count
 
-                page_title = await page.title()
+
                 wrapper = await page.query_selector("div.gridBlock.row")
                 products = await wrapper.query_selector_all("div.productTile") if wrapper else []
                 logging.info(f"Total products found: {len(products)}")
 
+                page_title = await page.title()
+                current_date = datetime.now().strftime("%Y-%m-%d")
+                time_only = datetime.now().strftime("%H.%M")
+
+                records = []
                 image_tasks = []
 
-                for product in products:
+                for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
                     try:
                         product_name_el = await product.query_selector("div.productTileName")
-                        price_el = await product.query_selector("div.productTilePrice")
-                        if not product_name_el or not price_el:
-                            continue
                         product_name = (await product_name_el.inner_text()).strip()
+                    except:
+                        product_name = "N/A"
+
+                    try:
+                        price_el = await product.query_selector("div.productTilePrice")
                         price = (await price_el.inner_text()).strip()
+                    except:
+                        price = "N/A"
 
-                        image_url = "N/A"
-                        try:
-                            image_elements = await product.query_selector_all("img.productListerPrimary")
-                            urls = [
-                                await img.get_attribute("src") or await img.get_attribute("data-src")
-                                for img in image_elements
-                            ]
-                            urls = [u for u in urls if u and u.startswith("https://")]
-                            image_url = urls[0] if urls else "N/A"
-                        except Exception as e:
-                            logging.warning(f"Image extraction error: {e}")
+                    try:
+                        await product.scroll_into_view_if_needed()
+                        image_elements = await product.query_selector_all("img")
+                        urls = []
+                        for img in image_elements:
+                            srcset = await img.get_attribute("srcset") or await img.get_attribute("data-srcset")
+                            if srcset:
+                                # Split by comma, take the last entry (largest image), and extract the URL
+                                last_entry = srcset.split(",")[-1].strip().split(" ")[0]
+                                if last_entry.startswith("//"):
+                                    last_entry = "https:" + last_entry
+                                urls.append(last_entry)
+                            else:
+                                # fallback to src or data-src
+                                fallback = await img.get_attribute("src") or await img.get_attribute("data-src")
+                                if fallback and fallback.startswith("http"):
+                                    urls.append(fallback)
 
-                        kt_match = re.search(r"(\d{1,2}ct?\s*(?:Yellow|White|Rose)?\s*Gold)", product_name, re.IGNORECASE)
-                        kt = kt_match.group(1) if kt_match else "N/A"
-                        dia_match = re.search(r"(\d+(?:\.\d+)?\s*ct(?:tw|t\.?w\.?)?)", product_name, re.IGNORECASE)
-                        diamond_weight = dia_match.group(1) if dia_match else "N/A"
-
-                        unique_id = str(uuid.uuid4())
-                        task = asyncio.create_task(
-                            download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
-                        )
-                        image_tasks.append((row_counter, unique_id, task))
-
-                        records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                        sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
-                        row_counter += 1
+                        image_url = urls[0] if urls else "N/A"
                     except Exception as e:
-                        logging.error(f"Product parsing error: {e}")
-                        continue
+                        image_url = "N/A"
 
+
+                    gold_type_match = re.search(r"\b\d+K\s+\w+\s+\w+\b", product_name)
+                    kt = gold_type_match.group() if gold_type_match else "Not found"
+
+
+                    diamond_weight_match = re.search(r"\d+[-/]?\d*/?\d*\s*ct\s*tw", product_name)
+                    diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+
+                    unique_id = str(uuid.uuid4())
+                    image_tasks.append((row_num, unique_id, asyncio.create_task(
+                        download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
+                    )))
+
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+
+                # Process images and update records
                 for row_num, unique_id, task in image_tasks:
-                    image_path = await task
-                    if image_path != "N/A":
-                        try:
-                            img = ExcelImage(image_path)
-                            img.width, img.height = 100, 100
-                            sheet.add_image(img, f"D{row_num}")
-                        except Exception as img_err:
-                            logging.warning(f"Failed to insert image: {img_err}")
+                    try:
+                        image_path = await asyncio.wait_for(task, timeout=60)
+                        if image_path != "N/A":
+                            try:
+                                img = Image(image_path)
+                                img.width, img.height = 100, 100
+                                sheet.add_image(img, f"D{row_num}")
+                            except Exception as img_error:
+                                logging.error(f"Error adding image to Excel: {img_error}")
+                                image_path = "N/A"
+                        
+                        for i, record in enumerate(records):
+                            if record[0] == unique_id:
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                break
+                    except asyncio.TimeoutError:
+                        logging.warning(f"Timeout downloading image for row {row_num}")
 
-                    for i, record in enumerate(records):
-                        if record[0] == unique_id:
-                            records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
-                            break
+                all_records.extend(records)
+                success_count += 1
 
-                next_button = await page.query_selector("div#pagination-LoadMore")
-                if next_button:
-                    next_page = await next_button.get_attribute("data-next-page")
-                    if next_page:
-                        current_page += 1
-                        current_url = f"{url}?q=&page={current_page}&sort="
-                        logging.info(f"[Next Page] {current_url}")
-                        continue
-                break
-        finally:
-            await page.close()
-            await browser.close()
+                # Save progress after each page
+                wb.save(file_path)
+                logging.info(f"Progress saved after page {page_count}")
+                if page:
+                    await page.close()
+                if browser:
+                    await browser.close()
+                
+                page_count += 1
+                await asyncio.sleep(random.uniform(2, 5))
+                
+            except Exception as e:
+                logging.error(f"Error processing page {page_count}: {str(e)}")
+                if page:
+                    await page.close()
+                if browser:
+                    await browser.close()
+                wb.save(file_path)
+                continue
+            
+            # Add delay between pages
+            await asyncio.sleep(random.uniform(2, 5))
+            
+        page_count += 1
 
-    filename = f"handle_goldsmiths_{current_date}_{time_only}.xlsx"
-    file_path = os.path.join(EXCEL_DATA_PATH, filename)
+    # # Final save and database operations
     wb.save(file_path)
+    log_event(f"Data saved to {file_path}")
 
-    with open(file_path, "rb") as f:
-        base64_encoded = base64.b64encode(f.read()).decode("utf-8")
+    if len(all_records) == 0:
+        return None, None, None
 
-    insert_into_db(records)
-    update_product_count(len(records))
-    logging.info(f"✅ Scraping complete. File saved: {file_path}")
+    insert_into_db(all_records)
+    update_product_count(len(all_records))
+
+    with open(file_path, "rb") as file:
+        base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
     return base64_encoded, filename, file_path

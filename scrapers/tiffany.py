@@ -22,7 +22,6 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
 
-
 def modify_image_url(image_url):
     if not image_url or image_url == "N/A":
         return image_url
@@ -32,7 +31,6 @@ def modify_image_url(image_url):
         query_params = f"?{query_params}"
     modified_url = re.sub(r'(_260)(?=\.\w+$)', '_1200', image_url)
     return modified_url + query_params
-
 
 async def download_image(session, image_url, product_name, timestamp, image_folder, unique_id):
     if not image_url or image_url == "N/A":
@@ -48,11 +46,9 @@ async def download_image(session, image_url, product_name, timestamp, image_fold
                 f.write(resp.content)
             return image_full_path
         except Exception as e:
-            logging.warning(
-                f"Retry {attempt + 1}/3 - Error downloading {product_name}: {e}")
+            logging.warning(f"Retry {attempt + 1}/3 - Error downloading {product_name}: {e}")
     logging.error(f"Failed to download {product_name} after 3 attempts.")
     return "N/A"
-
 
 async def handle_tiffany(url, max_pages):
     ip_address = get_public_ip()
@@ -68,8 +64,7 @@ async def handle_tiffany(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image",
-               "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
     sheet.append(headers)
 
     current_date = datetime.now().strftime("%Y-%m-%d")
@@ -124,8 +119,7 @@ async def handle_tiffany(url, max_pages):
         async with httpx.AsyncClient() as session:
             for idx, product in enumerate(collected_products):
                 try:
-                    product_name_tag = product.locator(
-                        "div.clp-hover-info a").nth(0)
+                    product_name_tag = product.locator("div.clp-hover-info a").nth(0)
                     product_name = (await product_name_tag.text_content()).strip() if await product_name_tag.count() > 0 else "N/A"
                 except:
                     product_name = "N/A"
@@ -139,30 +133,26 @@ async def handle_tiffany(url, max_pages):
                 except:
                     product_price = "N/A"
 
+
                 try:
-                    image_tag = product.locator(
-                        "div.category-product-images img")
+                    image_tag = product.locator("div.category-product-images img")
                     image_url = await image_tag.get_attribute("data-src") if await image_tag.count() > 0 else "N/A"
                 except:
                     image_url = "N/A"
 
-                kt_match = re.search(
-                    r"\b\d{1,2}K\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSilver\b", product_name, re.IGNORECASE)
+
+                kt_match = re.search(r"\b\d{1,2}K\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSilver\b", product_name, re.IGNORECASE)
                 kt = kt_match.group() if kt_match else "Not found"
 
-                diamond_match = re.search(
-                    r"\b(\d+(\.\d+)?)\s*(?:ct|ctw|carat)\b", product_name, re.IGNORECASE)
+                diamond_match = re.search(r"\b(\d+(\.\d+)?)\s*(?:ct|ctw|carat)\b", product_name, re.IGNORECASE)
                 diamond_weight = f"{diamond_match.group(1)} ct" if diamond_match else "N/A"
 
                 unique_id = str(uuid.uuid4())
-                task = asyncio.create_task(download_image(
-                    session, image_url, product_name, timestamp, image_folder, unique_id))
+                task = asyncio.create_task(download_image(session, image_url, product_name, timestamp, image_folder, unique_id))
                 image_tasks.append((idx + 2, unique_id, task))
 
-                records.append((unique_id, current_date, page_title,
-                               product_name, None, kt, product_price, diamond_weight))
-                sheet.append([current_date, page_title, product_name, None,
-                             kt, product_price, diamond_weight, time_only, image_url])
+                records.append((unique_id, current_date, page_title, product_name, None, kt, product_price, diamond_weight))
+                sheet.append([current_date, page_title, product_name, None, kt, product_price, diamond_weight, time_only, image_url])
 
             for row, unique_id, task in image_tasks:
                 image_path = await task
@@ -172,8 +162,7 @@ async def handle_tiffany(url, max_pages):
                     sheet.add_image(img, f"D{row}")
                 for i, record in enumerate(records):
                     if record[0] == unique_id:
-                        records[i] = (record[0], record[1], record[2], record[3],
-                                      image_path, record[5], record[6], record[7])
+                        records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
                         break
 
         filename = f'handle_tiffany_{datetime.now().strftime("%Y-%m-%d_%H.%M")}.xlsx'

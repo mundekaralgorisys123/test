@@ -255,13 +255,12 @@ async def handle_stroilioro(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     current_date = datetime.now().strftime("%Y-%m-%d")
     time_only = datetime.now().strftime("%H.%M")
 
-    
     records = []
     image_tasks = []
 
@@ -271,15 +270,14 @@ async def handle_stroilioro(url, max_pages):
         current_url = url
         while current_page <= max_pages:
             if current_page > 1:
-                current_url =  f"{url}?start={(current_page-1)*41}&sz=41"
+                current_url = f"{url}?start={(current_page-1)*41}&sz=41"
                     
             browser = None
             page = None        
             async with async_playwright() as p:
-                # Create a new browser instance for each page
                 browser, page = await get_browser_with_proxy_strategy(p, current_url)
                 log_event(f"Successfully loaded: {current_url}")
-                # Handle Didomi cookie consent popup
+                
                 try:
                     await page.wait_for_selector("#didomi-popup", timeout=5000)
                     accept_btn = await page.query_selector("button[aria-label='Accepter']")
@@ -291,7 +289,6 @@ async def handle_stroilioro(url, max_pages):
                     print("ℹ️ No Didomi popup found or already dismissed.")
                     
                 all_products = await page.query_selector_all("div.c-grid__item")
-
                 total_products = len(all_products)
                 new_products = all_products
                 logging.info(f"Page {current_page}: Total = {total_products}, New = {len(new_products)}")
@@ -300,95 +297,181 @@ async def handle_stroilioro(url, max_pages):
                 page_title = await page.title()
 
                 for idx, product in enumerate(new_products):
+                    # Skip if product doesn't have basic required elements
+                    if not await product.query_selector("a.c-product-tile__name-link"):
+                        continue
+
                     try:
+                        # Product name
                         name_tag = await product.query_selector("a.c-product-tile__name-link")
-                        if name_tag:
-                            product_name = await name_tag.inner_text()
-                            product_name = product_name.replace('\n', ' ').strip()
-                        else:
-                            product_name = "N/A"
+                        product_name = await name_tag.inner_text()
+                        product_name = product_name.replace('\n', ' ').strip()
+                        if not product_name:
+                            continue
                     except Exception as e:
                         print(f"[Product Name] Error: {e}")
-                        product_name = "N/A"
-
+                        continue
 
                     try:
+                        # Price
                         price_tag = await product.query_selector("span.c-price__standard")
-                        price = await price_tag.inner_text() if price_tag else "N/A"
+                        price = await price_tag.inner_text() if price_tag else None
+                        if not price:
+                            continue
                     except Exception as e:
                         print(f"[Price] Error: {e}")
-                        price = "N/A"
-
+                        continue
 
                     try:
-                        # await product.scroll_into_view_if_needed()
-                        
-                        # Locate the first <img> tag inside a <picture> element
+                        # Image URL
                         img_tag = await product.query_selector("div.c-product-tile__image-link picture img")
-                        
-                        # First, try to get the high-resolution image from `data-src` (for lazy loading)
                         image_url = await img_tag.get_attribute("data-src") if img_tag else None
-                        
-                        # If `data-src` is not available, fallback to `src` attribute
                         if not image_url:
                             image_url = await img_tag.get_attribute("src") if img_tag else None
-
-                        # Ensure the URL is fully qualified (adds 'https:' if it is a relative URL)
                         if image_url and image_url.startswith("//"):
                             image_url = "https:" + image_url
-
-                        # In case no valid URL was found
                         if not image_url:
-                            image_url = "N/A"
-
+                            continue
                     except Exception as e:
                         print(f"[Image URL] Error: {e}")
-                        image_url = "N/A"
+                        continue
 
-                                            
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue
+
+                    # Extract Additional Info (labels, tags, etc.)
+                    additional_info = []
                     
-                    # Extract Gold Type (e.g., "14K Yellow Gold").
-                    gold_type_match = re.findall(r"(\d{1,2}ct\s*(?:Yellow|White|Rose)?\s*Gold|Platinum|Cubic Zirconia)", product_name, re.IGNORECASE)
+                    try:
+                        # Get stickers/labels (like "Engraving" in the example)
+                        stickers = await product.query_selector_all(".sticker .sticker-body")
+                        for sticker in stickers:
+                            label = await sticker.inner_text()
+                            if label.strip():
+                                additional_info.append(label.strip())
+                    except Exception as e:
+                        print(f"[Stickers] Error: {e}")
+
+                    try:
+                        # Get discount information if available
+                        discount_tag = await product.query_selector(".c-product__discount-plp")
+                        if discount_tag:
+                            discount_text = await discount_tag.inner_text()
+                            if discount_text.strip():
+                                additional_info.append(discount_text.strip())
+                    except Exception as e:
+                        print(f"[Discount] Error: {e}")
+
+                    try:
+                        # Get ratings if available
+                        rating_tag = await product.query_selector("[itemprop='ratingValue']")
+                        if rating_tag:
+                            rating = await rating_tag.get_attribute("content")
+                            if rating:
+                                additional_info.append(f"Rating: {rating}")
+                    except Exception as e:
+                        print(f"[Rating] Error: {e}")
+
+                    # Format additional info
+                    additional_info_str = " | ".join(additional_info) if additional_info else ""
+
+                    # Extract product details
+                    gold_type_match = re.findall(r"(\d{1,2}ct\s*(?:Yellow|White|Rose)?\s*Gold|Platinum|Cubic Zirconia)", 
+                                              product_name, re.IGNORECASE)
                     kt = ", ".join(gold_type_match) if gold_type_match else "N/A"
 
-                    # Extract Diamond Weight (supports "1.85ct", "2ct", "1.50ct", etc.)
                     diamond_weight_match = re.findall(r"(\d+(?:\.\d+)?\s*ct)", product_name, re.IGNORECASE)
                     diamond_weight = ", ".join(diamond_weight_match) if diamond_weight_match else "N/A"
 
                     unique_id = str(uuid.uuid4())
-                    task = asyncio.create_task(download_image(session, image_url, product_name, timestamp, image_folder, unique_id))
+                    task = asyncio.create_task(
+                        download_image(session, image_url, product_name, timestamp, image_folder, unique_id)
+                    )
                     image_tasks.append((len(sheet['A']) + 1, unique_id, task))
-                    if image_url != "N/A":
-                        records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                        sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    
+                    records.append((
+                        unique_id, 
+                        current_date, 
+                        page_title, 
+                        product_name, 
+                        None,  # Placeholder for image path
+                        kt, 
+                        price, 
+                        diamond_weight,
+                        additional_info_str
+                    ))
+                    
+                    sheet.append([
+                        current_date, 
+                        page_title, 
+                        product_name, 
+                        None,  # Placeholder for image
+                        kt, 
+                        price, 
+                        diamond_weight, 
+                        time_only, 
+                        image_url,
+                        additional_info_str
+                    ])
 
-                # Process image downloads and attach them to Excel
+                # Process image downloads and update records
                 for row, unique_id, task in image_tasks:
-                    image_path = await task
-                    if image_path != "N/A":
-                        img = Image(image_path)
-                        img.width, img.height = 100, 100
-                        sheet.add_image(img, f"D{row}")
-                    for i, record in enumerate(records):
-                        if record[0] == unique_id:
-                            records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
-                            break
+                    try:
+                        image_path = await asyncio.wait_for(task, timeout=60)
+                        if not image_path or image_path == "N/A":
+                            # Remove record if image download failed
+                            records = [r for r in records if r[0] != unique_id]
+                            continue
+                            
+                        try:
+                            img = Image(image_path)
+                            img.width, img.height = 100, 100
+                            sheet.add_image(img, f"D{row}")
+                        except Exception as img_error:
+                            logging.error(f"Error adding image to Excel: {img_error}")
+                            records = [r for r in records if r[0] != unique_id]
+                            continue
+                            
+                        # Update record with image path
+                        for i, record in enumerate(records):
+                            if record[0] == unique_id:
+                                records[i] = (
+                                    record[0], 
+                                    record[1], 
+                                    record[2], 
+                                    image_path, 
+                                    record[4], 
+                                    record[5], 
+                                    record[6],
+                                    record[7],
+                                    record[8]
+                                )
+                                break
+                    except asyncio.TimeoutError:
+                        logging.warning(f"Timeout downloading image for row {row}")
+                        records = [r for r in records if r[0] != unique_id]
 
                 await browser.close()
             current_page += 1
 
+        if not all_products:
+            return None, None, None
+        
         # Save Excel
         filename = f'handle_stroilioro_{datetime.now().strftime("%Y-%m-%d_%H.%M")}.xlsx'
         file_path = os.path.join(EXCEL_DATA_PATH, filename)
         wb.save(file_path)
         log_event(f"Data saved to {file_path} | IP: {ip_address}")
 
-        if records:
-            insert_into_db(records)
+        # Only insert complete records into database
+        complete_records = [r for r in records if all(r[1:])]
+        if complete_records:
+            insert_into_db(complete_records)
         else:
-            logging.info("No data to insert into the database.")
+            logging.info("No complete records to insert into the database.")
 
-        update_product_count(len(records))
+        update_product_count(len(complete_records))
 
         with open(file_path, "rb") as f:
             base64_encoded = base64.b64encode(f.read()).decode("utf-8")

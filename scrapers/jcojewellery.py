@@ -15,6 +15,7 @@ from limit_checker import update_product_count
 import httpx
 from playwright.async_api import async_playwright, TimeoutError
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from proxysetup import get_browser_with_proxy_strategy
 # Load .env variables
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
@@ -78,7 +79,7 @@ async def handle_jcojewellery(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     current_date = datetime.now().strftime("%Y-%m-%d")
@@ -95,8 +96,8 @@ async def handle_jcojewellery(url, max_pages):
         while load_more_clicks <= max_pages:
             async with async_playwright() as p:
                 # Create a new browser instance for each page
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                page = await browser.new_page()
+                product_wrapper_selector = "div.products-outer-wrapper"
+                browser , page = await get_browser_with_proxy_strategy(p, url, product_wrapper_selector)
 
                 try:
                     await page.goto(url, timeout=120000)
@@ -120,17 +121,16 @@ async def handle_jcojewellery(url, max_pages):
                         logging.warning(f"Could not click 'Load More': {e}")
                         break
 
-
-                                            
-
-
-               # Wait for the product wrapper that contains all products
-                product_wrapper = await page.wait_for_selector("div.products-outer-wrapper", timeout=30000)
+                # Wait for the product wrapper that contains all products
+                try:
+                    product_wrapper = await page.wait_for_selector(product_wrapper_selector, timeout=30000)
+                except Exception as e:
+                    logging.warning(f"Product wrapper not found on {url}: {e}")
+                    await browser.close()
+                    continue
 
                 # Select all product cards inside the wrapper
                 all_products = await product_wrapper.query_selector_all("div.product-card-wrapper")
-
-                
 
                 total_products = len(all_products)
                 new_products = all_products[previous_count:]
@@ -141,19 +141,26 @@ async def handle_jcojewellery(url, max_pages):
                 page_title = await page.title()
 
                 for idx, product in enumerate(new_products):
+                    additional_info = []
+
                     try:
-                        product_name = await (await product.query_selector("a.p4.width-100.regular-400.color-url")).inner_text()
+                        product_name_element = await product.query_selector("a.p4.width-100.regular-400.color-url")
+                        product_name = await product_name_element.inner_text() if product_name_element else "N/A"
                     except:
                         product_name = "N/A"
 
-
+                    price_parts = []
                     try:
-                        # Price is in a <span> with class "money"
-                        price = await (await product.query_selector("span.p5")).inner_text()
+                        price_element = await product.query_selector("div.price-container span.p5")
+                        if price_element:
+                            price_parts.append(await price_element.inner_text())
+                        original_price_element = await product.query_selector("div.price-container span.money.sale-price") # Adjust selector if needed
+                        if original_price_element:
+                            price_parts.append(await original_price_element.inner_text())
                     except:
-                        price = "N/A"
-                        
-                
+                        pass
+                    price = "|".join(price_parts) if price_parts else "N/A"
+
                     try:
                         # Use a broader query selector to find the image
                         image_element = await product.query_selector("img")
@@ -185,32 +192,57 @@ async def handle_jcojewellery(url, max_pages):
                         print(f"Error extracting product image URL: {e}")
                         image_url = "N/A"
 
-
-
-                        
                     gold_type_match = re.search(r"\b\d{1,2}K(?:\s+\w+){0,3}\s+Gold\b", product_name, re.IGNORECASE)
                     kt = gold_type_match.group() if gold_type_match else "Not found"
 
                     diamond_weight_match = re.search(r"(\d+(\.\d+)?)\s*(ct|carat)", product_name, re.IGNORECASE)
                     diamond_weight = f"{diamond_weight_match.group(1)} ct" if diamond_weight_match else "N/A"
-                    
+
+                    # Extract additional info
+                    try:
+                        # Check for color variants
+                        color_swatches = await product.query_selector_all("div.color-variant-picker div.swatch-wrapper div[data-value]")
+                        colors = [await swatch.get_attribute("data-value") for swatch in color_swatches]
+                        if colors:
+                            additional_info.append(f"Available Colors: {', '.join(colors)}")
+                    except:
+                        pass
+
+                    try:
+                        # Check for any labels or tags (e.g., "best seller")
+                        tags_container = await product.query_selector("div.pro-tags-container")
+                        if tags_container:
+                            tags_elements = await tags_container.query_selector_all("div.tag-each")
+                            tags = [await tag.inner_text() for tag in tags_elements]
+                            if tags:
+                                additional_info.append(f"Labels: {', '.join(tags)}")
+                    except:
+                        pass
+
                     unique_id = str(uuid.uuid4())
                     task = asyncio.create_task(download_image(session, image_url, product_name, timestamp, image_folder, unique_id))
                     image_tasks.append((len(sheet['A']) + 1, unique_id, task))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    additional_info_str = "|".join(additional_info)
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight, additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url, additional_info_str])
 
                 # Process image downloads and attach them to Excel
                 for row, unique_id, task in image_tasks:
                     image_path = await task
                     if image_path != "N/A":
-                        img = Image(image_path)
-                        img.width, img.height = 100, 100
-                        sheet.add_image(img, f"D{row}")
+                        try:
+                            img = Image(image_path)
+                            # Adjust image size as needed
+                            img.width, img.height = 100, 100
+                            sheet.add_image(img, f"D{row}")
+                        except Exception as e:
+                            logging.warning(f"Error adding image to Excel at row {row}: {e}")
                     for i, record in enumerate(records):
                         if record[0] == unique_id:
-                            records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                            updated_record = list(record)
+                            updated_record[4] = image_path
+                            records[i] = tuple(updated_record)
                             break
 
                 await browser.close()
@@ -223,11 +255,13 @@ async def handle_jcojewellery(url, max_pages):
         log_event(f"Data saved to {file_path} | IP: {ip_address}")
 
         if records:
-            insert_into_db(records)
+            # Prepare records for database insertion (including the additional info)
+            db_records = [(r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]) for r in records]
+            insert_into_db(db_records)
         else:
             logging.info("No data to insert into the database.")
 
-        update_product_count(len(seen_ids))
+        update_product_count(len(records))
 
         with open(file_path, "rb") as f:
             base64_encoded = base64.b64encode(f.read()).decode("utf-8")

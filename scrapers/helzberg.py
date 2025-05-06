@@ -21,7 +21,7 @@ import re
 from playwright.async_api import Page
 import re
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-
+from proxysetup import get_browser_with_proxy_strategy
 # Load environment variables
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
@@ -122,7 +122,7 @@ async def click_load_more(page, max_pages=5, delay_range=(3, 5)):
             break
 
 async def handle_helzberg(url, max_pages):
-    """Scrape product data from Helzberg website using direct pagination URLs."""
+    """Scrape product data from Helzberg website with enhanced product information."""
     ip_address = get_public_ip()
     logging.info(f"Scraping started for: {url} | IP: {ip_address} | Max pages: {max_pages}")
 
@@ -132,11 +132,11 @@ async def handle_helzberg(url, max_pages):
     image_folder = os.path.join(IMAGE_SAVE_PATH, timestamp)
     os.makedirs(image_folder, exist_ok=True)
 
-    # Prepare Excel
+    # Prepare Excel with Additional Info column
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     current_date = datetime.now().strftime("%Y-%m-%d")
@@ -151,11 +151,7 @@ async def handle_helzberg(url, max_pages):
     while current_url and pages_processed < max_pages:
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                page = await browser.new_page()
-                
-                logging.info(f"Processing page {pages_processed + 1}: {current_url}")
-                await page.goto(current_url, timeout=180000, wait_until="domcontentloaded")
+                browser , page = get_browser_with_proxy_strategy(p, current_url, ".row.product-grid")
                 pages_processed += 1
 
                 # Scroll to load lazy content
@@ -176,24 +172,55 @@ async def handle_helzberg(url, max_pages):
                 async with aiohttp.ClientSession() as session:
                     for product in products:
                         try:
+                            additional_info = []
+                            
                             # Product name
                             name_element = await product.query_selector("a.prodname-container__link")
                             product_name = await name_element.inner_text() if name_element else "N/A"
                             product_name = product_name.strip()
 
-                            # Price
-                            price_tag = await product.query_selector("span.value")
-                            price = await price_tag.inner_text() if price_tag else "N/A"
-                            price = price.strip()
+                            # Price handling - capture both current and original price
+                            price_info = []
+                            try:
+                                # Current price
+                                current_price_elem = await product.query_selector("span.sales.promo-price .value")
+                                current_price = await current_price_elem.inner_text() if current_price_elem else "N/A"
+                                current_price = current_price.strip()
+                                if current_price != "N/A":
+                                    price_info.append(current_price)
+                                
+                                # Original price
+                                original_price_elem = await product.query_selector("span.strike-through.list .value")
+                                if original_price_elem:
+                                    original_price = await original_price_elem.inner_text()
+                                    original_price = original_price.strip()
+                                    if original_price and original_price != current_price:
+                                        price_info.append(original_price)
+                                        
+                                        # Check for discount/sale badge
+                                        sale_badge = await product.query_selector("div.plp-badge.badge-text-tile-sale")
+                                        if sale_badge:
+                                            sale_text = await sale_badge.inner_text()
+                                            additional_info.append(f"Sale: {sale_text.strip()}")
+                            except Exception as e:
+                                logging.warning(f"Error getting price info: {str(e)}")
+                                price_info = ["N/A"]
+                            
+                            price = " | ".join(price_info) if price_info else "N/A"
 
                             # Image URL
-                            images = await product.query_selector_all("img")
+                            images = await product.query_selector_all("img.tile-image")
                             product_urls = []
                             for img in images:
                                 src = await img.get_attribute("src")
                                 if src:
                                     product_urls.append(src)
                             image_url = product_urls[0] if product_urls else "N/A"
+
+                            if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                                print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                                continue
+
 
                             # Metal type
                             gold_type_match = re.search(r"\b\d+K\s+\w+\s+\w+\b", product_name)
@@ -203,16 +230,75 @@ async def handle_helzberg(url, max_pages):
                             diamond_weight_match = re.search(r"(\d+(?:\.\d+)?(?:[-/]\d+(?:\.\d+)?)?\s*ct\.?\s*t\.?w\.?)", product_name)
                             diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
 
+                            # Additional product info
+                            try:
+                                # Check for available metals (colors)
+                                metal_buttons = await product.query_selector_all("button.color-attribute")
+                                if metal_buttons and len(metal_buttons) > 1:
+                                    metals = []
+                                    for button in metal_buttons:
+                                        try:
+                                            metal_label = await button.get_attribute("aria-label")
+                                            if metal_label and "Metal" in metal_label:
+                                                metals.append(metal_label.replace("Metal ", ""))
+                                        except:
+                                            continue
+                                    if metals:
+                                        additional_info.append(f"Metals: {', '.join(metals)}")
+                            except:
+                                pass
+
+                            try:
+                                # Check for diamond weight options
+                                weight_options = await product.query_selector_all("li.custom-select-item.custom-select-item-pdp")
+                                if weight_options and len(weight_options) > 1:
+                                    weights = []
+                                    for option in weight_options:
+                                        try:
+                                            weight_text = await option.inner_text()
+                                            if weight_text.strip():
+                                                weights.append(weight_text.strip())
+                                        except:
+                                            continue
+                                    if weights:
+                                        additional_info.append(f"Weights: {', '.join(weights)}")
+                            except:
+                                pass
+
+                            try:
+                                # Check for brand
+                                brand_elem = await product.query_selector("span.brand-span")
+                                if brand_elem:
+                                    brand_text = await brand_elem.inner_text()
+                                    if brand_text.strip():
+                                        additional_info.append(f"Brand: {brand_text.strip()}")
+                            except:
+                                pass
+
+                            # Combine all additional info with pipe delimiter
+                            additional_info_str = " | ".join(additional_info) if additional_info else ""
+
                             unique_id = str(uuid.uuid4())
                             
                             # Download image immediately while browser is still open
                             image_path = await download_image(session, image_url, product_name, timestamp, image_folder, unique_id)
                             
                             # Add record
-                            all_records.append((unique_id, current_date, page_title, product_name, image_path, kt, price, diamond_weight))
+                            all_records.append((unique_id, current_date, page_title, product_name, image_path, kt, price, diamond_weight, additional_info_str))
                             
                             # Add to Excel
-                            sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                            sheet.append([
+                                current_date, 
+                                page_title, 
+                                product_name, 
+                                None, 
+                                kt, 
+                                price, 
+                                diamond_weight, 
+                                time_only, 
+                                image_url,
+                                additional_info_str
+                            ])
                             
                             # Add image to Excel if downloaded successfully
                             if image_path != "N/A":
@@ -249,6 +335,9 @@ async def handle_helzberg(url, max_pages):
             if 'browser' in locals():
                 await browser.close()
             break
+    
+    if not all_records:
+        return None, None, None
 
     # Save Excel file
     filename = f"Helzberg_{current_date}_{time_only}.xlsx"

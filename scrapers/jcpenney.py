@@ -22,6 +22,7 @@ import aiohttp
 from io import BytesIO
 from openpyxl.drawing.image import Image as XLImage
 import httpx
+from proxysetup import get_browser_with_proxy_strategy
 # Load environment variables from .env file
 from functools import partial
 load_dotenv()
@@ -153,49 +154,43 @@ async def handle_jcpenney(url, max_pages):
     image_folder = os.path.join(IMAGE_SAVE_PATH, timestamp)
     os.makedirs(image_folder, exist_ok=True)
 
-    # Create workbook and setup
+    # Create workbook with Additional Info column
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Material", "Price", 
+               "Size/Weight", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
-    filename = f"handle_jcpenney_{datetime.now().strftime('%Y-%m-%d_%H.%M')}.xlsx"
+    filename = f"JCPenney_{datetime.now().strftime('%Y-%m-%d_%H.%M')}.xlsx"
     file_path = os.path.join(EXCEL_DATA_PATH, filename)
 
     page_count = 1
     success_count = 0
 
-    while page_count <= max_pages:
-        current_url = f"{url}&page={page_count}"
-        logging.info(f"Processing page {page_count}: {current_url}")
-        
-        # Create a new browser instance for each page
-        browser = None
-        page = None
-        try:
-            async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                
-                # Configure timeouts for this page
-                page = await context.new_page()
-                page.set_default_timeout(120000)  # 2 minute timeout
-                
-                await safe_goto_and_wait(page, current_url)
+    async with async_playwright() as p:
+        while page_count <= max_pages:
+            current_url = f"{url}&page={page_count}"
+            logging.info(f"Processing page {page_count}: {current_url}")
+            
+            browser = None
+            page = None
+            try:
+                product_wrapper = "li[data-automation-id^='list-item']"
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, product_wrapper)
+
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all products
                 prev_product_count = 0
                 for _ in range(10):
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await asyncio.sleep(random.uniform(1, 2))  # Random delay between scrolls
+                    await asyncio.sleep(random.uniform(1, 2))
                     current_product_count = await page.locator("li[data-automation-id^='list-item']").count()
                     if current_product_count == prev_product_count:
                         break
                     prev_product_count = current_product_count
-
 
                 product_selector = 'ul[data-automation-id="gallery-product-list"] > li[data-automation-id^="list-item-"]'
                 products = await page.locator(product_selector).all()
@@ -209,27 +204,55 @@ async def handle_jcpenney(url, max_pages):
                 image_tasks = []
 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
+                    additional_info = []
+                    
                     try:
                         # Product Name
                         product_name_tag = product.locator('a[data-automation-id="product-title"]')
                         product_name = await product_name_tag.text_content() if await product_name_tag.count() > 0 else "N/A"
-                        product_name = product_name.strip()
+                        product_name = product_name.strip() if product_name else "N/A"
                     except:
                         product_name = "N/A"
 
+                    # Price handling
+                    price_info = []
                     try:
-                        # Price (check multiple selectors)
-                        price_selectors = ['span.DXCCO._2Bk5a.wrap', 'span.DXCCO.wrap', 'span.k26R9']
-                        price = "N/A"
-                        for selector in price_selectors:
-                            price_loc = product.locator(selector)
-                            if await price_loc.count() > 0:
-                                raw_price = await price_loc.first.text_content()
-                                price = raw_price.strip().split("(")[0]
-                                break
-                    except:
-                        price = "N/A"
+                        # Current price
+                        current_price_loc = product.locator('span.DXCCO._2Bk5a.wrap, span.DXCCO.wrap, span.k26R9')
+                        if await current_price_loc.count() > 0:
+                            current_price = await current_price_loc.first.text_content()
+                            current_price = current_price.strip().split("(")[0] if current_price else "N/A"
+                            price_info.append(current_price)
+                        
+                        # Original price
+                        original_price_loc = product.locator('strike, span.H-M5g')
+                        if await original_price_loc.count() > 0:
+                            original_price = await original_price_loc.first.text_content()
+                            original_price = original_price.strip() if original_price else "N/A"
+                            if original_price and original_price != "N/A" and original_price != current_price:
+                                price_info.append(original_price)
+                                
+                                # Calculate discount percentage
+                                try:
+                                    current_num = float(re.sub(r'[^\d.]', '', current_price))
+                                    original_num = float(re.sub(r'[^\d.]', '', original_price))
+                                    discount_pct = round((1 - (current_num / original_num)) * 100)
+                                    additional_info.append(f"Discount: {discount_pct}%")
+                                except:
+                                    pass
+                        
+                        # Check for flash sale
+                        flash_sale_loc = product.locator('p.BfDPx[data-automation-id="at-price-marketing-label"]')
+                        if await flash_sale_loc.count() > 0:
+                            flash_text = await flash_sale_loc.text_content()
+                            additional_info.append(f"Promo: {flash_text.strip()}" if flash_text else "")
+                    except Exception as e:
+                        logging.warning(f"Error getting price info: {str(e)}")
+                        price_info = ["N/A"]
+                    
+                    price = " | ".join(price_info) if price_info else "N/A"
 
+                    # Image URL
                     try:
                         images = await product.locator("img").all()
                         image_urls = []
@@ -239,24 +262,86 @@ async def handle_jcpenney(url, max_pages):
                                 full_url = f"https:{src}" if src.startswith("//") else src
                                 image_urls.append(full_url)
                         image_url = image_urls[0] if image_urls else "N/A"
-                       
                     except:
                         image_url = "N/A"
 
+                    # Material Type
+                    material = "N/A"
+                    try:
+                        material_match = re.search(r"\b(Sterling Silver|Gold|Platinum|Titanium)\b", product_name, re.IGNORECASE)
+                        material = material_match.group() if material_match else "N/A"
+                    except:
+                        pass
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue
 
-                    gold_type_match = re.search(r"\b\d+K\s+\w+\s+\w+\b", product_name)
-                    kt = gold_type_match.group() if gold_type_match else "Not found"
+                    # Size/Weight
+                    size_weight = "N/A"
+                    try:
+                        # Fixed regex pattern
+                        size_match = re.search(r"(\d+(?:\.\d+)?(?:[-/]\d+)?\s*(?:ct|inch|cm|mm)\b)", product_name, re.IGNORECASE)
+                        size_weight = size_match.group() if size_match else "N/A"
+                    except Exception as e:
+                        logging.warning(f"Error extracting size/weight: {str(e)}")
 
-                    diamond_weight_match = re.search(r"\d+[-/]?\d*/?\d*\s*ct\s*tw", product_name)
-                    diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                    # Additional product info
+                    try:
+                        # Check for ratings
+                        rating_loc = product.locator('div[data-automation-id="productCard-automation-rating"]')
+                        if await rating_loc.count() > 0:
+                            rating_text = await rating_loc.text_content()
+                            rating_clean = " ".join(rating_text.split()) if rating_text else ""
+                            if rating_clean:
+                                additional_info.append(f"Rating: {rating_clean}")
+                    except:
+                        pass
+
+                    try:
+                        # Check for color options
+                        color_buttons = await product.locator('button.qMneo img').all()
+                        if color_buttons:
+                            colors = []
+                            for btn in color_buttons:
+                                alt_text = await btn.get_attribute("alt")
+                                if alt_text and alt_text != "null":
+                                    colors.append(alt_text)
+                            if colors:
+                                additional_info.append(f"Colors: {', '.join(colors)}")
+                    except:
+                        pass
+
+                    try:
+                        # Check for coupon code
+                        coupon_loc = product.locator('input.fpacCoupon')
+                        if await coupon_loc.count() > 0:
+                            coupon_code = await coupon_loc.get_attribute("value")
+                            if coupon_code:
+                                additional_info.append(f"Coupon: {coupon_code}")
+                    except:
+                        pass
+
+                    # Combine all additional info
+                    additional_info_str = " | ".join(filter(None, additional_info)) if additional_info else ""
 
                     unique_id = str(uuid.uuid4())
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, material, price, size_weight, additional_info_str))
+                    sheet.append([
+                        current_date, 
+                        page_title, 
+                        product_name, 
+                        None, 
+                        material, 
+                        price, 
+                        size_weight, 
+                        time_only, 
+                        image_url,
+                        additional_info_str
+                    ])
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -273,7 +358,7 @@ async def handle_jcpenney(url, max_pages):
                         
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")
@@ -285,24 +370,22 @@ async def handle_jcpenney(url, max_pages):
                 wb.save(file_path)
                 logging.info(f"Progress saved after page {page_count}")
 
-        except Exception as e:
-            logging.error(f"Error processing page {page_count}: {str(e)}")
-            # Save what we have so far
-            wb.save(file_path)
-        finally:
-            # Clean up resources for this page
-            if page:
-                await page.close()
-            if browser:
-                await browser.close()
-            
-            # Add delay between pages
-            await asyncio.sleep(random.uniform(2, 5))
-            
-        page_count += 1
+                page_count += 1
+                await asyncio.sleep(random.uniform(2, 5))
 
+            except Exception as e:
+                logging.error(f"Error processing page {page_count}: {str(e)}")
+                if page:
+                    await page.close()
+                if browser:
+                    await browser.close()
+                wb.save(file_path)
+                continue
 
     # Final save and database operations
+    if not all_records:
+        return None, None, None
+    
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
 

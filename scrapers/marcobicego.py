@@ -97,6 +97,7 @@ async def safe_goto_and_wait(page, url, retries=3):
 
 # Main scraper function
 async def handle_marcobicego(url, max_pages=None):
+    
     ip_address = get_public_ip()
     logging.info(f"Scraping started for: {url} from IP: {ip_address}")
 

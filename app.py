@@ -5,7 +5,7 @@ import json
 from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
 from urllib.parse import urlparse
-
+from scrapers.hoskings import handle_hoskings
 # Scraper imports
 from scrapers.ernest_jones import handle_ernest_jones
 from scrapers.shaneco import handle_shane_co
@@ -307,6 +307,7 @@ def fetch_data():
         "www.ross-simons.com": handle_rosssimons,
         "mazzucchellis.com.au": handle_mazzucchellis,
         "www.zamels.com.au": handle_zamels,
+        "hoskings.com.au": handle_hoskings,
         
         
     }
@@ -355,5 +356,5 @@ def product_view():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=5008)
     # app.run(debug=True, port=5000)

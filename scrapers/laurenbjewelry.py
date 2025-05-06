@@ -19,15 +19,18 @@ from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
 import json
-import mimetypes
+import urllib
 
 # Load environment
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
 
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
+# Flask and paths
+app = Flask(__name__)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+EXCEL_DATA_PATH = os.path.join(app.root_path, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
+
 # Resize image if needed
 def resize_image(image_data, max_size=(100, 100)):
     try:
@@ -39,6 +42,7 @@ def resize_image(image_data, max_size=(100, 100)):
     except Exception as e:
         log_event(f"Error resizing image: {e}")
         return image_data
+
 
 # Async image downloader
 async def download_image_async(image_url, product_name, timestamp, image_folder, unique_id, retries=3):
@@ -84,7 +88,7 @@ async def safe_goto_and_wait(page, url, retries=3):
         try:
             print(f"[Attempt {attempt + 1}] Navigating to: {url}")
             await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-            await page.wait_for_selector(".ProductListWrapper", state="attached", timeout=30000)
+            await page.wait_for_selector(".category-products", state="attached", timeout=30000)
             print("[Success] Product listing loaded.")
             return
         except (Error, TimeoutError) as e:
@@ -95,7 +99,7 @@ async def safe_goto_and_wait(page, url, retries=3):
                 raise
 
 # Main scraper function
-async def handle_ringconcierge(url, max_pages=None):
+async def handle_laurenbjewelry(url, max_pages=None):
     ip_address = get_public_ip()
     logging.info(f"Scraping started for: {url} from IP: {ip_address}")
 
@@ -111,15 +115,15 @@ async def handle_ringconcierge(url, max_pages=None):
     sheet.append(headers)
 
     all_records = []
-    filename = f"handle_ringconcierge_{datetime.now().strftime('%Y-%m-%d_%H.%M')}.xlsx"
+    filename = f"handle_laurenbjewelry_{datetime.now().strftime('%Y-%m-%d_%H.%M')}.xlsx"
     file_path = os.path.join(EXCEL_DATA_PATH, filename)
     load_more_clicks = 1
-    current_url = url
+    
     while load_more_clicks <= max_pages:
         browser = None
         page = None
         if load_more_clicks > 1:
-            current_url = f"{url}?page={load_more_clicks}"
+            url = f"{url}&p={load_more_clicks}"
         try:
             async with async_playwright() as p:
                 browser = await p.chromium.connect_over_cdp(PROXY_URL)
@@ -127,8 +131,8 @@ async def handle_ringconcierge(url, max_pages=None):
                 page = await context.new_page()
                 page.set_default_timeout(1200000)
 
-                await safe_goto_and_wait(page, current_url)
-                log_event(f"Successfully loaded: {current_url}")
+                await safe_goto_and_wait(page, url)
+                log_event(f"Successfully loaded: {url}")
 
                 # Scroll to load all items
                 await scroll_to_bottom(page)
@@ -138,8 +142,8 @@ async def handle_ringconcierge(url, max_pages=None):
                 time_only = datetime.now().strftime("%H.%M")
 
                 # Get all product tiles
-                product_wrapper = await page.query_selector("div.ProductListWrapper")
-                products = await page.query_selector_all("div.Grid__Cell") if product_wrapper else []
+                product_wrapper = await page.query_selector("ul.products-grid")
+                products = await product_wrapper.query_selector_all("li.item  ") if product_wrapper else []
 
                 logging.info(f"New products found: {len(products)}")
                 print(f"New products found: {len(products)}")
@@ -148,51 +152,49 @@ async def handle_ringconcierge(url, max_pages=None):
                 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
                     try:
-                        # Extract product name - from the ProductItem__Title element
-                        name_tag = await product.query_selector(".ProductItem__Title")
+                        # Extract product name - from product-name class
+                        name_tag = await product.query_selector(".product-name")
                         product_name = (await name_tag.inner_text()).strip() if name_tag else "N/A"
                     except Exception:
                         product_name = "N/A"
 
                     try:
-                        # Extract price - from the money element
-                        price_tag = await product.query_selector(".money")
+                        # Extract price - from price-box span
+                        price_tag = await product.query_selector(".price-box .price")
                         price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
                         # Clean up price string
                         price = re.sub(r'\s+', ' ', price).strip()
                     except Exception:
                         price = "N/A"
 
+                    try:
+                        # Extract stock status
+                        stock_tag = await product.query_selector(".stock-state span")
+                        stock_status = (await stock_tag.inner_text()).strip() if stock_tag else "N/A"
+                    except Exception:
+                        stock_status = "N/A"
+
                     # Description is same as product name in this case
                     description = product_name
 
                     image_url = "N/A"
                     try:
-                        # Get the second image tag (index 1) which is the main product image
-                        img_tags = await product.query_selector_all(".ProductItem__Image")
-                        if len(img_tags) > 1:  # Ensure there is a second image
-                            img_tag = img_tags[1]
-                            srcset = await img_tag.get_attribute("srcset")
-                            
-                            if srcset:
-                                # Extract all URLs and resolutions from srcset
-                                srcset_parts = [part.strip() for part in srcset.split(",")]
-                                urls_resolutions = []
-                                
-                                for part in srcset_parts:
-                                    img_url, resolution = part.split(" ")
-                                    resolution = int(resolution.replace("w", ""))
-                                    urls_resolutions.append((resolution, img_url))
-                                
-                                # Sort by resolution and get the highest one
-                                urls_resolutions.sort(reverse=True)
-                                if urls_resolutions:
-                                    image_url = urls_resolutions[0][1]
-                                    # Ensure URL is complete (add https: if needed)
-                                    if image_url.startswith("//"):
-                                        image_url = f"https:{image_url}"
+                        # Get all image elements
+                        img_tags = await product.query_selector_all(".product-image-block img")
+                        for img_tag in img_tags:
+                            temp_url = await img_tag.get_attribute("src") or await img_tag.get_attribute("data-src")
+                            if temp_url and "/media/catalog/product/" in temp_url:
+                                # Modify only product image URLs (skip icons/logos)
+                                image_url = temp_url.replace("small_image/210x215", "image/600x600")
+                                if image_url.startswith("//"):
+                                    image_url = f"https:{image_url}"
+                                image_url = image_url.split('?')[0]
+                                break  # Use first valid product image
                     except Exception as e:
                         log_event(f"Error getting image URL: {e}")
+
+                    # Only process if we have a valid product image URL
+                    if "/media/catalog/product/" not in image_url:
                         image_url = "N/A"
 
                     # Extract gold type (kt) from product name/description
@@ -211,8 +213,8 @@ async def handle_ringconcierge(url, max_pages=None):
                             download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                         )))
 
-                    records.append((unique_id, current_date, page_title, product_name, description, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, description, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, description, kt, price, diamond_weight, stock_status))
+                    sheet.append([current_date, page_title, product_name, description, kt, price, diamond_weight, time_only, image_url, stock_status])
                             
                 # Process image downloads
                 for row_num, unique_id, task in image_tasks:

@@ -15,6 +15,7 @@ from limit_checker import update_product_count
 import httpx
 from playwright.async_api import async_playwright
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from proxysetup import get_browser_with_proxy_strategy
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
 
@@ -90,15 +91,8 @@ async def handle_hannoush(url, max_pages):
     image_tasks = []
 
     async with async_playwright() as p:
-        browser = await p.chromium.connect_over_cdp(PROXY_URL)
-        page = await browser.new_page()
-
-        print("Opening page...")
-        try:
-            await page.goto(url, timeout=120000)
-        except Exception as e:
-            logging.warning(f"Failed to load URL {url}: {e}")
-            return "", "", ""
+        product_wrapper = "#product-grid"
+        browser, page =  await get_browser_with_proxy_strategy(p, url, product_wrapper)
 
         for scroll_index in range(max_pages):
             print(f"Scroll {scroll_index + 1}/{max_pages}")

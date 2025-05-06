@@ -81,22 +81,6 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
 def random_delay(min_sec=1, max_sec=3):
     time.sleep(random.uniform(min_sec, max_sec))
 
-# # Reliable page.goto wrapper
-# async def safe_goto_and_wait(page, url, retries=3):
-#     for attempt in range(retries):
-#         try:
-#             print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-#             await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-#             await page.wait_for_selector(".main-product-container", state="attached", timeout=30000)
-#             print("[Success] Product cards loaded.")
-#             return
-#         except (Error, TimeoutError) as e:
-#             logging.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
-#             if attempt < retries - 1:
-#                 random_delay(1, 3)
-#             else:
-#                 raise
-            
 ########################################  safe_goto_and_wait ####################################################################
 
 
@@ -269,7 +253,7 @@ async def handle_shane_co(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -279,10 +263,10 @@ async def handle_shane_co(url, max_pages):
     page_count = 1
     current_url = url
     prev_prod_count = 0
-    while current_url and (page_count < max_pages):
+    while current_url and (page_count <= max_pages):
         logging.info(f"Processing page {page_count}: {current_url}")
         browser = None
-        context = None
+        page = None
         try:
             async with async_playwright() as p:
                 browser, page = await get_browser_with_proxy_strategy(p, current_url)
@@ -328,10 +312,63 @@ async def handle_shane_co(url, max_pages):
                         image_url = await image_tag.get_attribute("data-url") if image_tag else "N/A"
                     except Exception:
                         image_url = "N/A"
+                        
+                        
+                        
+                    try:
+                        # Extract the text for the product description (e.g., material like "14k Yellow Gold")
+                        material_el = await product.query_selector("div.text-caption-small")
+                        kt = await material_el.inner_text() if material_el else "N/A"
+                    except Exception:
+                        kt = "N/A"
+                        
+                    additional_info = []
 
-                    gold_type_pattern = r"\b\d{1,2}(?:K|ct)?\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSilver\b"
-                    gold_type_match = re.search(gold_type_pattern, product_name, re.IGNORECASE)
-                    kt = gold_type_match.group() if gold_type_match else "Not found"
+                    # 1. Extract tags like "Lab-Grown"
+                    try:
+                        tag_els = await product.query_selector_all("span.badge span.text-caption-small")
+                        if tag_els:
+                            for tag_el in tag_els:
+                                tag_text = await tag_el.inner_text()
+                                if tag_text:
+                                    additional_info.append(tag_text.strip())
+                        else:
+                            additional_info.append("N/A")
+                    except Exception:
+                        additional_info.append("N/A")
+
+                    # 2. Extract metal type (e.g., "14k White Gold")
+                    try:
+                        metal_el = await product.query_selector("div.text-caption-small")
+                        metal_text = await metal_el.inner_text() if metal_el else "N/A"
+                        additional_info.append(metal_text.strip())
+                    except Exception:
+                        additional_info.append("N/A")
+
+                    # 3. Extract rating count (e.g., "(4)")
+                    try:
+                        rating_el = await product.query_selector("div.pcat-ratings span.totalRattings")
+                        rating_text = await rating_el.inner_text() if rating_el else "N/A"
+                        
+                        if rating_text and "(" in rating_text:
+                            rating_count = rating_text.strip().strip("()")
+                            additional_info.append(f"{rating_count} ratings")
+                        else:
+                            additional_info.append("N/A")
+                    except Exception:
+                        additional_info.append("N/A")
+
+
+                    # Final string
+                    additional_info_str = " | ".join(additional_info)
+                    
+                    
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue    
+                    
+   
+    
 
                     diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw)\b"
                     diamond_weight_match = re.search(diamond_weight_pattern, product_name, re.IGNORECASE)
@@ -342,8 +379,8 @@ async def handle_shane_co(url, max_pages):
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
 
                 for row_num, unique_id, task in image_tasks:
                     try:
@@ -358,7 +395,7 @@ async def handle_shane_co(url, max_pages):
                                 image_path = "N/A"
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")
@@ -387,12 +424,20 @@ async def handle_shane_co(url, max_pages):
 
         page_count += 1
 
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
+
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

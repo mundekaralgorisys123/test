@@ -23,10 +23,10 @@ import json
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
 
-# Flask and paths
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
+
 
 # Resize image if needed
 def resize_image(image_data, max_size=(100, 100)):

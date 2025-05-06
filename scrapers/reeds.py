@@ -10,24 +10,16 @@ from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError, Error
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image
-from flask import Flask
 from PIL import Image as PILImage
-import requests
-import concurrent.futures
 from utils import get_public_ip, log_event, sanitize_filename
-from dotenv import load_dotenv
 from database import insert_into_db
 from limit_checker import update_product_count
-import aiohttp
 from io import BytesIO
-from openpyxl.drawing.image import Image as XLImage
 import httpx
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 # Load environment variables from .env file
-from functools import partial
-load_dotenv()
-PROXY_URL = os.getenv("PROXY_URL")
+from proxysetup import get_browser_with_proxy_strategy
 
-app = Flask(__name__)
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
@@ -103,40 +95,52 @@ def random_delay(min_sec=1, max_sec=3):
 
 
 
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
+# async def safe_goto_and_wait(page, url, retries=3):
+#     for attempt in range(retries):
+#         try:
+#             print(f"[Attempt {attempt + 1}] Navigating to: {url}")
+#             await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
 
 
-            # Wait for the selector with a longer timeout
+#             # Wait for the selector with a longer timeout
             
-            product_cards = await page.wait_for_selector(".products.wrapper.grid.products-grid", state="attached", timeout=30000)
+#             product_cards = await page.wait_for_selector(".products.wrapper.grid.products-grid", state="attached", timeout=30000)
 
 
-            # Optionally validate at least 1 is visible (Playwright already does this)
-            if product_cards:
-                print("[Success] Product cards loaded.")
-                return
-        except Error as e:
-            logging.error(f"Error navigating to {url} on attempt {attempt + 1}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
-        except TimeoutError as e:
-            logging.warning(f"TimeoutError on attempt {attempt + 1} navigating to {url}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
+#             # Optionally validate at least 1 is visible (Playwright already does this)
+#             if product_cards:
+#                 print("[Success] Product cards loaded.")
+#                 return
+#         except Error as e:
+#             logging.error(f"Error navigating to {url} on attempt {attempt + 1}: {e}")
+#             if attempt < retries - 1:
+#                 logging.info("Retrying after waiting a bit...")
+#                 random_delay(1, 3)  # Add a delay before retrying
+#             else:
+#                 logging.error(f"Failed to navigate to {url} after {retries} attempts.")
+#                 raise
+#         except TimeoutError as e:
+#             logging.warning(f"TimeoutError on attempt {attempt + 1} navigating to {url}: {e}")
+#             if attempt < retries - 1:
+#                 logging.info("Retrying after waiting a bit...")
+#                 random_delay(1, 3)  # Add a delay before retrying
+#             else:
+#                 logging.error(f"Failed to navigate to {url} after {retries} attempts.")
+#                 raise
 
         
+def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    url_parts = urlparse(base_url)
+    query_params = parse_qs(url_parts.query)
+
+    # Remove rfk if it exists
+    query_params.pop('rfk', None)
+
+    # Set pagination
+    query_params['p'] = [str(page_count)]
+
+    new_query = urlencode(query_params, doseq=True)
+    return urlunparse((url_parts.scheme, url_parts.netloc, url_parts.path, '', new_query, ''))
 
 async def handle_reeds(url, max_pages):
     ip_address = get_public_ip()
@@ -152,7 +156,7 @@ async def handle_reeds(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -163,7 +167,7 @@ async def handle_reeds(url, max_pages):
     success_count = 0
 
     while page_count <= max_pages:
-        current_url = f"{url}?p={page_count}"
+        current_url = build_url_with_loadmore(url, page_count)
         logging.info(f"Processing page {page_count}: {current_url}")
         
         # Create a new browser instance for each page
@@ -171,14 +175,8 @@ async def handle_reeds(url, max_pages):
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                
-                # Configure timeouts for this page
-                page = await context.new_page()
-                page.set_default_timeout(120000)  # 2 minute timeout
-                
-                await safe_goto_and_wait(page, current_url)
+                product_wrapper=".products.wrapper.grid.products-grid"
+                browser, page = await get_browser_with_proxy_strategy(p, current_url,product_wrapper)
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all products
@@ -204,40 +202,58 @@ async def handle_reeds(url, max_pages):
                 image_tasks = []
 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
+                    additional_info = []
+                    
                     try:
-                        # Target the <a> tag with class 'product-item-link' and get its text content
+                        # Product Name
                         product_name = await (await product.query_selector("a.product-item-link")).inner_text()
+                        product_name = product_name.strip() if product_name else "N/A"
                     except:
                         product_name = "N/A"
 
-
+                    # Price handling with original and discounted prices
+                    price_info = []
                     try:
-                        # Try to get special price first
+                        # Get special/discounted price
                         special_price_el = await product.query_selector(".special-price .price")
                         if special_price_el:
-                            price = await special_price_el.inner_text()
+                            discounted_price = await special_price_el.inner_text()
+                            price_info.append(discounted_price.strip())
+                            
+                            # Get original price if available
+                            original_price_el = await product.query_selector(".price-box .old-price .price")
+                            if original_price_el:
+                                original_price = await original_price_el.inner_text()
+                                price_info.append(original_price.strip())
+                                
+                                # Calculate discount percentage if possible
+                                try:
+                                    disc_num = float(discounted_price.replace('$', '').replace(',', '').strip())
+                                    orig_num = float(original_price.replace('$', '').replace(',', '').strip())
+                                    discount_pct = round((1 - (disc_num / orig_num)) * 100)
+                                    additional_info.append(f"Discount: {discount_pct}%")
+                                except:
+                                    pass
                         else:
-                            # Fall back to the regular price
+                            # Regular price
                             regular_price_el = await product.query_selector(".price-box .price")
-                            price = await regular_price_el.inner_text() if regular_price_el else "N/A"
+                            if regular_price_el:
+                                price_info.append((await regular_price_el.inner_text()).strip())
                     except:
-                        price = "N/A"
-
-
-                        
+                        price_info = ["N/A"]
                     
+                    price = " | ".join(price_info) if price_info else "N/A"
+
+                    # Image URL
                     try:
-                        # Target the <img> tag inside the <span> with class 'product-image-wrapper' and get the 'src' attribute
                         image_el = await product.query_selector("span.product-image-wrapper img.product-image-photo")
                         image_url = await image_el.get_attribute("src")
-                        
-                        # Normalize to full URL if it's relative
                         if image_url and image_url.startswith("//"):
                             image_url = "https:" + image_url
                     except:
                         image_url = "N/A"
 
-
+                    # Gold/Karat Type
                     gold_type_match = re.findall(
                         r"(\d{1,2}(?:/\d{1,2})?ctw?\s*(?:Yellow|White|Rose)?\s*Gold|Platinum|Sterling Silver|Gold-Plated|Rhodium-Plated)",
                         product_name,
@@ -245,8 +261,7 @@ async def handle_reeds(url, max_pages):
                     )
                     kt = ", ".join(gold_type_match) if gold_type_match else "N/A"
 
-
-                    # Extract Diamond Weight (supports "1.85ct", "2ct", "1.50ct", etc.)
+                    # Diamond Weight
                     diamond_weight_match = re.findall(
                         r"(\d+(?:\.\d+)?(?:/\d+)?\s*ctw?)",
                         product_name,
@@ -254,14 +269,68 @@ async def handle_reeds(url, max_pages):
                     )
                     diamond_weight = ", ".join(diamond_weight_match) if diamond_weight_match else "N/A"
 
+                    # Additional Product Info
+                    try:
+                        # Stock status
+                        stock_el = await product.query_selector(".rfk_oos")
+                        if stock_el:
+                            stock_status = await stock_el.inner_text()
+                            if stock_status and stock_status.lower() != "out of stock":
+                                additional_info.append(f"Stock: {stock_status.strip()}")
+                        
+                        # Brand
+                        brand_el = await product.query_selector(".rfkx_brand")
+                        if brand_el:
+                            brand = await brand_el.inner_text()
+                            if brand.strip():
+                                additional_info.append(f"Brand: {brand.strip()}")
+                        
+                        # Product labels (sale, new, etc.)
+                        label_el = await product.query_selector(".rfk_condition")
+                        if label_el:
+                            label = await label_el.inner_text()
+                            if label.strip():
+                                additional_info.append(f"Label: {label.strip()}")
+                        
+                        # Product category
+                        category = await product.get_attribute("category")
+                        if category:
+                            additional_info.append(f"Category: {category}")
+                        
+                        # Product ID
+                        product_id = await product.get_attribute("id")
+                        if product_id:
+                            additional_info.append(f"Product ID: {product_id}")
+                        
+                        # Color options (if available)
+                        color_options = await product.query_selector_all(".rfk_alt-images img")
+                        if color_options and len(color_options) > 1:
+                            additional_info.append(f"Color options: {len(color_options)}")
+                    
+                    except Exception as e:
+                        logging.warning(f"Error extracting additional info: {e}")
+
+                    # Combine all additional info with pipe delimiter
+                    additional_info_str = " | ".join(additional_info) if additional_info else ""
 
                     unique_id = str(uuid.uuid4())
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight, additional_info_str))
+                    sheet.append([
+                        current_date, 
+                        page_title, 
+                        product_name, 
+                        None,  # Image placeholder (will be added later)
+                        kt, 
+                        price, 
+                        diamond_weight, 
+                        time_only, 
+                        image_url,
+                        additional_info_str
+                    ])
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -278,7 +347,8 @@ async def handle_reeds(url, max_pages):
                         
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, 
+                                             record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")

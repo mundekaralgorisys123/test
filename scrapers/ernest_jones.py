@@ -270,7 +270,7 @@ async def handle_ernest_jones(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -321,14 +321,84 @@ async def handle_ernest_jones(url, max_pages):
                         product_name = "N/A"
 
                     try:
-                        price = await (await product.query_selector("div.price")).inner_text()
-                    except:
+                        # Extract sale price (discounted price)
+                        price_el = await product.query_selector("div.price")
+                        sale_price_text = await price_el.inner_text() if price_el else ""
+                        sale_price_match = re.search(r"£\s*[\d,]+(?:\.\d{2})?", sale_price_text)
+                        sale_price = sale_price_match.group().strip() if sale_price_match else ""
+
+                        # Extract discount text (like "50% off")
+                        discount_match = re.search(r"\(\s*\d+% off\s*\)", sale_price_text)
+                        discount = discount_match.group().strip("()") if discount_match else ""
+
+                        # Extract original price (Was price)
+                        original_price_el = await product.query_selector("div.original-price")
+                        original_price_text = await original_price_el.inner_text() if original_price_el else ""
+                        original_price_match = re.search(r"£\s*[\d,]+(?:\.\d{2})?", original_price_text)
+                        original_price = original_price_match.group().strip() if original_price_match else ""
+
+                        # Format the final price string
+                        if sale_price and original_price:
+                            price = f"{sale_price} ({discount}) off {original_price}" if discount else f"{sale_price} off {original_price}"
+                        elif sale_price:
+                            price = f"{sale_price} ({discount})" if discount else sale_price
+                        elif original_price:
+                            price = original_price
+                        else:
+                            price = "N/A"
+
+                    except Exception as e:
                         price = "N/A"
+                        print(f"Error extracting price: {e}")
+
 
                     try:
                         image_url = await (await product.query_selector("img[itemprop='image']")).get_attribute("src")
                     except:
                         image_url = "N/A"
+                        
+                    additional_info = []
+
+                    try:
+                        # Extract Variations Available text
+                        variations_el = await product.query_selector("div.more-options div.v-hidden a[title='Variations Available']")
+                        if variations_el:
+                            variations_text = await variations_el.inner_text()
+                            if variations_text:
+                                additional_info.append(variations_text.strip())
+                        else:
+                            additional_info.append("N/A")
+
+                        
+
+                        # Extract Finance Message
+                        finance_msg_el = await product.query_selector("div.finance-msg-uk p")
+                        if finance_msg_el:
+                            finance_msg = await finance_msg_el.inner_text()
+                            if finance_msg:
+                                additional_info.append(finance_msg.strip())
+                        else:
+                            additional_info.append("N/A")
+
+                        # Extract tags like "Exclusive"
+                        tag_els = await product.query_selector_all("span.product-tag.groupby-tablet-product-tags")
+                        if tag_els:
+                            for tag_el in tag_els:
+                                tag_text = await tag_el.inner_text()
+                                if tag_text:
+                                    additional_info.append(tag_text.strip())
+
+                    except Exception as e:
+                        additional_info.append("N/A")
+
+                    # Join all the extracted info into a single string with separators
+                    additional_info_str = " | ".join(additional_info)
+
+                        
+                        
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue      
 
                     gold_type_match = re.findall(r"(\d{1,2}ct\s*(?:Yellow|White|Rose)?\s*Gold|Platinum)", product_name, re.IGNORECASE)
                     kt = ", ".join(gold_type_match) if gold_type_match else "N/A"
@@ -342,8 +412,8 @@ async def handle_ernest_jones(url, max_pages):
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -360,7 +430,7 @@ async def handle_ernest_jones(url, max_pages):
                         
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")
@@ -388,15 +458,21 @@ async def handle_ernest_jones(url, max_pages):
             
         page_count += 1
 
+    # return base64_encoded, filename, file_path
+    if not all_records:
+        return None, None, None
 
-    # Final save and database operations
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
 
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

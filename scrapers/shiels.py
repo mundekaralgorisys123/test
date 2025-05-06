@@ -24,6 +24,7 @@ from openpyxl.drawing.image import Image as XLImage
 import httpx
 # Load environment variables from .env file
 from functools import partial
+from proxysetup import get_browser_with_proxy_strategy
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
 
@@ -90,48 +91,6 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
         except httpx.RequestError as e:
             logging.error(f"Fallback failed for {product_name}: {e}")
             return "N/A"
-        
-        
-def random_delay(min_sec=1, max_sec=3):
-    """Introduce a random delay to mimic human-like behavior."""
-    time.sleep(random.uniform(min_sec, max_sec))
-
-
-
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-
-
-            # Wait for the selector with a longer timeout
-            product_cards = await page.wait_for_selector(".ProductGridContainer", state="attached", timeout=30000)
-
-            # Optionally validate at least 1 is visible (Playwright already does this)
-            if product_cards:
-                print("[Success] Product cards loaded.")
-                return
-        except Error as e:
-            logging.error(f"Error navigating to {url} on attempt {attempt + 1}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
-        except TimeoutError as e:
-            logging.warning(f"TimeoutError on attempt {attempt + 1} navigating to {url}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
-
-            
-
-
 
 async def handle_shiels(url, max_pages):
     ip_address = get_public_ip()
@@ -158,7 +117,12 @@ async def handle_shiels(url, max_pages):
     success_count = 0
 
     while page_count <= max_pages:
-        current_url = f"{url}?page={page_count}"
+        if page_count > 1:
+            if '#' in url:
+                base, fragment = url.split('#', 1)
+                current_url = f"{base}?page={page_count}#{fragment}"
+            else:
+                current_url = f"{url}?page={page_count}"
         logging.info(f"Processing page {page_count}: {current_url}")
         
         # Create a new browser instance for each page
@@ -166,16 +130,9 @@ async def handle_shiels(url, max_pages):
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                
-                # Configure timeouts for this page
-                page = await context.new_page()
-                page.set_default_timeout(120000)  # 2 minute timeout
-                
-                await safe_goto_and_wait(page, current_url)
+                product_wrapper = ".ProductGridContainer"
+                browser, page = await get_browser_with_proxy_strategy(p,current_url, product_wrapper)
                 log_event(f"Successfully loaded: {current_url}")
-
                 # Scroll to load all products
                 prev_product_count = 0
                 for _ in range(10):

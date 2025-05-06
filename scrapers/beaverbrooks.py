@@ -16,6 +16,7 @@ from utils import get_public_ip, log_event, sanitize_filename
 from dotenv import load_dotenv
 from database import insert_into_db
 from limit_checker import update_product_count
+from proxysetup import get_browser_with_proxy_strategy
 from io import BytesIO
 from openpyxl.drawing.image import Image as XLImage
 import httpx
@@ -58,31 +59,6 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
     logging.error(f"Failed to download {product_name} after {retries} attempts.")
     return "N/A"
 
-def random_delay(min_sec=1, max_sec=3):
-    time.sleep(random.uniform(min_sec, max_sec))
-
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180000, wait_until="domcontentloaded")
-            product_cards = await page.wait_for_selector(".products--xdQkZ", state="attached", timeout=30000)
-            if product_cards:
-                print("[Success] Product cards loaded.")
-                return
-        except Error as e:
-            logging.error(f"Error navigating to {url} on attempt {attempt + 1}: {e}")
-            if attempt < retries - 1:
-                random_delay(1, 3)
-            else:
-                raise
-        except TimeoutError as e:
-            logging.warning(f"TimeoutError on attempt {attempt + 1} navigating to {url}: {e}")
-            if attempt < retries - 1:
-                random_delay(1, 3)
-            else:
-                raise
-
 async def handle_beaverbrooks(url, max_pages):
     ip_address = get_public_ip()
     logging.info(f"Scraping started for: {url} from IP: {ip_address}, max_pages: {max_pages}")
@@ -104,21 +80,21 @@ async def handle_beaverbrooks(url, max_pages):
 
     page_count = 1
     success_count = 0
-
+    current_url = url
     while page_count <= max_pages:
-        current_url = f"{url}?page={page_count}"
+        if page_count > 1:
+            if '?' in current_url:
+                current_url = f"{url}&page={page_count}"
+            else:
+                current_url = f"{url}?page={page_count}"
         logging.info(f"Processing page {page_count}: {current_url}")
 
         browser = None
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(120000)
-
-                await safe_goto_and_wait(page, current_url)
+                product_wrapper = ".products--xdQkZ"
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, product_wrapper)
                 log_event(f"Successfully loaded: {current_url}")
 
                 prev_product_count = 0

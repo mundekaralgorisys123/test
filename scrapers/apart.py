@@ -296,7 +296,7 @@ async def handle_apart(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -314,7 +314,6 @@ async def handle_apart(url, max_pages):
             browser = None
             page = None
             try:
-                
                 browser, page = await get_browser_with_proxy_strategy(p, current_url)
                 log_event(f"Successfully loaded: {current_url}")
 
@@ -332,38 +331,89 @@ async def handle_apart(url, max_pages):
                 current_date = datetime.now().strftime("%Y-%m-%d")
                 time_only = datetime.now().strftime("%H.%M")
                 
-                # wrapper = page.locator("#product-list")
-                # products = await wrapper.locator("li.item").all() if await wrapper.count() > 0 else []
-                
                 products = await page.query_selector_all("li.item")
-                
-        
                 logging.info(f"Total products scraped on page: {len(products)}")
                 records = []
                 image_tasks = []
                 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
                     try:
+                        # Product name
                         name_elem = await product.query_selector("div.product-name a.productListGTM")
-                        product_name = await name_elem.inner_text() if name_elem else "N/A"
+                        product_name = await name_elem.inner_text() if name_elem else None
+                        
+                        if not product_name:
+                            continue  # Skip if no product name
                     except Exception as e:
-                        product_name = "N/A"
+                        continue  # Skip if error getting product name
+
+                    # Price handling - comprehensive approach
+                    price_str = None
+                    currency = None
+                    try:
+                        price_container = await product.query_selector("div.price-cnt")
+                        if price_container:
+                            # Get price value
+                            price_elem = await price_container.query_selector("span.value")
+                            price_value = await price_elem.inner_text() if price_elem else None
+                            
+                            # Get currency
+                            currency_elem = await price_container.query_selector("span.currencyName")
+                            currency = await currency_elem.inner_text() if currency_elem else None
+                            
+                            # Format price string
+                            if price_value and currency:
+                                price_str = f"{price_value} {currency}"
+                            elif price_value:
+                                price_str = price_value
+                    except Exception as e:
+                        print(f"[Price] Error: {e}")
+                        price_str = None
+
+                    if not price_str:
+                        continue  # Skip if no price
 
                     try:
-                        price_elem = await product.query_selector("div.price-cnt span.value")
-                        price = await price_elem.inner_text() if price_elem else "N/A"
-                    except Exception as e:
-                        price = "N/A"
-
-                    try:
+                        # Image URL
                         image_elem = await product.query_selector("img.group.list-group-image")
-                        image_url = await image_elem.get_attribute("src") if image_elem else "N/A"
-                        if image_url and image_url.startswith("//"):
-                            image_url = f"https:{image_url}"
+                        image_url = await image_elem.get_attribute("src") if image_elem else None
+                        
+                        if image_url:
+                            if image_url.startswith("//"):
+                                image_url = f"https:{image_url}"
+                            elif image_url.startswith("/"):
+                                image_url = f"https://www.apart.eu{image_url}"
+                        else:
+                            continue  # Skip if no image URL
                     except Exception as e:
-                        image_url = "N/A"
+                        print(f"[Image URL] Error: {e}")
+                        continue  # Skip if error getting image URL
+                    
+                    if product_name == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Image: {image_url}")
+                        continue
 
+                    # Extract all labels/badges
+                    additional_info = []
+                    
+                    try:
+                        # Get all badge elements
+                        badge_elements = await product.query_selector_all(".new-badge .new .label-master")
+                        for badge in badge_elements:
+                            badge_text = (await badge.inner_text()).strip()
+                            if badge_text:
+                                additional_info.append(badge_text)
+                                
+                        # Also check for group badges
+                        group_badges = await product.query_selector_all(".new-badge .new .label-master.group")
+                        for badge in group_badges:
+                            badge_text = (await badge.inner_text()).strip()
+                            if badge_text:
+                                additional_info.append(badge_text)
+                    except Exception as e:
+                        print(f"[Badges] Error: {e}")
 
+                    # Extract product details
                     gold_type_match = re.search(r"(\d{1,2}K|Platinum|Silver|Gold|White Gold|Yellow Gold|Rose Gold)", product_name, re.IGNORECASE)
                     kt = gold_type_match.group(0) if gold_type_match else "N/A"
 
@@ -375,30 +425,69 @@ async def handle_apart(url, max_pages):
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
                     
-
-                    # all_records.append((unique_id, current_date, page_title, product_name, image_url, kt, price, diamond_weight))
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
-
+                    records.append((
+                        unique_id, 
+                        current_date, 
+                        page_title, 
+                        product_name, 
+                        None,  # Placeholder for image path
+                        kt, 
+                        price_str, 
+                        diamond_weight,
+                        " | ".join(additional_info) if additional_info else "N/A"
+                    ))
                     
+                    sheet.append([
+                        current_date, 
+                        page_title, 
+                        product_name, 
+                        None,  # Placeholder for image
+                        kt, 
+                        price_str, 
+                        diamond_weight, 
+                        time_only, 
+                        image_url,
+                        " | ".join(additional_info) if additional_info else "N/A"
+                    ])
+                    
+                # Process images and update records
                 for row_num, unique_id, task in image_tasks:
                     try:
                         image_path = await asyncio.wait_for(task, timeout=60)
-                        if image_path != "N/A":
-                            try:
-                                img = Image(image_path)
-                                img.width, img.height = 100, 100
-                                sheet.add_image(img, f"D{row_num}")
-                            except Exception as img_error:
-                                logging.error(f"Error adding image to Excel: {img_error}")
-                                image_path = "N/A"
+                        if not image_path or image_path == "N/A":
+                            # Remove the record if image download failed
+                            records = [r for r in records if r[0] != unique_id]
+                            continue
+                            
+                        try:
+                            img = Image(image_path)
+                            img.width, img.height = 100, 100
+                            sheet.add_image(img, f"D{row_num}")
+                        except Exception as img_error:
+                            logging.error(f"Error adding image to Excel: {img_error}")
+                            # Remove the record if we can't add the image
+                            records = [r for r in records if r[0] != unique_id]
+                            continue
                         
+                        # Update the record with image path
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (
+                                    record[0], 
+                                    record[1], 
+                                    record[2], 
+                                    record[3], 
+                                    image_path, 
+                                    record[5], 
+                                    record[6], 
+                                    record[7],
+                                    record[8]
+                                )
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")
+                        # Remove the record if image download timed out
+                        records = [r for r in records if r[0] != unique_id]
 
                 all_records.extend(records)
                 success_count += 1
@@ -425,17 +514,20 @@ async def handle_apart(url, max_pages):
             
             # Add delay between pages
             await asyncio.sleep(random.uniform(2, 5))
-            
-        page_count += 1
 
-    # # Final save and database operations
+    # Final save and database operations
+    if not all_records:
+        return None, None, None
+    
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
 
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
-    insert_into_db(all_records)
-    update_product_count(len(all_records))
+    # Only insert complete records into database
+    complete_records = [r for r in all_records if all(r[1:])]  # Skip if any field is None
+    insert_into_db(complete_records)
+    update_product_count(len(complete_records))
 
     return base64_encoded, filename, file_path

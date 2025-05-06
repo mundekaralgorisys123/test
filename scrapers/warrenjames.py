@@ -14,7 +14,7 @@ from database import insert_into_db
 from limit_checker import update_product_count
 import httpx
 from playwright.async_api import async_playwright, TimeoutError
-
+from proxysetup import get_browser_with_proxy_strategy
 # Load .env variables
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
@@ -72,8 +72,8 @@ async def handle_warrenjames(url, max_pages):
         while load_more_clicks <= max_pages:
             async with async_playwright() as p:
                 # Create a new browser instance for each page
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                page = await browser.new_page()
+                product_wrapper = "div.category_product_holder.categoryListMinHeight"
+                browser, page = await get_browser_with_proxy_strategy(p,url, product_wrapper)
 
                 try:
                     await page.goto(url, timeout=120000)

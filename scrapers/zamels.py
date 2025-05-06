@@ -227,13 +227,12 @@ async def handle_zamels(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     current_date = datetime.now().strftime("%Y-%m-%d")
     time_only = datetime.now().strftime("%H.%M")
 
-   
     records = []
     image_tasks = []
 
@@ -249,25 +248,15 @@ async def handle_zamels(url, max_pages):
                 browser, page = await get_browser_with_proxy_strategy(p, url)
                 log_event(f"Successfully loaded: {url}")
 
-                
                 for _ in range(load_more_clicks - 1):
                     try:
                         load_more_button = page.locator("button.btn-filter-load-more")
-
-                        # Wait for the button to appear in the DOM (up to 10 seconds)
                         await load_more_button.wait_for(state="attached", timeout=10000)
-
-                        # Scroll into view to make sure it's visible
                         await load_more_button.scroll_into_view_if_needed()
-
-                        # Check if it's visible
                         if await load_more_button.is_visible():
                             prev_count = await page.locator("div.product-card").count()
-
                             await load_more_button.click()
                             logging.info("Clicked 'Load More' button.")
-
-                            # Wait until new products appear
                             for _ in range(10):
                                 await asyncio.sleep(1.5)
                                 current_count = await page.locator("div.product-card").count()
@@ -280,13 +269,9 @@ async def handle_zamels(url, max_pages):
                         else:
                             logging.warning("'Load More' button not visible.")
                             break
-
                     except Exception as e:
                         logging.warning(f"Could not click 'Load More': {e}")
                         break
-
-
-
 
                 all_products = await page.query_selector_all(".nn-product-slider-item")
                 total_products = len(all_products)
@@ -310,25 +295,11 @@ async def handle_zamels(url, max_pages):
                     except:
                         price = "N/A"
 
-                    # try:
-                    #     image_tag = await product.query_selector("div.nn-product-slider-item-image img")
-                    #     if image_tag:
-                    #         image_url = await image_tag.get_attribute("src") or await image_tag.get_attribute("data-src")
-                    #     else:
-                    #         image_url = "N/A"
-                    # except Exception as e:
-                    #     print(f"Error fetching image URL: {e}")
-                    #     image_url = "N/A"
-                    
-                    # print(image_url)
-                    
-                                        
                     try:
                         image_tag = await product.query_selector("div.nn-product-slider-item-image img")
                         if image_tag:
                             raw_url = await image_tag.get_attribute("src") or await image_tag.get_attribute("data-src")
                             if raw_url:
-                                # Normalize protocol-relative URLs (e.g., //cdn.shopify.com/...)
                                 if raw_url.startswith("//"):
                                     image_url = "https:" + raw_url
                                 elif raw_url.startswith("/"):
@@ -344,10 +315,6 @@ async def handle_zamels(url, max_pages):
                         image_url = "N/A"
 
                     print(image_url)
-                                        
-
-
-
 
                     kt_match = re.search(r"\b\d{1,2}K\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSilver\b", product_name, re.IGNORECASE)
                     kt = kt_match.group() if kt_match else "Not found"
@@ -355,12 +322,48 @@ async def handle_zamels(url, max_pages):
                     diamond_match = re.search(r"\b(\d+(\.\d+)?)\s*(?:ct|ctw|carat)\b", product_name, re.IGNORECASE)
                     diamond_weight = f"{diamond_match.group(1)} ct" if diamond_match else "N/A"
 
+                    # Extract additional info
+                    additional_info = []
+                    
+                    # Check for Best Seller tag
+                    try:
+                        bestseller_tag = await product.query_selector(".nn-product-slider-item-badge.bestseller")
+                        if bestseller_tag:
+                            bestseller_text = await bestseller_tag.inner_text()
+                            if bestseller_text.strip():
+                                additional_info.append(f"Best Seller")
+                    except:
+                        pass
+                    
+                    # Check for discount notice
+                    try:
+                        discount_tag = await product.query_selector(".text-danger.fw-700.fs-12")
+                        if discount_tag:
+                            discount_text = await discount_tag.inner_text()
+                            if discount_text.strip() and "discount" in discount_text.lower():
+                                additional_info.append(f"Discount: {discount_text.strip()}")
+                    except:
+                        pass
+                    
+                    # Check for rating (if available in future)
+                    # try:
+                    #     rating_tag = await product.query_selector(".product-rating")
+                    #     if rating_tag:
+                    #         rating = await rating_tag.inner_text()
+                    #         if rating.strip():
+                    #             additional_info.append(f"Rating: {rating.strip()}")
+                    # except:
+                    #     pass
+                    
+                    # Join all additional info with pipe separator
+                    additional_info_str = " | ".join(additional_info) if additional_info else "N/A"
+
                     unique_id = str(uuid.uuid4())
                     task = asyncio.create_task(download_image(session, image_url, product_name, timestamp, image_folder, unique_id))
                     image_tasks.append((len(sheet['A']) + 1, unique_id, task))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight, additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url, additional_info_str])
 
                 # Process image downloads and attach them to Excel
                 for row, unique_id, task in image_tasks:
@@ -371,7 +374,7 @@ async def handle_zamels(url, max_pages):
                         sheet.add_image(img, f"D{row}")
                     for i, record in enumerate(records):
                         if record[0] == unique_id:
-                            records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                            records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                             break
 
                 await browser.close()
@@ -384,6 +387,7 @@ async def handle_zamels(url, max_pages):
         log_event(f"Data saved to {file_path} | IP: {ip_address}")
 
         if records:
+            # Update your database schema to include the additional_info column
             insert_into_db(records)
         else:
             logging.info("No data to insert into the database.")

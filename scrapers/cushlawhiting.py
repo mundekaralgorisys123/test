@@ -19,10 +19,10 @@ from playwright.async_api import async_playwright, TimeoutError
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
 
+app = Flask(__name__)
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
+EXCEL_DATA_PATH = os.path.join(app.root_path, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
-
 
 async def download_image(session, image_url, product_name, timestamp, image_folder, unique_id):
     if not image_url or image_url == "N/A" or image_url.startswith('data:image'):
@@ -103,21 +103,32 @@ async def handle_cushlawhiting(url_page, max_pages):
                     continue
 
                 # Only click "Load More" after the first page
-                try:
-                    for i in range(1, current_page):
+                if current_page > 1:
+                    try:
                         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                         await asyncio.sleep(1)
-                        button = await page.query_selector("button#view-more-product")
+
+                        button = await page.query_selector("button.load-more-btn.button-outlined")
                         if button and await button.is_visible():
                             await button.scroll_into_view_if_needed()
                             await asyncio.sleep(0.5)
                             await button.click()
+                            # Wait for new products to load
+                            try:
+                                await page.wait_for_function(
+                                    "document.querySelectorAll('.grid__item').length > old_count",
+                                    timeout=10000,
+                                    poll=500
+                                )
+                            except TimeoutError:
+                                logging.info("No new products loaded after clicking 'Load More'")
+                                has_more_products = False
                         else:
                             logging.info("No more 'Load More' button found")
                             has_more_products = False
-                except Exception as e:
-                    logging.warning(f"Error clicking 'Load More': {e}")
-                    has_more_products = False
+                    except Exception as e:
+                        logging.warning(f"Error clicking 'Load More': {e}")
+                        has_more_products = False
 
                 # Get all current products
                 current_products = await page.query_selector_all("div.card-wrapper")

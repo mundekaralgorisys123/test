@@ -84,7 +84,7 @@ async def handle_histoiredor(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     current_date = datetime.now().strftime("%Y-%m-%d")
@@ -102,7 +102,7 @@ async def handle_histoiredor(url, max_pages):
             async with async_playwright() as p:
                 # Create a new browser instance for each page
                 if current_page > 1:
-                    current_url =  f"{url}?start={(current_page-1)*41}&sz=41"
+                    current_url = f"{url}?start={(current_page-1)*41}&sz=41"
                 browser = await p.chromium.connect_over_cdp(PROXY_URL)
                 page = await browser.new_page()
 
@@ -111,8 +111,7 @@ async def handle_histoiredor(url, max_pages):
                 except Exception as e:
                     logging.warning(f"Failed to load URL {url}: {e}")
                     await browser.close()
-                    continue  # move to the next iteration
-
+                    continue
 
                 # Handle Didomi cookie consent popup
                 try:
@@ -126,7 +125,6 @@ async def handle_histoiredor(url, max_pages):
                     print("ℹ️ No Didomi popup found or already dismissed.")
                     
                 all_products = await page.query_selector_all("div.c-grid__item")
-
                 total_products = len(all_products)
                 new_products = all_products
                 logging.info(f"Page {current_page}: Total = {total_products}, New = {len(new_products)}")
@@ -146,56 +144,116 @@ async def handle_histoiredor(url, max_pages):
                         print(f"[Product Name] Error: {e}")
                         product_name = "N/A"
 
-
+                    # Price handling - comprehensive approach
+                    price_str = "N/A"
+                    original_price = "N/A"
+                    sale_price = "N/A"
                     try:
+                        # Get standard price
                         price_tag = await product.query_selector("span.c-price__standard")
-                        price = await price_tag.inner_text() if price_tag else "N/A"
+                        if price_tag:
+                            price_str = await price_tag.inner_text()
+                            
+                        # Check for discounted price (if available)
+                        sale_price_tag = await product.query_selector("span.c-price__sale")
+                        if sale_price_tag:
+                            sale_price = await sale_price_tag.inner_text()
+                            price_str = f"{price_str} | {sale_price}"
                     except Exception as e:
                         print(f"[Price] Error: {e}")
-                        price = "N/A"
-
+                        price_str = "N/A"
 
                     try:
-                        # await product.scroll_into_view_if_needed()
-                        
-                        # Locate the first <img> tag inside a <picture> element
+                        # Image handling
                         img_tag = await product.query_selector("div.c-product-tile__image-link picture img")
-                        
-                        # First, try to get the high-resolution image from `data-src` (for lazy loading)
                         image_url = await img_tag.get_attribute("data-src") if img_tag else None
                         
-                        # If `data-src` is not available, fallback to `src` attribute
                         if not image_url:
                             image_url = await img_tag.get_attribute("src") if img_tag else None
 
-                        # Ensure the URL is fully qualified (adds 'https:' if it is a relative URL)
                         if image_url and image_url.startswith("//"):
                             image_url = "https:" + image_url
+                        elif image_url and image_url.startswith("/"):
+                            image_url = "https://www.histoiredor.com" + image_url
 
-                        # In case no valid URL was found
                         if not image_url:
                             image_url = "N/A"
-
                     except Exception as e:
                         print(f"[Image URL] Error: {e}")
                         image_url = "N/A"
+                    if product_name == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Image: {image_url}")
+                        continue
 
-                                            
+                    # Extract additional info
+                    additional_info = []
                     
-                    # Extract Gold Type (e.g., "14K Yellow Gold").
+                    # Check for gold type sticker
+                    try:
+                        gold_sticker = await product.query_selector(".sticker--bg-red-1")
+                        if gold_sticker:
+                            sticker_text = await gold_sticker.inner_text()
+                            if sticker_text.strip():
+                                additional_info.append(sticker_text.strip())
+                    except:
+                        pass
+                    
+                    # Check for discount sticker
+                    try:
+                        discount_sticker = await product.query_selector(".c-product__discount-plp")
+                        if discount_sticker:
+                            discount_text = await discount_sticker.inner_text()
+                            if discount_text.strip():
+                                additional_info.append(f"Discount: {discount_text.strip()}")
+                    except:
+                        pass
+                    
+                    # Check for product dimensions (e.g., "- 43 cm")
+                    try:
+                        dimensions = re.search(r"- (\d+ cm)", product_name)
+                        if dimensions:
+                            additional_info.append(dimensions.group(1))
+                    except:
+                        pass
+                    
+                    # Join all additional info with pipe separator
+                    additional_info_str = " | ".join(additional_info) if additional_info else "N/A"
+
+                    # Extract product details
                     gold_type_match = re.findall(r"(\d{1,2}ct\s*(?:Yellow|White|Rose)?\s*Gold|Platinum|Cubic Zirconia)", product_name, re.IGNORECASE)
                     kt = ", ".join(gold_type_match) if gold_type_match else "N/A"
 
-                    # Extract Diamond Weight (supports "1.85ct", "2ct", "1.50ct", etc.)
                     diamond_weight_match = re.findall(r"(\d+(?:\.\d+)?\s*ct)", product_name, re.IGNORECASE)
                     diamond_weight = ", ".join(diamond_weight_match) if diamond_weight_match else "N/A"
 
                     unique_id = str(uuid.uuid4())
                     task = asyncio.create_task(download_image(session, image_url, product_name, timestamp, image_folder, unique_id))
                     image_tasks.append((len(sheet['A']) + 1, unique_id, task))
-                    if image_url != "N/A":
-                        records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                        sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    
+                    records.append((
+                        unique_id,
+                        current_date,
+                        page_title,
+                        product_name,
+                        None,  # Placeholder for image path
+                        kt,
+                        price_str,
+                        diamond_weight,
+                        additional_info_str
+                    ))
+                    
+                    sheet.append([
+                        current_date,
+                        page_title,
+                        product_name,
+                        None,  # Placeholder for image
+                        kt,
+                        price_str,
+                        diamond_weight,
+                        time_only,
+                        image_url,
+                        additional_info_str
+                    ])
 
                 # Process image downloads and attach them to Excel
                 for row, unique_id, task in image_tasks:
@@ -206,14 +264,26 @@ async def handle_histoiredor(url, max_pages):
                         sheet.add_image(img, f"D{row}")
                     for i, record in enumerate(records):
                         if record[0] == unique_id:
-                            records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                            records[i] = (
+                                record[0],
+                                record[1],
+                                record[2],
+                                record[3],
+                                image_path,
+                                record[5],
+                                record[6],
+                                record[7],
+                                record[8]
+                            )
                             break
 
                 await browser.close()
             current_page += 1
 
+        if not records:
+            return None, None, None
         # Save Excel
-        filename = f'handle_marcorian_{datetime.now().strftime("%Y-%m-%d_%H.%M")}.xlsx'
+        filename = f'handle_histoiredor_{datetime.now().strftime("%Y-%m-%d_%H.%M")}.xlsx'
         file_path = os.path.join(EXCEL_DATA_PATH, filename)
         wb.save(file_path)
         log_event(f"Data saved to {file_path} | IP: {ip_address}")

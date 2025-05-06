@@ -4,23 +4,17 @@ import logging
 import concurrent.futures
 import asyncio
 from datetime import datetime
-from io import BytesIO
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image
-from flask import Flask
 import uuid
 import base64
-from dotenv import load_dotenv
-from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
-import requests
+import random
 import re
-
-# Load environment variables
-load_dotenv()
-PROXY_URL = os.getenv("PROXY_URL")
+from proxysetup import get_browser_with_proxy_strategy
+import requests
 
 # Setup Flask
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -28,7 +22,6 @@ EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
 
 def download_image(image_url, product_name, timestamp, image_folder, unique_id, retries=5, timeout=30):
     if not image_url or image_url == "N/A":
@@ -55,21 +48,6 @@ def download_image(image_url, product_name, timestamp, image_folder, unique_id, 
     logging.error(f"Failed to download image after {retries} attempts: {image_url}")
     return None
 
-
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-            await page.wait_for_selector(".grid-group-item", timeout=60000)
-            print("[Success] Product cards loaded.")
-            return
-        except Exception as e:
-            print(f"[Retry {attempt + 1}] Error: {e}")
-            await asyncio.sleep(2)
-    raise Exception(f"Failed to load product cards on {url} after {retries} attempts.")
-
-
 async def handle_fredmeyer(url, max_pages):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     image_folder = os.path.join(IMAGE_SAVE_PATH, timestamp)
@@ -89,13 +67,10 @@ async def handle_fredmeyer(url, max_pages):
     async with async_playwright() as p:
         for page_count in range(1, max_pages + 1):
             logging.info(f"Processing page {page_count}/{max_pages}")
-            browser = await p.chromium.connect_over_cdp(PROXY_URL)
+            product_wrapper=".grid-group-item"
+            browser, page = await get_browser_with_proxy_strategy(p, url ,product_wrapper)
 
             try:
-                page = await browser.new_page()
-                await safe_goto_and_wait(page, url)
-                logging.info(f"Loaded page: {url}")
-
                 # Simulate going to the correct page by clicking through pagination
                 if page_count > 1:
                     for _ in range(1, page_count):

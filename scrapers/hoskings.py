@@ -314,7 +314,7 @@ async def handle_hoskings(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath","AdditionalInfo"]
     sheet.append(headers)
 
     all_records = []
@@ -372,20 +372,42 @@ async def handle_hoskings(url, max_pages):
                         product_name = "N/A"
 
                     try:
-                         # Use more precise selector for price container
                         price_container = product.locator('div.text-label.text-text-subdued.font-bold.mt-1')
-                        
-                        # First try to find sale price (when on sale)
+
                         sale_price_loc = price_container.locator('span.text-text-sale:visible')
+                        original_price_loc = price_container.locator('span.line-through:visible')
+
                         if await sale_price_loc.count() > 0:
-                            price = (await sale_price_loc.first.inner_text()).strip()
+                            sale_price = (await sale_price_loc.first.inner_text()).strip().replace('$', '').replace(',', '')
                         else:
-                            # Fallback to regular price (first span)
-                            regular_price_loc = price_container.locator('span:visible')
-                            price = (await regular_price_loc.first.inner_text()).strip() if await regular_price_loc.count() > 0 else "N/A"
+                            sale_price = "N/A"
+
+                        if await original_price_loc.count() > 0:
+                            original_price = (await original_price_loc.first.inner_text()).strip().replace('$', '').replace(',', '')
+                        else:
+                            original_price = "N/A"
+
+                        if sale_price != "N/A" and original_price != "N/A":
+                            price = f"{sale_price} offer {original_price}"
+                        elif sale_price != "N/A":
+                            price = sale_price
+                        elif original_price != "N/A":
+                            price = original_price
+                        else:
+                            # Fallback: try to get the only visible span inside price_container
+                            fallback_price_loc = price_container.locator("span:visible")
+                            if await fallback_price_loc.count() > 0:
+                                price = (await fallback_price_loc.first.inner_text()).strip().replace('$', '').replace(',', '')
+                            else:
+                                price = "N/A"
+
                     except Exception as e:
                         price = "N/A"
-                        logging.debug(f"Price error: {str(e)}")
+                        logging.debug(f"Price extraction error: {str(e)}")
+
+                        
+                        
+
 
                     try:
                         await product.scroll_into_view_if_needed()
@@ -399,8 +421,36 @@ async def handle_hoskings(url, max_pages):
                             image_url = "N/A"
                     except Exception as e:
                         image_url = "N/A"
+                        
+                    try:
+                        # Target the specific div containing "hoskings"
+                        EXTRAlocator = product.locator(
+                            "div.font-normal.text-text-subdued.uppercase.text-body3.mt-3"
+                        )
+                        # Fetch the text and strip any extra spaces
+                        EXTRAlocator = (await EXTRAlocator.inner_text()).strip() if await EXTRAlocator.count() > 0 else "N/A"
+                    except Exception:
+                        EXTRAlocator = "N/A"
 
 
+
+
+                    try:
+                        Typesr = product.locator("div.text-text-sale")
+                        Typesr = (await Typesr.inner_text()).strip() if await Typesr.count() > 0 else "N/A"
+                    except Exception:
+                        Typesr = "N/A"
+
+                    AdditionalInfo = f"{EXTRAlocator}|{Typesr}"
+
+                    
+                    # print(AdditionalInfo)
+                    # print(image_url)
+                    # print(price)
+                    # print(product_name)
+                   
+                        
+                      
                     gold_type_match = re.search(r"(\d{1,2}(K|ct)\s*(Yellow|White|Rose)?\s*Gold|Platinum|Sterling Silver|Rhodium Plate)", product_name, re.IGNORECASE)
                     kt = gold_type_match.group(1) if gold_type_match else "Not found"
 
@@ -412,8 +462,8 @@ async def handle_hoskings(url, max_pages):
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,AdditionalInfo))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,AdditionalInfo])
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -421,6 +471,7 @@ async def handle_hoskings(url, max_pages):
                         image_path = await asyncio.wait_for(task, timeout=60)
                         if image_path != "N/A":
                             try:
+                                
                                 img = Image(image_path)
                                 img.width, img.height = 100, 100
                                 sheet.add_image(img, f"D{row_num}")
@@ -430,7 +481,7 @@ async def handle_hoskings(url, max_pages):
                         
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")

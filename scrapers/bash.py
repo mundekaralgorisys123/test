@@ -18,14 +18,12 @@ from database import insert_into_db, create_table
 from limit_checker import update_product_count
 from urllib.parse import urljoin
 import httpx
+from proxysetup import get_browser_with_proxy_strategy
 
-load_dotenv()
-PROXY_URL = os.getenv("PROXY_URL")
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
-
 
 # Ensure directories exist
 os.makedirs(EXCEL_DATA_PATH, exist_ok=True)
@@ -67,22 +65,7 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
     logging.error(f"Failed to download {product_name} after {retries} attempts.")
     return "N/A"
 
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-            try:
-                await page.wait_for_selector("#product-cards", timeout=15000)
-                print("[Success] Found #product-cards")
-            except:
-                print("[Fallback] Waiting for product cards using card selector...")
-                await page.wait_for_selector("[data-testid='card']", timeout=15000)
-            return True
-        except Exception as e:
-            print(f"[Retry {attempt + 1}] Error loading {url}: {e}")
-            await asyncio.sleep(3)
-    raise Exception(f"[Error] Failed to load product cards on {url} after {retries} attempts.")
+
 
 async def scroll_page(page):
     """Scroll down to load lazy-loaded products."""
@@ -127,19 +110,19 @@ async def handle_bash(start_url, max_pages):
 
     while current_url and (page_count < max_pages):
         logging.info(f"Processing page {page_count + 1}: {current_url}")
-        
+        if page_count > 0:
+            if '?' in current_url:
+                current_url = f"{current_url}&page={page_count + 1}"
+            else:
+                current_url = f"{current_url}?page={page_count + 1}"
+
         # Create a new browser instance for each page
         browser = None
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(120000)  # 2 minute timeout
-
-                if not await safe_goto_and_wait(page, current_url):
-                    break
+                product_wrapper = "#product-cards"
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, product_wrapper)
 
                 await scroll_page(page)
 
