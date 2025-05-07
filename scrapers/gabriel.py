@@ -79,11 +79,21 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
 def random_delay(min_sec=1, max_sec=3):
     time.sleep(random.uniform(min_sec, max_sec))
 
-
-
-def build_url_with_loadmore(base_url: str, page_count: int) -> str:
-    separator = '&' if '?' in base_url else '?'
-    return f"{base_url}{separator}p={page_count}"   
+# Reliable page.goto wrapper
+async def safe_goto_and_wait(page, url, retries=3):
+    for attempt in range(retries):
+        try:
+            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
+            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
+            await page.wait_for_selector(".ProductCardWrapper", state="attached", timeout=30000)
+            print("[Success] Product cards loaded.")
+            return
+        except (Error, TimeoutError) as e:
+            logging.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
+            if attempt < retries - 1:
+                random_delay(1, 3)
+            else:
+                raise
 
 # Main scraper function
 async def handle_gabriel(url, max_pages):
@@ -98,7 +108,7 @@ async def handle_gabriel(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -106,19 +116,21 @@ async def handle_gabriel(url, max_pages):
     file_path = os.path.join(EXCEL_DATA_PATH, filename)
 
     page_count = 1
+    current_url = url
 
-
-    while page_count <= max_pages:
-        current_url= build_url_with_loadmore(url, page_count)
+    while current_url and (page_count <= max_pages):
+        if page_count > 1:
+            if '?' in current_url:
+                current_url = f"{url}&p={page_count}"
+            else:
+                current_url = f"{url}?p={page_count}"
         logging.info(f"Processing page {page_count}: {current_url}")
         browser = None
         page = None
         try:
             async with async_playwright() as p:
-                
-                product_wrapper=".ProductCardWrapper"
-                browser, page = await get_browser_with_proxy_strategy(p, current_url,product_wrapper)
-                
+                browser, page = await get_browser_with_proxy_strategy(p, current_url,".ProductCardWrapper")
+                log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all items
                 prev_count = 0
@@ -141,41 +153,127 @@ async def handle_gabriel(url, max_pages):
                 image_tasks = []
 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
-                    try:
-                        product_name = await product.locator("a.ProductCTA").inner_text()
-                    except:
-                        product_name = "N/A"
-
-
-                    try:
-                        price_wrapper = product.locator('.price-wrapper')
-                        price = await price_wrapper.locator('.price').text_content() if await price_wrapper.count() > 0 else "N/A"
-                    except:
-                        price = "N/A"
-
-                    try:
-                        product_images = await product.locator("img.image-entity").all()
-                        product_urls = [await img.get_attribute("data-src") for img in product_images if (await img.get_attribute("data-src")).startswith("https://")]
-                        image_url = product_urls[0] if product_urls else "N/A"
-                    except:
-                        image_url = "N/A"
-
-                    try:
-                        metal_el = product.locator("span.metalIcon")
-                        kt = await metal_el.get_attribute("data-originalmetal") if await metal_el.count() > 0 else "N/A"
-                    except:
-                        kt = "N/A"
-
-                    dia_match = re.search(r"\b(\d+(\.\d+)?)\s*(?:ct|ctw|carat)\b", product_name, re.IGNORECASE)
-                    diamond_weight = f"{dia_match.group(1)} ct" if dia_match else "N/A"
-
+                    additional_info = []
+                    product_name = "N/A"
+                    price = "N/A"
+                    image_url = "N/A"
+                    kt = "N/A"
+                    diamond_weight = "N/A"
                     unique_id = str(uuid.uuid4())
+
+                    try:
+                        # Product Name (using locator API)
+                        name_locator = product.locator("h2.ProductName a.ProductCTA")
+                        if await name_locator.count() > 0:
+                            # Try to get full name from data-pname attribute first
+                            full_name = await name_locator.get_attribute("data-pname")
+                            displayed_text = (await name_locator.inner_text()).strip()
+                            
+                            product_name = full_name.strip() if full_name else displayed_text.replace("...", "").strip()
+                    except Exception as e:
+                        logging.error(f"Error getting product name: {e}")
+
+                    try:
+                        # Price handling (using locator API)
+                        price_locator = product.locator('.price-wrapper .price')
+                        if await price_locator.count() > 0:
+                            price = (await price_locator.inner_text()).strip()
+                            
+                            # Check for original price if on sale
+                            original_price_locator = product.locator('.old-price .price')
+                            if await original_price_locator.count() > 0:
+                                original_price = (await original_price_locator.inner_text()).strip()
+                                price = f"{original_price} | Sale: {price}"
+                                additional_info.append("On Sale")
+                    except Exception as e:
+                        logging.error(f"Error getting price: {e}")
+
+                    try:
+                        # Image URL (using locator API)
+                        image_locator = product.locator("img.image-entity")
+                        if await image_locator.count() > 0:
+                            # Get first image's data-src or src
+                            image_url = await image_locator.first.get_attribute("data-src") or \
+                                    await image_locator.first.get_attribute("src")
+                            
+                            # Count total available images
+                            image_count = await image_locator.count()
+                            if image_count > 1:
+                                additional_info.append(f"{image_count} images available")
+                    except Exception as e:
+                        logging.error(f"Error getting image URL: {e}")
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue
+
+                    # Metal type (kt)
+                    try:
+                        # First try from product name
+                        if product_name != "N/A":
+                            gold_match = re.search(r"\b\d{1,2}K\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSilver\b", product_name, re.IGNORECASE)
+                            if gold_match:
+                                kt = gold_match.group()
+                        
+                        # If not found in name, try from metal swatches (using locator API)
+                        if kt == "N/A":
+                            metal_span_locator = product.locator(".metalIcon")
+                            if await metal_span_locator.count() > 0:
+                                metal_text = await metal_span_locator.inner_text()
+                                gold_match = re.search(r"\b\d{1,2}K\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSilver\b", metal_text, re.IGNORECASE)
+                                if gold_match:
+                                    kt = gold_match.group()
+                    except Exception as e:
+                        logging.error(f"Error extracting metal type: {e}")
+
+                    # Diamond weight
+                    try:
+                        if product_name != "N/A":
+                            dia_match = re.search(r"\b(\d+(\.\d+)?)\s*(?:ct|ctw|carat)\b", product_name, re.IGNORECASE)
+                            diamond_weight = f"{dia_match.group(1)} ct" if dia_match else "N/A"
+                    except Exception as e:
+                        logging.error(f"Error extracting diamond weight: {e}")
+
+                    # Additional product info (using locator API)
+                    try:
+                        # Metal options - using more specific selector
+                        metal_options_locator = product.locator(".metal-swatches li[data-product-id]")
+                        metal_count = await metal_options_locator.count()
+                        if metal_count > 0:
+                            options = []
+                            for i in range(metal_count):
+                                option = metal_options_locator.nth(i)
+                                title = await option.get_attribute("title")
+                                if title and title != kt:
+                                    options.append(title)
+                            if options:
+                                additional_info.append(f"Metal Options: {', '.join(options)}")
+                        
+                        # Product ID - using the most specific selector available
+                        product_id_locator = product.locator(".price-box[data-product-id]")
+                        if await product_id_locator.count() > 0:
+                            product_id = await product_id_locator.get_attribute("data-product-id")
+                            if product_id:
+                                additional_info.append(f"Product ID: {product_id}")
+                    except Exception as e:
+                        logging.error(f"Error getting additional info: {e}")
+
+                    # Prepare additional info string
+                    additional_info_str = " | ".join(additional_info) if additional_info else "N/A"
+
+                    # Schedule image download
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((
+                        unique_id, current_date, page_title, product_name, None, 
+                        kt, price, diamond_weight, time_only, image_url, additional_info_str
+                    ))
+                    sheet.append([
+                        current_date, page_title, product_name, None, 
+                        kt, price, diamond_weight, time_only, 
+                        image_url, additional_info_str
+                    ])
 
                 for row_num, unique_id, task in image_tasks:
                     try:
@@ -190,7 +288,10 @@ async def handle_gabriel(url, max_pages):
                                 image_path = "N/A"
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (
+                                    record[0], record[1], record[2], record[3], image_path, 
+                                    record[5], record[6], record[7], record[8], record[9], record[10]
+                                )
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")
@@ -208,6 +309,9 @@ async def handle_gabriel(url, max_pages):
 
         page_count += 1
 
+    if not all_records:
+        return None, None, None
+    
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
     with open(file_path, "rb") as file:

@@ -71,7 +71,7 @@ async def handle_beaverbrooks(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -125,29 +125,33 @@ async def handle_beaverbrooks(url, max_pages):
                         product_name = "N/A"
 
                     try:
-                        # Use query_selector to locate the offer and normal price elements
+                        # Discounted price (current price after discount)
                         offer_price_tag = await product.query_selector("span.price-line__price--discounted--LmVtQ")
+                        
+                        # Original price before discount
+                        was_price_tag = await product.query_selector("span.price-line__price--was--cpI48 s")
+
+                        # Regular price (if no discount)
                         normal_price_tag = await product.query_selector("span.price-line__price--normal--x54ly")
 
-                        # Check if offer_price_tag exists and extract its text
                         if offer_price_tag:
-                            price = (await offer_price_tag.inner_text()).strip()
-                        # If not, check if normal_price_tag exists and extract its text
+                            current_price = (await offer_price_tag.inner_text()).strip()
+                            if was_price_tag:
+                                original_price = (await was_price_tag.inner_text()).strip()
+                                price = f"{current_price} (was {original_price})"
+                            else:
+                                price = current_price
                         elif normal_price_tag:
                             price = (await normal_price_tag.inner_text()).strip()
                         else:
-                            price = "N/A"  # Fallback if no price is found
+                            price = "N/A"
                     except Exception as e:
                         logging.warning(f"⚠️ Error extracting price: {e}")
                         price = "N/A"
 
-
                     try:
                         # # Ensure product is scrolled into view
                         await product.scroll_into_view_if_needed()
-
-                        # Wait for the img element to be in the DOM
-                        # await product.page.wait_for_selector("img")
 
                         # Use query_selector to locate the first img element
                         image_element = await product.query_selector("img")
@@ -170,13 +174,63 @@ async def handle_beaverbrooks(url, max_pages):
                             if image_url and image_url.startswith("//"):
                                 image_url = "https:" + image_url
 
-                            print("✅ Extracted Image URL:", image_url)
+                            # print("✅ Extracted Image URL:", image_url)
                         else:
                             image_url = "N/A"
 
                     except Exception as e:
                         logging.warning(f"⚠️ Error extracting image URL: {e}")
                         image_url = "N/A"
+                        
+                    # Initialize info parts
+                    info_parts = []
+
+                    # Financing Text
+                    try:
+                        financing_el = await product.query_selector("div.financing--vpMZt span")
+                        if financing_el:
+                            financing_text = (await financing_el.inner_text()).strip()
+                            if financing_text:
+                                info_parts.append(financing_text)
+                    except Exception:
+                        pass
+
+                    # Brand Name
+                    try:
+                        brand_el = await product.query_selector("h4.description__brand--haZK5")
+                        if brand_el:
+                            brand = (await brand_el.inner_text()).strip()
+                            if brand:
+                                info_parts.append(brand)
+                    except Exception:
+                        pass
+
+                    # Discount Calculation
+                    try:
+                        was_el = await product.query_selector("span.price-line__price--was--cpI48 s")
+                        now_el = await product.query_selector("span.price-line__price--discounted--LmVtQ")
+
+                        if was_el and now_el:
+                            was_text = (await was_el.inner_text()).strip().replace("£", "")
+                            now_text = (await now_el.inner_text()).strip().replace("£", "")
+                            if was_text and now_text:
+                                was_price = float(was_text.replace(",", ""))
+                                now_price = float(now_text.replace(",", ""))
+                                if was_price > now_price:
+                                    discount_percent = round((was_price - now_price) / was_price * 100)
+                                    info_parts.append(f"{discount_percent}% off")
+                    except Exception:
+                        pass
+
+                    # Final combined string
+                    additional_info_str = " | ".join(info_parts) if info_parts else "N/A"
+                        
+                        
+                        
+                        
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue      
 
 
 
@@ -191,8 +245,8 @@ async def handle_beaverbrooks(url, max_pages):
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
 
                 for row_num, unique_id, task in image_tasks:
                     try:
@@ -208,7 +262,7 @@ async def handle_beaverbrooks(url, max_pages):
 
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")
@@ -229,13 +283,20 @@ async def handle_beaverbrooks(url, max_pages):
             await asyncio.sleep(random.uniform(2, 5))
         page_count += 1
 
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
 
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

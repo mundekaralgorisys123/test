@@ -328,7 +328,7 @@ async def handle_goodstoneinc(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -339,9 +339,9 @@ async def handle_goodstoneinc(url, max_pages):
     success_count = 0
 
     while page_count <= max_pages:
-        current_url= build_url_with_loadmore(url, page_count)
+        current_url = build_url_with_loadmore(url, page_count)
         logging.info(f"Processing page {page_count}: {current_url}")
-        
+       
         # Create a new browser instance for each page
         browser = None
         page = None
@@ -360,8 +360,7 @@ async def handle_goodstoneinc(url, max_pages):
                         break
                     prev_product_count = current_product_count
 
-
-               # Get the main container (optional if not strictly needed)
+                # Get the main container (optional if not strictly needed)
                 product_wrapper = await page.query_selector("div.container.collection-matrix")
 
                 # Select all product blocks using a more accurate class selector
@@ -377,22 +376,36 @@ async def handle_goodstoneinc(url, max_pages):
                 image_tasks = []
 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
+                    additional_info = []
+                    unique_id = str(uuid.uuid4())
+
                     try:
+                        # Product Name
                         name_tag = await product.query_selector("a.product-thumbnail__title")
                         product_name = await name_tag.inner_text() if name_tag else "N/A"
                     except Exception as e:
                         print(f"[Product Name] Error: {e}")
                         product_name = "N/A"
-                        
+                       
                     try:
+                        # Price handling - check for both regular and sale price
                         price_tag = await product.query_selector("span.product-thumbnail__price.price")
-                        price = await price_tag.inner_text() if price_tag else "N/A"
+                        sale_price_tag = await product.query_selector("span.product-thumbnail__price.price.sale")
+                        
+                        if sale_price_tag:
+                            # If there's a sale price, get both prices
+                            regular_price = await price_tag.inner_text() if price_tag else "N/A"
+                            sale_price = await sale_price_tag.inner_text() if sale_price_tag else "N/A"
+                            price = f"{regular_price.strip()}|{sale_price.strip()}"
+                            additional_info.append(f"Sale Price: {sale_price.strip()}")
+                        else:
+                            price = await price_tag.inner_text() if price_tag else "N/A"
                     except Exception as e:
                         print(f"[Price] Error: {e}")
                         price = "N/A"
 
-
                     try:
+                        # Image URL
                         img_tag = await product.query_selector("img")
                         image_url = await img_tag.get_attribute("src") if img_tag else "N/A"
                         if image_url and image_url.startswith("//"):
@@ -401,23 +414,66 @@ async def handle_goodstoneinc(url, max_pages):
                         print(f"[Image URL] Error: {e}")
                         image_url = "N/A"
 
+                    # Gold type (kt)
+                    try:
+                        gold_type_match = re.findall(r"(\d{1,2}ct\s*(?:Yellow|White|Rose)?\s*Gold|Platinum)", product_name, re.IGNORECASE)
+                        kt = ", ".join(gold_type_match) if gold_type_match else "N/A"
+                        
+                        # Also check for metal types in data attributes
+                        metal_types = await product.get_attribute("data-band-metals")
+                        if metal_types:
+                            additional_info.append(f"Available Metals: {metal_types}")
+                    except Exception as e:
+                        print(f"[Gold Type] Error: {e}")
+                        kt = "N/A"
 
-                    # This will still work but always return "N/A" with current data
-                    gold_type_match = re.findall(r"(\d{1,2}ct\s*(?:Yellow|White|Rose)?\s*Gold|Platinum)", product_name, re.IGNORECASE)
-                    kt = ", ".join(gold_type_match) if gold_type_match else "N/A"
+                    # Diamond Weight
+                    try:
+                        diamond_weight_match = re.findall(r"(\d+(?:\.\d+)?\s*ct)", product_name, re.IGNORECASE)
+                        diamond_weight = ", ".join(diamond_weight_match) if diamond_weight_match else "N/A"
+                    except Exception as e:
+                        print(f"[Diamond Weight] Error: {e}")
+                        diamond_weight = "N/A"
 
+                    # Additional product info
+                    try:
+                        # Check for stickers/badges (like "New", "Featured", etc.)
+                        sticker = await product.query_selector(".thumbnail-sticker")
+                        if sticker:
+                            sticker_text = await sticker.inner_text()
+                            if sticker_text.strip():
+                                additional_info.append(f"Badge: {sticker_text.strip()}")
+                    except Exception as e:
+                        print(f"[Sticker] Error: {e}")
 
-                    # Extract Diamond Weight (supports "1.85ct", "2ct", "1.50ct", etc.)
-                    diamond_weight_match = re.findall(r"(\d+(?:\.\d+)?\s*ct)", product_name, re.IGNORECASE)
-                    diamond_weight = ", ".join(diamond_weight_match) if diamond_weight_match else "N/A"
+                    try:
+                        # Check for product settings/styles
+                        settings = await product.get_attribute("data-setting-styles")
+                        if settings:
+                            additional_info.append(f"Styles: {settings}")
+                    except Exception as e:
+                        print(f"[Settings] Error: {e}")
 
-                    unique_id = str(uuid.uuid4())
+                    try:
+                        # Check for any additional description elements
+                        desc_elements = await product.query_selector_all(".product-thumbnail__description, .product-thumbnail__subtitle")
+                        for elem in desc_elements:
+                            desc_text = await elem.inner_text()
+                            if desc_text.strip():
+                                additional_info.append(desc_text.strip())
+                    except Exception as e:
+                        print(f"[Description] Error: {e}")
+
+                    # Join all additional info with pipe delimiter
+                    additional_info_str = " | ".join(additional_info) if additional_info else "N/A"
+
+                    # Schedule image download
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight, additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url, additional_info_str])
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -431,10 +487,10 @@ async def handle_goodstoneinc(url, max_pages):
                             except Exception as img_error:
                                 logging.error(f"Error adding image to Excel: {img_error}")
                                 image_path = "N/A"
-                        
+                       
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")
@@ -456,12 +512,11 @@ async def handle_goodstoneinc(url, max_pages):
                 await page.close()
             if browser:
                 await browser.close()
-            
+           
             # Add delay between pages
             await asyncio.sleep(random.uniform(2, 5))
-            
+           
         page_count += 1
-
 
     # Final save and database operations
     wb.save(file_path)

@@ -78,7 +78,7 @@ async def handle_hannoush(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     current_date = datetime.now().strftime("%Y-%m-%d")
@@ -86,13 +86,16 @@ async def handle_hannoush(url, max_pages):
 
     seen_ids = set()
     collected_products = []
-    target_product_count = max_pages * 28
+    target_product_count = max_pages * 28  # Assuming approximately 28 products per scroll
     records = []
     image_tasks = []
 
     async with async_playwright() as p:
-        product_wrapper = "#product-grid"
-        browser, page =  await get_browser_with_proxy_strategy(p, url, product_wrapper)
+        product_wrapper_selector = "ul#product-grid"
+        try:
+            browser, page = await get_browser_with_proxy_strategy(p, url, product_wrapper_selector)
+        except Exception:
+            return None, None, None
 
         for scroll_index in range(max_pages):
             print(f"Scroll {scroll_index + 1}/{max_pages}")
@@ -100,11 +103,10 @@ async def handle_hannoush(url, max_pages):
             await asyncio.sleep(2)
 
             try:
-                # Wait for the loading spinner to be hidden (class .loading-overlay)
+                # Wait for the loading spinner to be hidden
                 await page.wait_for_selector(".loading-overlay[style*='display: none']", state="hidden", timeout=10000)
             except Exception as e:
                 print(f"Loader not found or hidden timeout: {e}")
-
 
             all_products = await page.locator('li.column').all()
             new_this_scroll = []
@@ -124,9 +126,13 @@ async def handle_hannoush(url, max_pages):
         collected_products = collected_products[:target_product_count]
         print(f"Total products to process: {len(collected_products)}")
         page_title = await page.title()
-
+        
         async with httpx.AsyncClient() as session:
             for idx, product in enumerate(collected_products):
+                additional_info = []
+                price_parts = []
+                unique_id = str(uuid.uuid4())
+
                 try:
                     # Extracting product name
                     product_name_locator = product.locator("a.product-card-title")
@@ -137,58 +143,135 @@ async def handle_hannoush(url, max_pages):
                     product_name = "N/A"
 
                 try:
-                    # Extracting product price
-                    product_price_locator = product.locator("span.price ins .amount")
-                    product_price = await product_price_locator.text_content()
-                    product_price = product_price.strip() if product_price else "N/A"
+                    # Extracting product prices - more comprehensive handling
+                    price_container = product.locator("span.price").first
+                    
+                    # Check for sale price (ins tag)
+                    sale_price_elem = price_container.locator("ins .amount").first
+                    sale_price = await sale_price_elem.text_content() if await sale_price_elem.count() > 0 else None
+                    
+                    # Check for original price (del tag)
+                    original_price_elem = price_container.locator("del .amount").first
+                    original_price = await original_price_elem.text_content() if await original_price_elem.count() > 0 else None
+                    
+                    # Check for regular price (no sale)
+                    regular_price_elem = price_container.locator(".amount").first
+                    regular_price = await regular_price_elem.text_content() if await regular_price_elem.count() > 0 else None
+
+                    # Format price string
+                    if sale_price and original_price:
+                        price = f"{original_price.strip()} | Sale: {sale_price.strip()}"
+                        additional_info.append(f"Discount: {calculate_discount(original_price, sale_price)}")
+                    elif sale_price:
+                        price = sale_price.strip()
+                    elif regular_price:
+                        price = regular_price.strip()
+                    else:
+                        price = "N/A"
+
                 except Exception as e:
                     print(f"Error extracting product price: {e}")
-                    product_price = "N/A"
+                    price = "N/A"
 
                 try:
-                    # Extracting product image URL
-                    image_locator = product.locator("img.product-primary-image")
-                    image_url = await image_locator.get_attribute("src")
+                    # Extracting product image URL - more reliable method
+                    image_container = product.locator("a.product-featured-image-link").first
+                    image_elem = image_container.locator("img.product-primary-image").first
                     
-                    # If srcset is empty, try to get srcsetc
-                    if not image_url:
-                        image_url = await image_locator.get_attribute("src")
-                    
-                    # Ensure the URL is valid and prepend the protocol if missing
-                    if image_url and image_url.startswith("//"):
-                        image_url = "https:" + image_url  # Add the https:// prefix
+                    # Try src first, then srcset
+                    image_url = await image_elem.get_attribute("src")
+                    if not image_url or "crop=center" in image_url:  # Skip placeholder images
+                        srcset = await image_elem.get_attribute("srcset")
+                        if srcset:
+                            # Get the highest resolution image from srcset
+                            srcset_parts = [p.strip() for p in srcset.split(",")]
+                            if srcset_parts:
+                                # Sort by width and take the largest
+                                srcset_parts.sort(key=lambda x: int(x.split(" ")[1].replace("w", "")))
+                                image_url = srcset_parts[-1].split(" ")[0]
 
-                    # Set to "N/A" if no image URL was found
+                    if image_url and image_url.startswith("//"):
+                        image_url = "https:" + image_url
                     image_url = image_url if image_url else "N/A"
                 except Exception as e:
                     print(f"Error extracting product image URL: {e}")
                     image_url = "N/A"
 
-                print(image_url)
-
+                # Extract metal type (kt) from product name
                 kt_match = re.search(r"\b\d{1,2}K\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSilver\b", product_name, re.IGNORECASE)
-                kt = kt_match.group() if kt_match else "Not found"
+                kt = kt_match.group() if kt_match else "N/A"
 
+                # Extract diamond weight (if any)
                 diamond_match = re.search(r"\b(\d+(\.\d+)?)\s*(?:ct|ctw|carat)\b", product_name, re.IGNORECASE)
                 diamond_weight = f"{diamond_match.group(1)} ct" if diamond_match else "N/A"
 
-                unique_id = str(uuid.uuid4())
-                task = asyncio.create_task(download_image(session, image_url, product_name, timestamp, image_folder, unique_id))
+                # Extract product dimensions/size if available
+                size_match = re.search(r"\b(\d+(\.\d+)?)\s*x\s*(\d+(\.\d+)?)\s*mm\b", product_name, re.IGNORECASE)
+                if size_match:
+                    additional_info.append(f"Size: {size_match.group(1)}x{size_match.group(3)}mm")
+
+                # Extract product code/sku
+                try:
+                    product_code = await product.get_attribute("data-productcode")
+                    if product_code:
+                        additional_info.append(f"Product Code: {product_code}")
+                except:
+                    pass
+
+                # Extract badges (like 'Sale', 'New', etc.)
+                try:
+                    badges_locator = product.locator(".product-card--badges span")
+                    badges = await badges_locator.all_text_contents()
+                    if badges:
+                        additional_info.append(f"Badges: {', '.join([b.strip() for b in badges if b.strip()])}")
+                except:
+                    pass
+
+                # Schedule image download
+                task = asyncio.create_task(
+                    download_image(session, image_url, product_name, timestamp, image_folder, unique_id)
+                )
                 image_tasks.append((idx + 2, unique_id, task))
 
-                records.append((unique_id, current_date, page_title, product_name, None, kt, product_price, diamond_weight))
-                sheet.append([current_date, page_title, product_name, None, kt, product_price, diamond_weight, time_only, image_url])
+                # Join additional info with pipe delimiter
+                additional_info_str = " | ".join(additional_info) if additional_info else "N/A"
 
+                records.append((
+                    unique_id, current_date, page_title, product_name, None, 
+                    kt, price, diamond_weight, time_only, image_url, additional_info_str
+                ))
+                sheet.append([
+                    current_date, page_title, product_name, None, 
+                    kt, price, diamond_weight, time_only, 
+                    image_url, additional_info_str
+                ])
+
+            # Process downloaded images
             for row, unique_id, task in image_tasks:
-                image_path = await task
-                if image_path != "N/A":
-                    img = Image(image_path)
-                    img.width, img.height = 100, 100
-                    sheet.add_image(img, f"D{row}")
-                for i, record in enumerate(records):
-                    if record[0] == unique_id:
-                        records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
-                        break
+                try:
+                    image_path = await task
+                    if image_path != "N/A":
+                        try:
+                            img = Image(image_path)
+                            img.width, img.height = 100, 100
+                            sheet.add_image(img, f"D{row}")
+                        except Exception as img_error:
+                            logging.error(f"Error adding image to Excel: {img_error}")
+                            image_path = "N/A"
+                    
+                    # Update record with image path
+                    for i, record in enumerate(records):
+                        if record[0] == unique_id:
+                            records[i] = (
+                                record[0], record[1], record[2], record[3], 
+                                image_path, record[5], record[6], record[7], 
+                                record[8], record[9], record[10]
+                            )
+                            break
+                except Exception as e:
+                    logging.error(f"Error processing image for row {row}: {e}")
+
+        await browser.close()
 
         filename = f'handle_hannoush_{datetime.now().strftime("%Y-%m-%d_%H.%M")}.xlsx'
         file_path = os.path.join(EXCEL_DATA_PATH, filename)
@@ -206,3 +289,14 @@ async def handle_hannoush(url, max_pages):
             base64_encoded = base64.b64encode(f.read()).decode("utf-8")
 
         return base64_encoded, filename, file_path
+
+
+def calculate_discount(original_price, sale_price):
+    """Helper function to calculate discount percentage"""
+    try:
+        original = float(original_price.replace('$', '').replace(',', ''))
+        sale = float(sale_price.replace('$', '').replace(',', ''))
+        discount = ((original - sale) / original) * 100
+        return f"{round(discount)}%"
+    except:
+        return "N/A"

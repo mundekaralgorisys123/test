@@ -262,7 +262,6 @@ async def handle_kay(url, max_pages):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     image_folder = os.path.join(IMAGE_SAVE_PATH, timestamp)
     os.makedirs(image_folder, exist_ok=True)
-
     # Create workbook and setup
     wb = Workbook()
     sheet = wb.active
@@ -287,7 +286,6 @@ async def handle_kay(url, max_pages):
                 # Use the new proxy strategy function
                 browser, page = await get_browser_with_proxy_strategy(p, current_url)
                 log_event(f"Successfully loaded: {current_url}")
-
                 # Scroll to load all products
                 prev_product_count = 0
                 for _ in range(10):

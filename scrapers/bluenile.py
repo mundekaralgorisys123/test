@@ -10,27 +10,26 @@ from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError, Error
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image
-from flask import Flask
-from PIL import Image as PILImage
 from utils import get_public_ip, log_event, sanitize_filename
 from dotenv import load_dotenv
 from database import insert_into_db
 from limit_checker import update_product_count
-import aiohttp
-from io import BytesIO
+import traceback
+from typing import List
 from openpyxl.drawing.image import Image as XLImage
 import httpx
 # Load environment variables from .env file
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
+PROXY_SERVER = os.getenv("PROXY_SERVER")
+PROXY_USERNAME = os.getenv("PROXY_USERNAME")
+PROXY_PASSWORD = os.getenv("PROXY_PASSWORD")
 
-app = Flask(__name__)
+
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
-
-
 
 def upgrade_to_high_res_url(image_url):
     if not image_url or image_url == "N/A":
@@ -74,15 +73,39 @@ def random_delay(min_sec=1, max_sec=3):
 
 
 
-async def safe_goto_and_wait(page, url, retries=3):
+
+            
+# Scroll to bottom of page to load all products
+async def scroll_to_bottom(page):
+    last_height = await page.evaluate("document.body.scrollHeight")
+    while True:
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await asyncio.sleep(random.uniform(1, 3))  # Random delay between scrolls
+        
+        # Check if we've reached the bottom
+        new_height = await page.evaluate("document.body.scrollHeight")
+        if new_height == last_height:
+            break
+        last_height = new_height
+            
+
+
+########################################  safe_goto_and_wait ####################################################################
+
+
+async def safe_goto_and_wait(page, url,isbri_data, retries=2):
     for attempt in range(retries):
         try:
             print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-
+            
+            if isbri_data:
+                await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
+            else:
+                await page.goto(url, wait_until="networkidle", timeout=180000)
 
             # Wait for the selector with a longer timeout
-            product_cards = await page.wait_for_selector(".gallery-grid-container--vJWMdFUhYMhp1TP3jIfs", state="attached", timeout=30000)
+            product_cards = await page.wait_for_selector('.gallery-grid-container--vJWMdFUhYMhp1TP3jIfs', state="attached", timeout=60000) # 60 seconds
+
 
             # Optionally validate at least 1 is visible (Playwright already does this)
             if product_cards:
@@ -105,20 +128,125 @@ async def safe_goto_and_wait(page, url, retries=3):
                 logging.error(f"Failed to navigate to {url} after {retries} attempts.")
                 raise
 
+
+########################################  get browser with proxy ####################################################################
+      
+
+async def get_browser_with_proxy_strategy(p, url: str):
+    """
+    Dynamically checks robots.txt and selects proxy accordingly
+    Always uses proxies - never scrapes directly
+    """
+    parsed_url = httpx.URL(url)
+    base_url = f"{parsed_url.scheme}://{parsed_url.host}"
+    
+    # 1. Fetch and parse robots.txt
+    disallowed_patterns = await get_robots_txt_rules(base_url)
+    
+    # 2. Check if URL matches any disallowed pattern
+    is_disallowed = check_url_against_rules(str(parsed_url), disallowed_patterns)
+    
+    # 3. Try proxies in order (bri-data first if allowed, oxylabs if disallowed)
+    proxies_to_try = [
+        PROXY_URL if not is_disallowed else {
+            "server": PROXY_SERVER,
+            "username": PROXY_USERNAME,
+            "password": PROXY_PASSWORD
+        },
+        {  # Fallback to the other proxy
+            "server": PROXY_SERVER,
+            "username": PROXY_USERNAME,
+            "password": PROXY_PASSWORD
+        } if not is_disallowed else PROXY_URL
+    ]
+
+    last_error = None
+    for proxy_config in proxies_to_try:
+        browser = None
+        try:
+            isbri_data = False
+            if proxy_config == PROXY_URL:
+                logging.info("Attempting with bri-data proxy (allowed by robots.txt)")
+                browser = await p.chromium.connect_over_cdp(PROXY_URL)
+                isbri_data = True
+            else:
+                logging.info("Attempting with oxylabs proxy (required by robots.txt)")
+                browser = await p.chromium.launch(
+                    proxy=proxy_config,
+                    headless=True,
+                    args=[
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-web-security'
+                    ]
+                )
+
+            context = await browser.new_context()
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                })
+            """)
+            page = await context.new_page()
             
-# Scroll to bottom of page to load all products
-async def scroll_to_bottom(page):
-    last_height = await page.evaluate("document.body.scrollHeight")
-    while True:
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await asyncio.sleep(random.uniform(1, 3))  # Random delay between scrolls
-        
-        # Check if we've reached the bottom
-        new_height = await page.evaluate("document.body.scrollHeight")
-        if new_height == last_height:
-            break
-        last_height = new_height
-            
+            await safe_goto_and_wait(page, url,isbri_data)
+            return browser, page
+
+        except Exception as e:
+            last_error = e
+            error_trace = traceback.format_exc()
+            logging.error(f"Proxy attempt failed:\n{error_trace}")
+            if browser:
+                await browser.close()
+            continue
+
+    error_msg = (f"Failed to load {url} using all proxy options. "
+                f"Last error: {str(last_error)}\n"
+                f"URL may be disallowed by robots.txt or proxies failed.")
+    logging.error(error_msg)
+    raise RuntimeError(error_msg)
+
+
+
+
+async def get_robots_txt_rules(base_url: str) -> List[str]:
+    """Dynamically fetch and parse robots.txt rules"""
+    robots_url = f"{base_url}/robots.txt"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(robots_url, timeout=10)
+            if resp.status_code == 200:
+                return [
+                    line.split(":", 1)[1].strip()
+                    for line in resp.text.splitlines()
+                    if line.lower().startswith("disallow:")
+                ]
+    except Exception as e:
+        logging.warning(f"Couldn't fetch robots.txt: {e}")
+    return []
+
+
+def check_url_against_rules(url: str, disallowed_patterns: List[str]) -> bool:
+    """Check if URL matches any robots.txt disallowed pattern"""
+    for pattern in disallowed_patterns:
+        try:
+            # Handle wildcard patterns
+            if "*" in pattern:
+                regex_pattern = pattern.replace("*", ".*")
+                if re.search(regex_pattern, url):
+                    return True
+            # Handle path patterns
+            elif url.startswith(f"{pattern}"):
+                return True
+            # Handle query parameters
+            elif ("?" in url) and any(
+                f"{param}=" in url 
+                for param in pattern.split("=")[0].split("*")[-1:]
+                if "=" in pattern
+            ):
+                return True
+        except Exception as e:
+            logging.warning(f"Error checking pattern {pattern}: {e}")
+    return False
 
 
 async def handle_bluenile(url, max_pages):
@@ -136,7 +264,7 @@ async def handle_bluenile(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -154,15 +282,12 @@ async def handle_bluenile(url, max_pages):
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
+                # product_wrapper = ".gallery-grid-container--vJWMdFUhYMhp1TP3jIfs"
+                # browser, page = await get_browser_with_proxy_strategy(p, url, product_wrapper)
                 
-                # Configure timeouts for this page
-                page = await context.new_page()
-                page.set_default_timeout(120000)  # 2 minute timeout
-                
-                await safe_goto_and_wait(page, url)
+                browser, page = await get_browser_with_proxy_strategy(p, url)
                 log_event(f"Successfully loaded: {url}")
+
 
                 # Scroll to load all products
                 await scroll_to_bottom(page)
@@ -204,16 +329,39 @@ async def handle_bluenile(url, max_pages):
                         product_name = "N/A"
 
                     try:
-                        # Prefer sale price if available
-                        sale_price_el = await product.query_selector("div.price--D59bW_owiHOgefBGjZBy")
-                
-                        if sale_price_el:
-                            price = await sale_price_el.inner_text()
-                        
+                        # Extract sale price and original price
+                        sale_price_el = await product.query_selector('[data-qa="sale-price"]')
+                        regular_price_el = await product.query_selector('[data-qa="price"]')
+                        discount_el = await product.query_selector('div[class^="discount--"]')
+
+                        if sale_price_el and regular_price_el:
+                            sale_price_text = await sale_price_el.inner_text()
+                            regular_price_text = await regular_price_el.inner_text()
+
+                            # Convert prices to numbers
+                            sale_price = float(sale_price_text.replace('$', '').replace(',', ''))
+                            regular_price = float(regular_price_text.replace('$', '').replace(',', ''))
+
+                            # Calculate discount amount
+                            discount_amount = regular_price - sale_price
+
+                            # Check if discount percent is provided, else calculate
+                            if discount_el:
+                                discount_percent = await discount_el.inner_text()
+                            else:
+                                discount_percent = f"-{round((discount_amount / regular_price) * 100)}%"
+
+                            # Format price output
+                            price = f"${discount_amount:,.0f} off {discount_percent}    ${sale_price:,.0f}"
+
+                        elif regular_price_el:
+                            regular_price_text = await regular_price_el.inner_text()
+                            price = f"${float(regular_price_text.replace('$', '').replace(',', '')):,.0f}"
                         else:
                             price = "N/A"
                     except:
                         price = "N/A"
+
 
                     try:
                         # Lifestyle image usually looks more styled, prefer it if present
@@ -224,6 +372,34 @@ async def handle_bluenile(url, max_pages):
                         image_url = await image_el.get_attribute("src") if image_el else "N/A"
                     except:
                         image_url = "N/A"
+                        
+                    additional_info = []
+
+                   
+
+                    # Extract star rating
+                    try:
+                        star_els = await product.query_selector_all('div.star--vN1jYGuXy5fgfM_M2C7Z.full--eWF94JobeoCq1i40n_Tw')
+                        if star_els:
+                            rating = len(star_els)
+                            additional_info.append(f"{rating} stars")
+                    except:
+                        pass
+
+                    # Extract review count
+                    try:
+                        review_el = await product.query_selector('div.revText--Ouf1K_o8qVYxDgE516SF')
+                        if review_el:
+                            review_text = await review_el.inner_text()  # e.g., "( 52 )"
+                            review_count = ''.join(filter(str.isdigit, review_text))  # get '52'
+                            if review_count:
+                                additional_info.append(f"{review_count} reviews")
+                    except:
+                        pass
+
+                    # Final string
+                    additional_info_str = " | ".join(additional_info)
+                        
 
                     gold_type_match = re.findall(r"(\d{1,2}ct\s*(?:Yellow|White|Rose)?\s*Gold|Platinum)", product_name, re.IGNORECASE)
                     kt = ", ".join(gold_type_match) if gold_type_match else "N/A"
@@ -237,8 +413,8 @@ async def handle_bluenile(url, max_pages):
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -255,7 +431,7 @@ async def handle_bluenile(url, max_pages):
                         
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")
@@ -271,12 +447,20 @@ async def handle_bluenile(url, max_pages):
             if page: await page.close()
             if browser: await browser.close()
 
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
+
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

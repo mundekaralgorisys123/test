@@ -100,39 +100,6 @@ def random_delay(min_sec=1, max_sec=3):
     time.sleep(random.uniform(min_sec, max_sec))
 
 
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-
-
-            # Wait for the selector with a longer timeout
-            product_cards = await page.wait_for_selector(".ps-category-items", state="attached", timeout=30000)
-
-            # Optionally validate at least 1 is visible (Playwright already does this)
-            if product_cards:
-                print("[Success] Product cards loaded.")
-                return
-        except Error as e:
-            logging.error(f"Error navigating to {url} on attempt {attempt + 1}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
-        except TimeoutError as e:
-            logging.warning(f"TimeoutError on attempt {attempt + 1} navigating to {url}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
-
-            
-
 
 async def handle_prouds(url, max_pages):
     ip_address = get_public_ip()
@@ -148,7 +115,7 @@ async def handle_prouds(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -205,10 +172,27 @@ async def handle_prouds(url, max_pages):
                         product_name = "N/A"
 
                     try:
-                        price_tag = await product.query_selector("span.s-price__now")
-                        price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
-                    except:
+                        price_now_tag = await product.query_selector("span.s-price__now")
+                        price_was_tag = await product.query_selector("span.s-price__was")
+                        full_price_tag = await product.query_selector("div.s-product__price.s-price")
+
+                        price_now = (await price_now_tag.inner_text()).strip() if price_now_tag else ""
+                        price_was = (await price_was_tag.inner_text()).strip() if price_was_tag else ""
+
+                        if price_now and price_was:
+                            price = f"{price_now} offer {price_was}"
+                        elif price_now:
+                            price = price_now
+                        elif full_price_tag:
+                            # Only use full_price_tag if both price_now and price_was are missing
+                            # This covers fallback like: <div class="s-product__price s-price"> $2,299 </div>
+                            price = (await full_price_tag.inner_text()).strip()
+                        else:
+                            price = "N/A"
+                    except Exception as e:
                         price = "N/A"
+
+
 
                     try:
                         image_tag = await product.query_selector("img")
@@ -223,22 +207,49 @@ async def handle_prouds(url, max_pages):
                             image_url = "N/A"
                     except:
                         image_url = "N/A"
+                        
+                        
+                    additional_info = []
+
+                    try:
+                       
+                        # New 'Sale' flag
+                        flag_els = await product.query_selector_all("div.s-product__flag.s-flag")
+                        if flag_els:
+                            for flag_el in flag_els:
+                                flag_text = await flag_el.inner_text()
+                                if flag_text:
+                                    additional_info.append(flag_text.strip())
+
+                        if not additional_info:
+                            additional_info.append("N/A")
+
+                    except Exception:
+                        additional_info.append("N/A")
+
+                    additional_info_str = " | ".join(additional_info)
+    
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue  
 
 
+                    gold_type_match = re.search(r"\b\d{1,2}CT(?:\s+(?:ROSE|YELLOW|WHITE))?\s+GOLD\b", product_name, re.IGNORECASE)
+                    kt = gold_type_match.group().upper() if gold_type_match else "N/A"
 
-                    gold_type_match = re.search(r"\b\d+K\s+\w+\s+\w+\b", product_name)
-                    kt = gold_type_match.group() if gold_type_match else "Not found"
 
-                    diamond_weight_match = re.search(r"\d+[-/]?\d*/?\d*\s*ct\s*tw", product_name)
-                    diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                    diamond_weight_match = re.search(r"\d+(\.\d+)?\s*(CT|CARAT)\s+TW", product_name, re.IGNORECASE)
+                    diamond_weight = diamond_weight_match.group().upper() if diamond_weight_match else "N/A"
+
+
 
                     unique_id = str(uuid.uuid4())
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -255,7 +266,7 @@ async def handle_prouds(url, max_pages):
                         
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")
@@ -285,13 +296,20 @@ async def handle_prouds(url, max_pages):
 
 
     # Final save and database operations
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
 
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

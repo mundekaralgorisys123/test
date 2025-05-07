@@ -100,7 +100,7 @@ async def handle_diamondsfactory(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -158,9 +158,61 @@ async def handle_diamondsfactory(url, max_pages):
                         image_url = await image_el.get_attribute("src") if image_el else "N/A"
                     except:
                         image_url = "N/A"
+                        
+                        
+                    additional_info = []
 
-                    gold_type_match = re.findall(r"(\d{1,2}ct\s*(?:Yellow|White|Rose)?\s*Gold|Platinum)", product_name, re.IGNORECASE)
-                    kt = ", ".join(gold_type_match) if gold_type_match else "N/A"
+                    try:
+                        # Product tags
+                        new_el = await product.query_selector("div.new-tag")
+                        if new_el:
+                            new_text = (await new_el.inner_text()).strip()
+                            if new_text:
+                                additional_info.append(new_text)
+
+                        if not additional_info:
+                            additional_info.append("N/A")
+
+                        # SALE tag
+                        sale_el = await product.query_selector("div.sale-on")
+                        if sale_el:
+                            sale_text = (await sale_el.inner_text()).strip()
+                            if sale_text:
+                                additional_info.append(sale_text)
+
+                        if not additional_info:
+                            additional_info.append("N/A")
+                            
+                        # Hidden Halo tag
+                        halo_el = await product.query_selector("div.hidden-halo-tag")
+                        if halo_el:
+                            halo_text = (await halo_el.inner_text()).strip()
+                            if halo_text:
+                                additional_info.append(halo_text)
+
+                        if not additional_info:
+                            additional_info.append("N/A")    
+
+                    except Exception:
+                        additional_info.append("N/A")
+
+                    additional_info_str = " | ".join(additional_info)
+                    
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue 
+    
+
+                    gold_type_match = re.findall(
+                        r"(?:(\d{1,2}ct)\s*)?(Yellow|White|Rose)?\s*Gold|Platinum", 
+                        product_name, 
+                        re.IGNORECASE
+                    )
+
+                    # Join matched tuples into strings like '9ct Yellow Gold' or 'White Gold'
+                    kt = ", ".join(
+                        " ".join(filter(None, match)).title() for match in gold_type_match
+                    ) if gold_type_match else "N/A"
 
                     # Extract Diamond Weight (supports "1.85ct", "2ct", "1.50ct", etc.)
                     diamond_weight_match = re.findall(r"(\d+(?:\.\d+)?\s*ct)", product_name, re.IGNORECASE)
@@ -171,8 +223,8 @@ async def handle_diamondsfactory(url, max_pages):
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -189,7 +241,7 @@ async def handle_diamondsfactory(url, max_pages):
                         
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")
@@ -219,13 +271,20 @@ async def handle_diamondsfactory(url, max_pages):
 
 
     # Final save and database operations
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
 
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

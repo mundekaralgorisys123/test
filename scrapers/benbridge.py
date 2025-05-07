@@ -14,7 +14,7 @@ from database import insert_into_db
 from limit_checker import update_product_count
 import httpx
 from playwright.async_api import async_playwright, TimeoutError
-
+from proxysetup import get_browser_with_proxy_strategy
 # Load .env variables
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
@@ -56,7 +56,7 @@ async def handle_benbridge(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     current_date = datetime.now().strftime("%Y-%m-%d")
@@ -96,14 +96,8 @@ async def handle_benbridge(url, max_pages):
                         logging.warning(f"Could not click 'Load More': {e}")
                         break
 
-
-                            
-
-
                 product_wrapper = await page.wait_for_selector("div.product-grid", timeout=30000)
                 all_products = await product_wrapper.query_selector_all("div.product-grid-tile")
-
-                
 
                 total_products = len(all_products)
                 new_products = all_products[previous_count:]
@@ -114,19 +108,32 @@ async def handle_benbridge(url, max_pages):
                 page_title = await page.title()
 
                 for idx, product in enumerate(new_products):
+                    additional_info = []
+
                     try:
                         product_name_el = await product.query_selector("div.pdp-link a")
                         product_name = await product_name_el.inner_text() if product_name_el else "N/A"
                     except:
                         product_name = "N/A"
 
+                    price_parts = []
                     try:
-                        price_el = await product.query_selector("span.value")
-                        price = await price_el.inner_text() if price_el else "N/A"
+                        sales_price_el = await product.query_selector("span.sales .value")
+                        if sales_price_el:
+                            price_parts.append(await sales_price_el.inner_text())
+                        original_price_el = await product.query_selector(".price span:not(.sales) .value")
+                        if original_price_el and (not sales_price_el or (await original_price_el.inner_text()) != (await sales_price_el.inner_text())):
+                            price_parts.append(f"Original: {await original_price_el.inner_text()}")
                     except:
-                        price = "N/A"
-                                            
-                      
+                        pass
+                    price = " | ".join(price_parts) if price_parts else "N/A"
+
+                    try:
+                        new_badge = await product.query_selector("span.badge-product.new")
+                        if new_badge:
+                            additional_info.append(await new_badge.inner_text())
+                    except:
+                        pass
 
                     try:
                         image_el = await product.query_selector("div.product-tile-image-container img.tile-image")
@@ -139,8 +146,11 @@ async def handle_benbridge(url, max_pages):
                             image_url = "N/A"
                     except:
                         image_url = "N/A"
-                        
-                        
+
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue
+
                     gold_type_match = re.search(
                         r"(18K|14K|10K)?\s*(White Gold|Yellow Gold|Rose Gold|Gold|Platinum|Silver)",
                         product_name,
@@ -148,17 +158,24 @@ async def handle_benbridge(url, max_pages):
                     )
                     kt = gold_type_match.group(0).strip() if gold_type_match else "N/A"
 
-                    
                     diamond_weight_match = re.search(r"(\d+(\.\d+)?)\s*(ct|carat)", product_name, re.IGNORECASE)
                     diamond_weight = f"{diamond_weight_match.group(1)} ct" if diamond_weight_match else "N/A"
 
-                    
+                    # Extract available sizes
+                    try:
+                        size_items = await product.query_selector_all("div.sizes-display.product-option .size-item")
+                        sizes = [await size.inner_text() for size in size_items]
+                        if sizes:
+                            additional_info.append(f"Available Sizes: {', '.join(sizes)}")
+                    except:
+                        pass
+
                     unique_id = str(uuid.uuid4())
                     task = asyncio.create_task(download_image(session, image_url, product_name, timestamp, image_folder, unique_id))
                     image_tasks.append((len(sheet['A']) + 1, unique_id, task))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, time_only, image_url, " | ".join(additional_info)))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url, " | ".join(additional_info)])
 
                 # Process image downloads and attach them to Excel
                 for row, unique_id, task in image_tasks:
@@ -169,12 +186,14 @@ async def handle_benbridge(url, max_pages):
                         sheet.add_image(img, f"D{row}")
                     for i, record in enumerate(records):
                         if record[0] == unique_id:
-                            records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                            records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8], record[9])
                             break
 
                 await browser.close()
             load_more_clicks += 1
 
+        if not all_products:
+            return None, None, None
         # Save Excel
         filename = f'handle_benbridge_{datetime.now().strftime("%Y-%m-%d_%H.%M")}.xlsx'
         file_path = os.path.join(EXCEL_DATA_PATH, filename)

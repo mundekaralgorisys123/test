@@ -10,23 +10,26 @@ from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError, Error
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image
-from flask import Flask
 from PIL import Image as PILImage
-import requests
-import concurrent.futures
 from utils import get_public_ip, log_event, sanitize_filename
 from dotenv import load_dotenv
 from database import insert_into_db
 from limit_checker import update_product_count
-import aiohttp
 from io import BytesIO
 from openpyxl.drawing.image import Image as XLImage
 import httpx
-from proxysetup import get_browser_with_proxy_strategy
 # Load environment variables from .env file
-from functools import partial
+import traceback
+from typing import List, Tuple
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
+
+
+PROXY_SERVER = os.getenv("PROXY_SERVER")
+PROXY_USERNAME = os.getenv("PROXY_USERNAME")
+PROXY_PASSWORD = os.getenv("PROXY_PASSWORD")
+
+
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
@@ -95,17 +98,19 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
             return "N/A"
 
 
-def random_delay(min_sec=1, max_sec=3):
-    """Introduce a random delay to mimic human-like behavior."""
-    time.sleep(random.uniform(min_sec, max_sec))
+
+########################################  safe_goto_and_wait ####################################################################
 
 
-async def safe_goto_and_wait(page, url, retries=3):
+async def safe_goto_and_wait(page, url,isbri_data, retries=2):
     for attempt in range(retries):
         try:
             print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-
+            
+            if isbri_data:
+                await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
+            else:
+                await page.goto(url, wait_until="domcontentloaded", timeout=180_000)
 
             # Wait for the selector with a longer timeout
             product_cards = await page.wait_for_selector(".product-list__inner", state="attached", timeout=30000)
@@ -131,7 +136,132 @@ async def safe_goto_and_wait(page, url, retries=3):
                 logging.error(f"Failed to navigate to {url} after {retries} attempts.")
                 raise
 
+
+########################################  get browser with proxy ####################################################################
+      
+
+async def get_browser_with_proxy_strategy(p, url: str):
+    """
+    Dynamically checks robots.txt and selects proxy accordingly
+    Always uses proxies - never scrapes directly
+    """
+    parsed_url = httpx.URL(url)
+    base_url = f"{parsed_url.scheme}://{parsed_url.host}"
+    
+    # 1. Fetch and parse robots.txt
+    disallowed_patterns = await get_robots_txt_rules(base_url)
+    
+    # 2. Check if URL matches any disallowed pattern
+    is_disallowed = check_url_against_rules(str(parsed_url), disallowed_patterns)
+    
+    # 3. Try proxies in order (bri-data first if allowed, oxylabs if disallowed)
+    proxies_to_try = [
+        PROXY_URL if not is_disallowed else {
+            "server": PROXY_SERVER,
+            "username": PROXY_USERNAME,
+            "password": PROXY_PASSWORD
+        },
+        {  # Fallback to the other proxy
+            "server": PROXY_SERVER,
+            "username": PROXY_USERNAME,
+            "password": PROXY_PASSWORD
+        } if not is_disallowed else PROXY_URL
+    ]
+
+    last_error = None
+    for proxy_config in proxies_to_try:
+        browser = None
+        try:
+            isbri_data = False
+            if proxy_config == PROXY_URL:
+                logging.info("Attempting with bri-data proxy (allowed by robots.txt)")
+                browser = await p.chromium.connect_over_cdp(PROXY_URL)
+                isbri_data = True
+            else:
+                logging.info("Attempting with oxylabs proxy (required by robots.txt)")
+                browser = await p.chromium.launch(
+                    proxy=proxy_config,
+                    headless=True,
+                    args=[
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-web-security'
+                    ]
+                )
+
+            context = await browser.new_context()
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                })
+            """)
+            page = await context.new_page()
             
+            await safe_goto_and_wait(page, url,isbri_data)
+            return browser, page
+
+        except Exception as e:
+            last_error = e
+            error_trace = traceback.format_exc()
+            logging.error(f"Proxy attempt failed:\n{error_trace}")
+            if browser:
+                await browser.close()
+            continue
+
+    error_msg = (f"Failed to load {url} using all proxy options. "
+                f"Last error: {str(last_error)}\n"
+                f"URL may be disallowed by robots.txt or proxies failed.")
+    logging.error(error_msg)
+    raise RuntimeError(error_msg)
+
+
+
+
+async def get_robots_txt_rules(base_url: str) -> List[str]:
+    """Dynamically fetch and parse robots.txt rules"""
+    robots_url = f"{base_url}/robots.txt"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(robots_url, timeout=10)
+            if resp.status_code == 200:
+                return [
+                    line.split(":", 1)[1].strip()
+                    for line in resp.text.splitlines()
+                    if line.lower().startswith("disallow:")
+                ]
+    except Exception as e:
+        logging.warning(f"Couldn't fetch robots.txt: {e}")
+    return []
+
+
+def check_url_against_rules(url: str, disallowed_patterns: List[str]) -> bool:
+    """Check if URL matches any robots.txt disallowed pattern"""
+    for pattern in disallowed_patterns:
+        try:
+            # Handle wildcard patterns
+            if "*" in pattern:
+                regex_pattern = pattern.replace("*", ".*")
+                if re.search(regex_pattern, url):
+                    return True
+            # Handle path patterns
+            elif url.startswith(f"{pattern}"):
+                return True
+            # Handle query parameters
+            elif ("?" in url) and any(
+                f"{param}=" in url 
+                for param in pattern.split("=")[0].split("*")[-1:]
+                if "=" in pattern
+            ):
+                return True
+        except Exception as e:
+            logging.warning(f"Error checking pattern {pattern}: {e}")
+    return False
+
+def random_delay(min_sec=1, max_sec=3):
+    """Introduce a random delay to mimic human-like behavior."""
+    time.sleep(random.uniform(min_sec, max_sec))
+
+
+
 
 
 async def handle_wallacebishop(url, max_pages):
@@ -148,7 +278,7 @@ async def handle_wallacebishop(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -171,9 +301,9 @@ async def handle_wallacebishop(url, max_pages):
         page = None
         try:
             async with async_playwright() as p:
-                product_wrapper = ".product-list__inner"
-                browser, page = await get_browser_with_proxy_strategy(p, current_url, product_wrapper)
+                browser, page = await get_browser_with_proxy_strategy(p, current_url)
                 log_event(f"Successfully loaded: {current_url}")
+
                 # Scroll to load all products
                 prev_product_count = 0
                 for _ in range(10):
@@ -210,10 +340,24 @@ async def handle_wallacebishop(url, max_pages):
                         product_name = "N/A"
 
                     try:
-                        price_tag = await product.query_selector("div.price-list span.price")
-                        price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
+                        sale_price_tag = await product.query_selector("span.price--highlight") or await product.query_selector("div.price-list span.price")
+                        compare_price_tag = await product.query_selector("span.price--compare")
+
+                        sale_price = (await sale_price_tag.inner_text()).strip() if sale_price_tag else None
+                        compare_price = (await compare_price_tag.inner_text()).strip() if compare_price_tag else None
+
+                        if sale_price and compare_price:
+                            price = f"{sale_price} offer {compare_price}"
+                        elif sale_price:
+                            price = sale_price
+                        elif compare_price:
+                            price = compare_price
+                        else:
+                            price = "N/A"
                     except:
                         price = "N/A"
+
+
 
                     try:
                         image_tag = await product.query_selector("img.product-item__primary-image")
@@ -224,6 +368,12 @@ async def handle_wallacebishop(url, max_pages):
                             image_url = "N/A"
                     except:
                         image_url = "N/A"
+                        
+                    additional_info_str = "N/A"    
+                        
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue     
 
 
                    # Gold type matching
@@ -245,8 +395,8 @@ async def handle_wallacebishop(url, max_pages):
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -263,7 +413,7 @@ async def handle_wallacebishop(url, max_pages):
                         
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")
@@ -293,13 +443,20 @@ async def handle_wallacebishop(url, max_pages):
 
 
     # Final save and database operations
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
 
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

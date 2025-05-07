@@ -246,7 +246,7 @@ async def handle_grahams(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]  # Moved Additional Info to last
     sheet.append(headers)
 
     current_date = datetime.now().strftime("%Y-%m-%d")
@@ -265,7 +265,7 @@ async def handle_grahams(url, max_pages):
                 browser, page = await get_browser_with_proxy_strategy(p, url)
                 log_event(f"Successfully loaded: {url}")
 
-                 # Simulate clicking 'Load More' number of times
+                # Simulate clicking 'Load More' number of times
                 for i in range(load_more_clicks):
                     try:
                         # Scroll to bottom of the page to trigger lazy load
@@ -294,19 +294,19 @@ async def handle_grahams(url, max_pages):
                         print(f"[Load More Error] {e}")
                         break
 
-
-                                    
                 all_products = await page.query_selector_all("li.column.ss__result.ss__result--item")
 
                 total_products = len(all_products)
                 new_products = all_products[previous_count:]
                 logging.info(f"Page {load_more_clicks}: Total = {total_products}, New = {len(new_products)}")
-                previous_count = total_products
+                previous_count += new_products
 
                 print(f"Page {load_more_clicks}: Scraping {len(new_products)} new products.")
                 page_title = await page.title()
 
                 for idx, product in enumerate(new_products):
+                    additional_info = []
+                    
                     try:
                         name_tag = await product.query_selector("a.product-card-title")
                         product_name = await name_tag.inner_text() if name_tag else "N/A"
@@ -314,23 +314,85 @@ async def handle_grahams(url, max_pages):
                         print(f"[Product Name] Error: {e}")
                         product_name = "N/A"
 
+                    # Handle price (original and discounted)
+                    price = "N/A"
                     try:
                         price_tag = await product.query_selector("span.price")
-                        price = await price_tag.inner_text() if price_tag else "N/A"
+                        if price_tag:
+                            original_price_tag = await price_tag.query_selector("del span.amount")
+                            discounted_price_tag = await price_tag.query_selector("ins span.amount")
+                            
+                            original_price = await original_price_tag.inner_text() if original_price_tag else None
+                            discounted_price = await discounted_price_tag.inner_text() if discounted_price_tag else None
+                            
+                            if original_price and discounted_price:
+                                price = f"{original_price}|{discounted_price}"
+                                additional_info.append(f"Discount: {original_price} → {discounted_price}")
+                            elif discounted_price:
+                                price = discounted_price
+                            else:
+                                price = await price_tag.inner_text()
                     except Exception as e:
                         print(f"[Price] Error: {e}")
                         price = "N/A"
 
-                   
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue
 
+                    # Handle discount badges
                     try:
-                        # await product.scroll_into_view_if_needed()
+                        discount_badges = await product.query_selector_all(".badge.onsale")
+                        for badge in discount_badges:
+                            badge_text = await badge.inner_text()
+                            if badge_text and "SAVE" in badge_text:
+                                additional_info.append(f"Badge: {badge_text}")
+                    except Exception as e:
+                        print(f"[Discount Badge] Error: {e}")
 
-                        # Try primary image first
+                    # Handle product availability/stock status
+                    try:
+                        stock_status_tag = await product.query_selector(".stock-status")
+                        if stock_status_tag:
+                            stock_status = await stock_status_tag.inner_text()
+                            additional_info.append(f"Stock: {stock_status}")
+                    except Exception as e:
+                        print(f"[Stock Status] Error: {e}")
+
+                    # Handle color options if available
+                    try:
+                        color_options = await product.query_selector_all(".color-swatch")
+                        if color_options:
+                            colors = [await color.get_attribute("title") or await color.get_attribute("alt") for color in color_options]
+                            colors = [c for c in colors if c]
+                            if colors:
+                                additional_info.append(f"Colors: {', '.join(colors)}")
+                    except Exception as e:
+                        print(f"[Color Options] Error: {e}")
+
+                    # Handle any other product labels
+                    try:
+                        labels = await product.query_selector_all(".product-label")
+                        if labels:
+                            label_texts = [await label.inner_text() for label in labels]
+                            additional_info.extend([f"Label: {text}" for text in label_texts if text])
+                    except Exception as e:
+                        print(f"[Product Labels] Error: {e}")
+
+                    # Handle product rating if available
+                    try:
+                        rating_tag = await product.query_selector(".product-rating")
+                        if rating_tag:
+                            rating = await rating_tag.get_attribute("data-rating") or await rating_tag.inner_text()
+                            additional_info.append(f"Rating: {rating}")
+                    except Exception as e:
+                        print(f"[Product Rating] Error: {e}")
+
+                    # Handle image
+                    try:
                         img_tag = await product.query_selector(".product-primary-image")
                         image_url = await img_tag.get_attribute("src") if img_tag else None
 
-                        # Fallback: try secondary image
                         if not image_url:
                             img_tag = await product.query_selector(".product-secondary-image")
                             image_url = await img_tag.get_attribute("src") if img_tag else "N/A"
@@ -339,31 +401,54 @@ async def handle_grahams(url, max_pages):
                             image_url = "https:" + image_url
                         elif not image_url:
                             image_url = "N/A"
-
                     except Exception as e:
                         print(f"[Image URL] Error: {e}")
                         image_url = "N/A"
 
-                    
-                    
-                    
                     image_url = modify_image_url(image_url)
-                        
 
-                    # Extract Gold Type (e.g., "14K Yellow Gold").
+                    # Extract Gold Type
                     gold_type_match = re.findall(r"(\d{1,2}ct\s*(?:Yellow|White|Rose)?\s*Gold|Platinum|Cubic Zirconia)", product_name, re.IGNORECASE)
                     kt = ", ".join(gold_type_match) if gold_type_match else "N/A"
 
-                    # Extract Diamond Weight (supports "1.85ct", "2ct", "1.50ct", etc.)
+                    # Extract Diamond Weight
                     diamond_weight_match = re.findall(r"(\d+(?:\.\d+)?\s*ct)", product_name, re.IGNORECASE)
                     diamond_weight = ", ".join(diamond_weight_match) if diamond_weight_match else "N/A"
+
+                    # Join additional info with pipe delimiter
+                    additional_info_text = " | ".join(additional_info) if additional_info else "N/A"
 
                     unique_id = str(uuid.uuid4())
                     task = asyncio.create_task(download_image(session, image_url, product_name, timestamp, image_folder, unique_id))
                     image_tasks.append((len(sheet['A']) + 1, unique_id, task))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    # Reordered to have Additional Info last
+                    records.append((
+                        unique_id, 
+                        current_date, 
+                        page_title, 
+                        product_name, 
+                        None, 
+                        kt, 
+                        price, 
+                        diamond_weight,
+                        time_only,
+                        image_url,
+                        additional_info_text  # Now last
+                    ))
+                    
+                    sheet.append([
+                        current_date, 
+                        page_title, 
+                        product_name, 
+                        None, 
+                        kt, 
+                        price, 
+                        diamond_weight,
+                        time_only,
+                        image_url,
+                        additional_info_text  # Now last
+                    ])
 
                 # Process image downloads and attach them to Excel
                 for row, unique_id, task in image_tasks:
@@ -374,13 +459,29 @@ async def handle_grahams(url, max_pages):
                         sheet.add_image(img, f"D{row}")
                     for i, record in enumerate(records):
                         if record[0] == unique_id:
-                            records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                            records[i] = (
+                                record[0], 
+                                record[1], 
+                                record[2], 
+                                record[3], 
+                                image_path, 
+                                record[5], 
+                                record[6], 
+                                record[7],
+                                record[8],
+                                record[9],
+                                record[10]  # Additional Info remains last
+                            )
                             break
 
                 await browser.close()
             load_more_clicks += 1
 
         # Save Excel
+
+        if not all_products:
+            return None, None, None
+        
         filename = f'handle_grahams_{datetime.now().strftime("%Y-%m-%d_%H.%M")}.xlsx'
         file_path = os.path.join(EXCEL_DATA_PATH, filename)
         wb.save(file_path)

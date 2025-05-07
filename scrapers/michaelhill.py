@@ -68,7 +68,7 @@ async def safe_goto_and_wait(page, url,isbri_data, retries=2):
                 await page.goto(url, wait_until="networkidle", timeout=180_000)
 
             # Wait for the selector with a longer timeout
-            product_cards = await page.wait_for_selector(".product-list", state="attached", timeout=30000)
+            product_cards = await page.wait_for_selector("li.product-list__tile", state="attached", timeout=30000)
 
             # Optionally validate at least 1 is visible (Playwright already does this)
             if product_cards:
@@ -228,13 +228,13 @@ async def handle_michaelhill(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     current_date = datetime.now().strftime("%Y-%m-%d")
     time_only = datetime.now().strftime("%H.%M")
 
-    seen_ids = set()
+   
     records = []
     image_tasks = []
 
@@ -259,7 +259,14 @@ async def handle_michaelhill(url, max_pages):
                         logging.warning(f"Could not click 'Load More': {e}")
                         break
 
-                all_products = await page.query_selector_all("li.product-list__tile")
+               
+                
+                
+                product_wrapper = await page.query_selector("ul.product-list__content")
+                all_products = await product_wrapper.query_selector_all("li.product-list__tile") if product_wrapper else []
+
+                
+
 
                 total_products = len(all_products)
                 new_products = all_products[previous_count:]
@@ -278,11 +285,30 @@ async def handle_michaelhill(url, max_pages):
                         product_name = "N/A"
 
                     try:
-                        price_tag = await product.query_selector(".base-pricing__retailOnly")
-                        price = await price_tag.inner_text() if price_tag else "N/A"
+                        # Try to extract discounted (sale) and list price
+                        sale_tag = await product.query_selector(".base-pricing__doubleAndRetail")
+                        if sale_tag:
+                            sale_price_tag = await sale_tag.query_selector(".base-pricing__double .mhj-currency-format")
+                            list_price_tag = await sale_tag.query_selector(".base-pricing__doubleAndRetail--strike .mhj-currency-format")
+
+                            sale_price = await sale_price_tag.inner_text() if sale_price_tag else "N/A"
+                            list_price = await list_price_tag.inner_text() if list_price_tag else "N/A"
+
+                            if list_price != "N/A" and list_price != sale_price:
+                                price = f"${sale_price} (Last Price: ${list_price})"
+                            else:
+                                price = f"${sale_price}"
+                        else:
+                            # Fallback for retail-only (no discount)
+                            retail_only_tag = await product.query_selector(".base-pricing__retailOnly .mhj-currency-format")
+                            retail_price = await retail_only_tag.inner_text() if retail_only_tag else "N/A"
+                            price = f"${retail_price}" if retail_price != "N/A" else "N/A"
+
                     except Exception as e:
                         print(f"Error getting price: {e}")
                         price = "N/A"
+
+
 
                     try:
                         image_div = await product.query_selector(".product-tile")
@@ -290,10 +316,35 @@ async def handle_michaelhill(url, max_pages):
                     except Exception as e:
                         print(f"Error getting image URL: {e}")
                         image_url = "N/A"
+                        
+                    additional_info = []
+
+                    try:
+                  
+                        # Gather badge elements like "MADE IN AU"
+                        badge_els = await product.query_selector_all("div.o-badge.o-badge--product")
+                        if badge_els:
+                            for badge_el in badge_els:
+                                badge_text = await badge_el.inner_text()
+                                if badge_text.strip():
+                                    additional_info.append(badge_text.strip())
+
+                        if not additional_info:
+                            additional_info.append("N/A")
+                    except Exception as e:
+                        additional_info.append("N/A")
+
+                    additional_info_str = " | ".join(additional_info)
+    
 
 
-                    gold_type_match = re.search(r"(\d{1,2}K|Platinum|Silver|Gold|White Gold|Yellow Gold|Rose Gold)", product_name, re.IGNORECASE)
-                    kt = gold_type_match.group(0) if gold_type_match else "N/A"
+                    gold_type_match = re.search(
+                        r"(Yellow and White Gold|Yellow/White Gold|Yellow & White Gold|White and Yellow Gold|White/Yellow Gold|White & Yellow Gold|Rose Gold|White Gold|Yellow Gold|Platinum|Silver|\d{1,2}kt|\d{1,2}K)",
+                        product_name,
+                        re.IGNORECASE
+                    )
+                    kt = gold_type_match.group(0).title() if gold_type_match else "N/A"
+
 
                     diamond_weight_match = re.search(r"(\d+(\.\d+)?)\s*(ct|carat)", product_name, re.IGNORECASE)
                     diamond_weight = f"{diamond_weight_match.group(1)} ct" if diamond_weight_match else "N/A"
@@ -302,8 +353,8 @@ async def handle_michaelhill(url, max_pages):
                     task = asyncio.create_task(download_image(session, image_url, product_name, timestamp, image_folder, unique_id))
                     image_tasks.append((len(sheet['A']) + 1, unique_id, task))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
 
                 # Process image downloads and attach them to Excel
                 for row, unique_id, task in image_tasks:
@@ -314,7 +365,7 @@ async def handle_michaelhill(url, max_pages):
                         sheet.add_image(img, f"D{row}")
                     for i, record in enumerate(records):
                         if record[0] == unique_id:
-                            records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                            records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                             break
 
                 await browser.close()
@@ -323,17 +374,35 @@ async def handle_michaelhill(url, max_pages):
         # Save Excel
         filename = f'handle_michaelhill_{datetime.now().strftime("%Y-%m-%d_%H.%M")}.xlsx'
         file_path = os.path.join(EXCEL_DATA_PATH, filename)
+        # wb.save(file_path)
+        # log_event(f"Data saved to {file_path} | IP: {ip_address}")
+
+        # if records:
+        #     insert_into_db(records)
+        # else:
+        #     logging.info("No data to insert into the database.")
+
+        # update_product_count(len(records))
+
+        # with open(file_path, "rb") as f:
+        #     base64_encoded = base64.b64encode(f.read()).decode("utf-8")
+
+        # return base64_encoded, filename, file_path
+         # # Final save and database operations
+        if not records:
+            return None, None, None
+
+        # Save the workbook
         wb.save(file_path)
-        log_event(f"Data saved to {file_path} | IP: {ip_address}")
+        log_event(f"Data saved to {file_path}")
 
-        if records:
-            insert_into_db(records)
-        else:
-            logging.info("No data to insert into the database.")
+        # Encode the file in base64
+        with open(file_path, "rb") as file:
+            base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+        # Insert data into the database and update product count
+        insert_into_db(records)
         update_product_count(len(records))
 
-        with open(file_path, "rb") as f:
-            base64_encoded = base64.b64encode(f.read()).decode("utf-8")
-
+        # Return necessary information
         return base64_encoded, filename, file_path

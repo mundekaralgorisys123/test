@@ -22,9 +22,7 @@ from playwright.async_api import Page
 import re
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from proxysetup import get_browser_with_proxy_strategy
-# Load environment variables
-load_dotenv()
-PROXY_URL = os.getenv("PROXY_URL")
+
 
 # Setup Flask
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))

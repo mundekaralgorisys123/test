@@ -48,42 +48,92 @@ async def download_and_resize_image(session, image_url):
         logging.warning(f"Error downloading/resizing image: {e}")
         return None
 
-def modify_image_url(image_url):
-    """Modify the image URL to replace '_260' with '_1200' while keeping query parameters."""
-    if not image_url or image_url == "N/A":
-        return image_url
-
-    # Extract and preserve query parameters
-    query_params = ""
-    if "?" in image_url:
-        image_url, query_params = image_url.split("?", 1)
-        query_params = f"?{query_params}"
-
-    # Replace '_260' with '_1200' while keeping the rest of the URL intact
-    modified_url = re.sub(r'(_260)(?=\.\w+$)', '_1200', image_url)
-
-    return modified_url + query_params  # Append query parameters if they exist
-
 async def download_image_async(image_url, product_name, timestamp, image_folder, unique_id, retries=3):
+    """Download and save an image with improved error handling and SVG detection"""
     if not image_url or image_url == "N/A":
         return "N/A"
-
+    
+    # Skip SVG placeholder images
+    if image_url.startswith("data:image/svg+xml"):
+        logging.info(f"Skipping SVG placeholder for {product_name}")
+        return "N/A"
+    
+    # Fix malformed URLs (double slashes)
+    if image_url.startswith("https://"):
+        image_url = image_url.replace("https://", "https://", 1)
+    
     image_filename = f"{unique_id}_{timestamp}.jpg"
     image_full_path = os.path.join(image_folder, image_filename)
-    modified_url = modify_image_url(image_url)
-
+    
     async with httpx.AsyncClient(timeout=10.0) as client:
         for attempt in range(retries):
             try:
-                response = await client.get(modified_url)
-                response.raise_for_status()
+                # Try original URL first
+                response = await client.get(image_url)
+                if response.status_code != 200:
+                    # Try modifying the URL for higher resolution
+                    modified_url = modify_image_url(image_url)
+                    if modified_url != image_url:
+                        response = await client.get(modified_url)
+                        response.raise_for_status()
+                
+                # Check if we got an actual image
+                content_type = response.headers.get('content-type', '')
+                if not content_type.startswith('image/'):
+                    logging.warning(f"Invalid content type {content_type} for {product_name}")
+                    return "N/A"
+                
                 with open(image_full_path, "wb") as f:
                     f.write(response.content)
-                return image_full_path
+                
+                # Verify the downloaded image
+                try:
+                    with PILImage.open(image_full_path) as img:
+                        img.verify()
+                    return image_full_path
+                except Exception as verify_error:
+                    logging.warning(f"Image verification failed for {product_name}: {verify_error}")
+                    os.remove(image_full_path)
+                    return "N/A"
+                    
             except httpx.RequestError as e:
                 logging.warning(f"Retry {attempt + 1}/{retries} - Error downloading {product_name}: {e}")
+                if attempt < retries - 1:
+                    await asyncio.sleep(random.uniform(1, 3))
+    
     logging.error(f"Failed to download {product_name} after {retries} attempts.")
     return "N/A"
+
+def modify_image_url(image_url):
+    """Modify the image URL to get higher resolution while keeping query parameters"""
+    if not image_url or image_url == "N/A":
+        return image_url
+    
+    # Handle SVG placeholders
+    if image_url.startswith("data:image/svg+xml"):
+        return "N/A"
+    
+    # Fix common URL issues
+    if image_url.startswith("//"):
+        image_url = f"https:{image_url}"
+    elif image_url.startswith("/"):
+        # You might need to prepend the base URL here if needed
+        pass
+    
+    # Replace common low-res patterns with high-res
+    replacements = [
+        ('_260.', '_1200.'),
+        ('-300x300.', '-1200x1200.'),
+        ('_small.', '_large.'),
+        ('thumbnail', 'full'),
+    ]
+    
+    for old, new in replacements:
+        if old in image_url:
+            image_url = image_url.replace(old, new)
+            break
+    
+    return image_url
 
 def random_delay(min_sec=1, max_sec=3):
     """Introduce a random delay to mimic human-like behavior."""
@@ -293,7 +343,7 @@ async def handle_larsenjewellery(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -304,7 +354,6 @@ async def handle_larsenjewellery(url, max_pages):
     success_count = 0
 
     while page_count <= max_pages:
-       
         if page_count == 1:
             current_url = url
         else:
@@ -331,12 +380,7 @@ async def handle_larsenjewellery(url, max_pages):
                         break
                     prev_product_count = current_product_count
 
-
-                # product_wrapper = await page.query_selector("div.row")
                 products = await page.query_selector_all("div.col-lg-3.col-6.product")
-
-
-
                 logging.info(f"Total products found on page {page_count}: {len(products)}")
 
                 page_title = await page.title()
@@ -347,49 +391,166 @@ async def handle_larsenjewellery(url, max_pages):
                 image_tasks = []
 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
-                    try:
-                        product_name = await (await product.query_selector("h2.name")).inner_text()
-                    except:
-                        product_name = "N/A"
+                    additional_info = []
+                    product_name = "N/A"
+                    price = "N/A"
+                    image_url = "N/A"
+                    kt = "N/A"
+                    diamond_weight = "N/A"
+                    unique_id = str(uuid.uuid4())
 
                     try:
-                        price = await (await product.query_selector("p.price-from")).inner_text()
-                    except:
-                        price = "N/A"
-
-
-                    try:
-                        await product.scroll_into_view_if_needed()
-                        img_tag = await product.query_selector("img")
-                        # Try `srcset` first for higher resolution, fallback to `src`
-                        image_url = await img_tag.get_attribute("src") or await img_tag.get_attribute("srcset")
+                        # Product Name
+                        name_element = await product.query_selector("h2.name")
+                        product_name = (await name_element.inner_text()).strip() if name_element else "N/A"
                         
-                        # If srcset exists, take the first URL (before the space)
-                        if image_url and " " in image_url:
-                            image_url = image_url.split(" ")[0]
-                        
-                        # Ensure full URL if needed (e.g., if it's a relative URL)
-                        if image_url and image_url.startswith("//"):
-                            image_url = "https:" + image_url
-
+                        # Product Description
+                        desc_element = await product.query_selector("p.product-description")
+                        if desc_element:
+                            description = (await desc_element.inner_text()).strip()
+                            if description and description.lower() != product_name.lower():
+                                additional_info.append(f"Description: {description}")
                     except Exception as e:
-                        print(f"[Image URL] Error: {e}")
+                        logging.error(f"Error getting product name/description: {e}")
+
+                    try:
+                        # Price handling - check for multiple price elements
+                        price_elements = await product.query_selector_all("p.price-from")
+                        if price_elements:
+                            prices = []
+                            for elem in price_elements:
+                                price_text = (await elem.inner_text()).strip()
+                                if price_text:
+                                    prices.append(price_text)
+                            
+                            if len(prices) > 1:
+                                price = " | ".join(prices)
+                                additional_info.append(f"Multiple price options")
+                            else:
+                                price = prices[0] if prices else "N/A"
+                    except Exception as e:
+                        logging.error(f"Error getting price: {e}")
+
+                    try:
+                        # Image URL
+                        await product.scroll_into_view_if_needed()
+                        img_tag = await product.query_selector("img.attachment-full.size-full:not([src^='data:image/svg+xml'])")
+                        if not img_tag:
+                            img_tag = await product.query_selector("img:not([src^='data:image/svg+xml'])")
+                        
+                        if img_tag:
+                            # Prioritize data-src or data-lazy-src if available (common lazy loading pattern)
+                            image_url = await img_tag.get_attribute("data-src") or \
+                                    await img_tag.get_attribute("data-lazy-src") or \
+                                    await img_tag.get_attribute("src")
+                            
+                            # Try srcset for higher resolution
+                            srcset = await img_tag.get_attribute("srcset")
+                            if srcset:
+                                srcset_parts = [p.strip() for p in srcset.split(",") if p.strip()]
+                                if srcset_parts:
+                                    # Get the highest resolution image from srcset
+                                    try:
+                                        srcset_parts.sort(key=lambda x: int(x.split(" ")[1].replace("w", "")))
+                                        image_url = srcset_parts[-1].split(" ")[0]
+                                    except (IndexError, ValueError):
+                                        pass
+                            
+                            # Ensure we have a valid URL
+                            if image_url and not image_url.startswith("data:image/svg+xml"):
+                                if image_url.startswith("//"):
+                                    image_url = f"https:{image_url}"
+                                elif image_url.startswith("/"):
+                                    # You might need to prepend the base URL here
+                                    pass
+                            else:
+                                image_url = "N/A"
+                        else:
+                            image_url = "N/A"
+                    except Exception as e:
+                        logging.error(f"Error getting image URL: {e}")
                         image_url = "N/A"
 
+                    # Metal type (kt)
+                    try:
+                        gold_type_match = re.search(r"\b\d+K\s+\w+\s+\w+\b", product_name, re.IGNORECASE)
+                        if not gold_type_match:
+                            gold_type_match = re.search(r"\b(?:Yellow|White|Rose)\s+Gold\b", product_name, re.IGNORECASE)
+                        if not gold_type_match:
+                            gold_type_match = re.search(r"\b(?:Platinum|Silver)\b", product_name, re.IGNORECASE)
+                        kt = gold_type_match.group() if gold_type_match else "N/A"
+                    except Exception as e:
+                        logging.error(f"Error extracting metal type: {e}")
 
-                    gold_type_match = re.search(r"\b\d+K\s+\w+\s+\w+\b", product_name)
-                    kt = gold_type_match.group() if gold_type_match else "Not found"
+                    # Diamond weight
+                    try:
+                        diamond_weight_match = re.search(r"(\d+\.?\d*)\s*(?:ct|ctw|carat|carats)", product_name, re.IGNORECASE)
+                        diamond_weight = f"{diamond_weight_match.group(1)} ct" if diamond_weight_match else "N/A"
+                        
+                        # If not found in name, check in description
+                        if diamond_weight == "N/A" and "Description" in "|".join(additional_info):
+                            desc_text = "|".join(additional_info)
+                            diamond_weight_match = re.search(r"(\d+\.?\d*)\s*(?:ct|ctw|carat|carats)", desc_text, re.IGNORECASE)
+                            diamond_weight = f"{diamond_weight_match.group(1)} ct" if diamond_weight_match else "N/A"
+                    except Exception as e:
+                        logging.error(f"Error extracting diamond weight: {e}")
 
-                    diamond_weight_match = re.search(r"\d+[-/]?\d*/?\d*\s*ct\s*tw", product_name)
-                    diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                    # Additional product info
+                    try:
+                        # Check for product ID
+                        product_id = await product.get_attribute("data-id")
+                        if product_id:
+                            additional_info.append(f"Product ID: {product_id}")
+                        
+                        # Check for availability
+                        availability_elem = await product.query_selector(".stock-status")
+                        if availability_elem:
+                            availability = (await availability_elem.inner_text()).strip()
+                            if availability:
+                                additional_info.append(f"Availability: {availability}")
+                        
+                        # Check for badges or special tags
+                        badge_elements = await product.query_selector_all(".badge, .tag, .label")
+                        if badge_elements:
+                            badges = []
+                            for badge in badge_elements:
+                                badge_text = (await badge.inner_text()).strip()
+                                if badge_text and badge_text.lower() not in ["new", "sale", "hot"]:
+                                    badges.append(badge_text)
+                            if badges:
+                                additional_info.append(f"Tags: {', '.join(badges)}")
+                        
+                        # Check for color options
+                        color_elements = await product.query_selector_all(".color-option, .swatch-color")
+                        if color_elements:
+                            colors = []
+                            for color in color_elements:
+                                color_name = await color.get_attribute("title") or await color.get_attribute("alt") or await color.get_attribute("data-color")
+                                if color_name:
+                                    colors.append(color_name.strip())
+                            if colors:
+                                additional_info.append(f"Color options: {', '.join(set(colors))}")
+                    except Exception as e:
+                        logging.error(f"Error getting additional info: {e}")
 
-                    unique_id = str(uuid.uuid4())
+                    # Prepare additional info string
+                    additional_info_str = " | ".join(additional_info) if additional_info else "N/A"
+
+                    # Schedule image download
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    # Add to records
+                    records.append((
+                        unique_id, current_date, page_title, product_name, None, 
+                        kt, price, diamond_weight, time_only, image_url, additional_info_str
+                    ))
+                    sheet.append([
+                        current_date, page_title, product_name, None, 
+                        kt, price, diamond_weight, time_only, 
+                        image_url, additional_info_str
+                    ])
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -404,9 +565,13 @@ async def handle_larsenjewellery(url, max_pages):
                                 logging.error(f"Error adding image to Excel: {img_error}")
                                 image_path = "N/A"
                         
+                        # Update the image path in records
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (
+                                    record[0], record[1], record[2], record[3], image_path, 
+                                    record[5], record[6], record[7], record[8], record[9], record[10]
+                                )
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")
@@ -433,7 +598,6 @@ async def handle_larsenjewellery(url, max_pages):
             await asyncio.sleep(random.uniform(2, 5))
             
         page_count += 1
-
 
     # Final save and database operations
     wb.save(file_path)

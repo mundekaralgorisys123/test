@@ -65,8 +65,18 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
 
 
 def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    # Remove existing 'page=' parameter if present
+    base_url = re.sub(r'([?&])page=\d+', '', base_url)
+
+    # Add the page parameter
     separator = '&' if '?' in base_url else '?'
+
+    # Ensure no trailing ampersand
+    base_url = base_url.rstrip('&')
+
     return f"{base_url}{separator}page={page_count}&sort="
+
+
 
 async def handle_goldsmiths(url, max_pages):
     ip_address = get_public_ip()
@@ -82,21 +92,21 @@ async def handle_goldsmiths(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
     filename = f"handle_goldsmiths_{datetime.now().strftime('%Y-%m-%d_%H.%M')}.xlsx"
     file_path = os.path.join(EXCEL_DATA_PATH, filename)
 
-    page_count = 1
+    page_count = 0
     success_count = 0
 
     async with async_playwright() as p:
         while page_count <= max_pages:
+            
             current_url= build_url_with_loadmore(url, page_count)
-            # current_url = build_url_with_loadmore(url, page_count)
-            # logging.info(f"Processing page {page_count}: {current_url}")
+           
             browser = None
             page = None
             try:
@@ -136,9 +146,25 @@ async def handle_goldsmiths(url, max_pages):
 
                     try:
                         price_el = await product.query_selector("div.productTilePrice")
-                        price = (await price_el.inner_text()).strip()
-                    except:
+                        price_text = (await price_el.inner_text()).strip() if price_el else None
+
+                        if price_text:
+                            # Extract main price and check if there's a nested original price span
+                            was_price_el = await price_el.query_selector("span.productTileWasPrice")
+                            if was_price_el:
+                                was_price = (await was_price_el.inner_text()).strip()
+                                # Remove the was_price from the main text to avoid duplication
+                                sale_price = price_text.replace(was_price, "").strip()
+                                price = f"{sale_price} offer {was_price}"
+                            else:
+                                price = price_text
+                        else:
+                            price = "N/A"
+
+                    except Exception as e:
+                        print(f"Error extracting price: {e}")
                         price = "N/A"
+
 
                     try:
                         await product.scroll_into_view_if_needed()
@@ -161,22 +187,59 @@ async def handle_goldsmiths(url, max_pages):
                         image_url = urls[0] if urls else "N/A"
                     except Exception as e:
                         image_url = "N/A"
+                        
+                        
+                    additional_info = []
+
+                    try:
+                        brand_el = await product.query_selector("div.productTileBrand")
+                        brand = (await brand_el.inner_text()).strip() if brand_el else None
+                        if brand:
+                            additional_info.append(brand)
+
+                        name_el = await product.query_selector("div.productTileName")
+                        name = (await name_el.inner_text()).strip() if name_el else None
+                        if name:
+                            additional_info.append(name)
+
+                        finance_el = await product.query_selector("div.productTileIfc b")
+                        finance = (await finance_el.inner_text()).strip() if finance_el else None
+                        if finance:
+                            additional_info.append(f"Finance from £{finance} per month")
+                            
+                    
+                        discount_el = await product.query_selector("div.product-flag.sale-percentage-flag")
+                        discount = (await discount_el.inner_text()).strip() if discount_el else None
+                        if discount:
+                            additional_info.append(discount)
+                       
+
+                        if not additional_info:
+                            additional_info.append("N/A")
+
+                    except Exception as e:
+                        print(f"Error fetching additional info: {e}")
+                        additional_info.append("N/A")
+
+                    additional_info_str = " | ".join(additional_info)
+                        
 
 
-                    gold_type_match = re.search(r"\b\d+K\s+\w+\s+\w+\b", product_name)
+                    gold_type_match = re.search(r"\b(?:9|14|18|22|24)\s*(?:Carat|ct)\s*(?:White|Yellow|Rose)?\s*Gold\b", product_name, re.IGNORECASE)
                     kt = gold_type_match.group() if gold_type_match else "Not found"
 
 
-                    diamond_weight_match = re.search(r"\d+[-/]?\d*/?\d*\s*ct\s*tw", product_name)
+                    diamond_weight_match = re.search(r"\b\d+(?:\.\d+)?\s*(?:Carat|ct(?:tw)?)\b", product_name, re.IGNORECASE)
                     diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+
 
                     unique_id = str(uuid.uuid4())
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -227,16 +290,20 @@ async def handle_goldsmiths(url, max_pages):
         page_count += 1
 
     # # Final save and database operations
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
 
-    if len(all_records) == 0:
-        return None, None, None
-
-    insert_into_db(all_records)
-    update_product_count(len(all_records))
-
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
+    insert_into_db(all_records)
+    update_product_count(len(all_records))
+
+    # Return necessary information
     return base64_encoded, filename, file_path

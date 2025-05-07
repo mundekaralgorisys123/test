@@ -111,7 +111,7 @@ async def handle_goldmark(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -171,18 +171,25 @@ async def handle_goldmark(url, max_pages):
                         product_name = "N/A"
 
                     try:
-                        # Extract price using async query_selector and inner_text
                         price_now_tag = await product.query_selector("span.s-price__now")
-                        price_now = await price_now_tag.inner_text() if price_now_tag else None
-
                         price_was_tag = await product.query_selector("span.s-price__was")
-                        price_was = await price_was_tag.inner_text() if price_was_tag else None
+                        price_regular_tag = await product.query_selector("div.s-product__price span")
 
-                        # Prioritize current price if available
-                        price = price_now if price_now else price
+                        if price_now_tag:
+                            # Discounted product
+                            price_now = await price_now_tag.inner_text()
+                            price_was = await price_was_tag.inner_text() if price_was_tag else None
+                            price = f"{price_now} offer {price_was}" if price_was else price_now
+                        elif price_regular_tag:
+                            # Regular price only
+                            price = await price_regular_tag.inner_text()
+                        else:
+                            price = "N/A"
+
                     except Exception as e:
                         logging.warning(f"⚠️ Error extracting price: {e}")
                         price = "N/A"
+
 
                     try:
                         # Extract image element asynchronously
@@ -196,6 +203,33 @@ async def handle_goldmark(url, max_pages):
                     except Exception as e:
                         logging.warning(f"⚠️ Error extracting image URL: {e}")
                         image_url = "N/A"
+                        
+                    additional_info = []
+
+                    try:
+                       
+
+                        # Additionally check for 'Sale' flag
+                        sale_flag_el = await product.query_selector("div.s-product__flag.s-flag--sale")
+                        if sale_flag_el:
+                            sale_text = await sale_flag_el.inner_text()
+                            if sale_text:
+                                additional_info.append(sale_text.strip())
+
+                        if not additional_info:
+                            additional_info.append("N/A")
+
+                    except Exception as e:
+                        logging.warning(f"⚠️ Error extracting additional info: {e}")
+                        additional_info.append("N/A")
+
+                    additional_info_str = " | ".join(additional_info)
+    
+                        
+                        
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue      
 
 
 
@@ -212,8 +246,8 @@ async def handle_goldmark(url, max_pages):
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -230,7 +264,7 @@ async def handle_goldmark(url, max_pages):
                         
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")
@@ -259,14 +293,21 @@ async def handle_goldmark(url, max_pages):
         page_count += 1
 
 
-    # Final save and database operations
+    # # Final save and database operations
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
 
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

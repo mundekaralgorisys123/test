@@ -140,49 +140,45 @@ async def handle_finks(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", 
+               "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
-    filename = f"handle_finks_{datetime.now().strftime('%Y-%m-%d_%H.%M')}.xlsx"
+    filename = f"Finks_{datetime.now().strftime('%Y-%m-%d_%H.%M')}.xlsx"
     file_path = os.path.join(EXCEL_DATA_PATH, filename)
 
     page_count = 1
     success_count = 0
-    current_url = url
-    while page_count <= max_pages:
-        if page_count > 1:
-            if '#' in current_url:
-                base, fragment = url.split('#', 1)
-                current_url = f"{base}?page={page_count}#{fragment}"
-            else:
-                current_url = f"{url}?page={page_count}"
-        logging.info(f"Processing page {page_count}: {current_url}")
-        
-        # Create a new browser instance for each page
-        browser = None
-        page = None
-        try:
-            async with async_playwright() as p:
-                browser , page = await get_browser_with_proxy_strategy(p, current_url, ".product-card__img-wrapper")
+
+    async with async_playwright() as p:
+        while page_count <= max_pages:
+            current_url = f"{url}?page={page_count}" if page_count > 1 else url
+            logging.info(f"Processing page {page_count}: {current_url}")
+            
+            browser = None
+            page = None
+            try:
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, ".product-card__img-wrapper")
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all products
                 prev_product_count = 0
                 for _ in range(10):
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await asyncio.sleep(random.uniform(1, 2))  # Random delay between scrolls
+                    await asyncio.sleep(random.uniform(1, 2))
                     current_product_count = await page.locator('.product-card__img-wrapper').count()
                     if current_product_count == prev_product_count:
                         break
                     prev_product_count = current_product_count
 
+                products = await page.query_selector_all("li.ss__result")
+                if not products:
+                    logging.warning(f"No products found on page {page_count}")
+                    page_count += 1
+                    continue
 
-               
-                products = await page.query_selector_all("ul.ss__results > li.ss__result")
-                
                 logging.info(f"Total products found on page {page_count}: {len(products)}")
-
                 page_title = await page.title()
                 current_date = datetime.now().strftime("%Y-%m-%d")
                 time_only = datetime.now().strftime("%H.%M")
@@ -191,42 +187,91 @@ async def handle_finks(url, max_pages):
                 image_tasks = []
 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
-                    try:
-                        # Product name is in a nested <a> inside div.product-card__title
-                        product_name_elem = await product.query_selector("div.product-card__title a")
-                        product_name = await product_name_elem.inner_text() if product_name_elem else "N/A"
-                    except:
-                        product_name = "N/A"
-
-                    try:
-                        # Price is inside span with class "price-item--regular"
-                        price_elem = await product.query_selector("span.price-item--regular")
-                        price = await price_elem.inner_text() if price_elem else "N/A"
-                    except:
-                        price = "N/A"
-
-                    try:
-                        # Image is in img tag with class "product-card__img"
-                        img_elem = await product.query_selector("img.product-card__img")
-                        image_url = await img_elem.get_attribute("data-src") if img_elem else "N/A"
-                    except:
-                        image_url = "N/A"
-
-
-                    gold_type_match = re.findall(r"(\d{1,2}ct\s*(?:Yellow|White|Rose)?\s*Gold|Platinum)", product_name, re.IGNORECASE)
-                    kt = ", ".join(gold_type_match) if gold_type_match else "N/A"
-
-                    # Extract Diamond Weight (supports "1.85ct", "2ct", "1.50ct", etc.)
-                    diamond_weight_match = re.findall(r"(\d+(?:\.\d+)?\s*ct)", product_name, re.IGNORECASE)
-                    diamond_weight = ", ".join(diamond_weight_match) if diamond_weight_match else "N/A"
-
+                    additional_info = []
                     unique_id = str(uuid.uuid4())
-                    image_tasks.append((row_num, unique_id, asyncio.create_task(
-                        download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
-                    )))
+                    
+                    try:
+                        # Product Name
+                        product_name_elem = await product.query_selector("div.product-card__title a")
+                        product_name = (await product_name_elem.inner_text()).strip() if product_name_elem else "N/A"
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                        # Brand
+                        brand_elem = await product.query_selector("span.product-card__brand")
+                        brand = (await brand_elem.inner_text()).strip() if brand_elem else ""
+                        if brand:
+                            additional_info.append(f"Brand: {brand}")
+
+                        # Price handling
+                        price_info = []
+                        regular_price_elem = await product.query_selector("span.price-item--regular")
+                        if regular_price_elem:
+                            regular_price = (await regular_price_elem.inner_text()).strip()
+                            if regular_price:
+                                price_info.append(f"Price: {regular_price}")
+                        
+                        sale_price_elem = await product.query_selector("span.price-item--sale")
+                        if sale_price_elem:
+                            sale_price = (await sale_price_elem.inner_text()).strip()
+                            if sale_price:
+                                price_info.append(f"Sale: {sale_price}")
+                                if regular_price and sale_price:
+                                    try:
+                                        reg_num = float(re.sub(r'[^\d.]', '', regular_price))
+                                        sale_num = float(re.sub(r'[^\d.]', '', sale_price))
+                                        if reg_num > 0:
+                                            discount_pct = round((1 - (sale_num / reg_num)) * 100)
+                                            additional_info.append(f"Discount: {discount_pct}%")
+                                    except Exception as e:
+                                        logging.warning(f"Couldn't calculate discount: {e}")
+
+                        price = " | ".join(price_info) if price_info else "N/A"
+
+                        # Image URL
+                        img_elem = await product.query_selector("img.product-card__img")
+                        image_url = await img_elem.get_attribute("src") or await img_elem.get_attribute("data-src") if img_elem else "N/A"
+                        if image_url and image_url.startswith("//"):
+                            image_url = f"https:{image_url}"
+
+                        # Metal Type
+                        gold_type_match = re.findall(r"(\d{1,2}K\s*(?:Yellow|White|Rose)?\s*Gold|Platinum)", product_name, re.IGNORECASE)
+                        kt = ", ".join(gold_type_match) if gold_type_match else "N/A"
+
+                        # Diamond Weight
+                        diamond_weight_match = re.findall(r"(\d+(?:\.\d+)?\s*ct(?:\w*))", product_name, re.IGNORECASE)
+                        diamond_weight = ", ".join(diamond_weight_match) if diamond_weight_match else "N/A"
+
+                        # Additional product info
+                        rating_elem = await product.query_selector("div.product-card__rating")
+                        if rating_elem:
+                            rating_text = (await rating_elem.inner_text()).strip()
+                            if rating_text:
+                                additional_info.append(f"Rating: {rating_text}")
+
+                        additional_info_str = " | ".join(additional_info) if additional_info else ""
+
+                        # Schedule image download
+                        image_tasks.append((row_num, unique_id, asyncio.create_task(
+                            download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
+                        )))
+
+                        records.append((unique_id, current_date, page_title, product_name, None, 
+                                      kt, price, diamond_weight, additional_info_str))
+                        sheet.append([
+                            current_date, 
+                            page_title, 
+                            product_name, 
+                            None, 
+                            kt, 
+                            price, 
+                            diamond_weight, 
+                            time_only, 
+                            image_url,
+                            additional_info_str
+                        ])
+
+                    except Exception as e:
+                        logging.error(f"Error processing product: {str(e)}")
+                        continue
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -241,40 +286,38 @@ async def handle_finks(url, max_pages):
                                 logging.error(f"Error adding image to Excel: {img_error}")
                                 image_path = "N/A"
                         
+                        # Update record with image path
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], 
+                                            image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")
 
                 all_records.extend(records)
                 success_count += 1
-
-                # Save progress after each page
                 wb.save(file_path)
-                logging.info(f"Progress saved after page {page_count}")
+                logging.info(f"Saved {len(records)} products from page {page_count}")
 
-        except Exception as e:
-            logging.error(f"Error processing page {page_count}: {str(e)}")
-            # Save what we have so far
-            wb.save(file_path)
-        finally:
-            # Clean up resources for this page
-            if page:
-                await page.close()
-            if browser:
-                await browser.close()
+            except Exception as e:
+                logging.error(f"Error processing page {page_count}: {str(e)}", exc_info=True)
+                if page:
+                    await page.screenshot(path=f"error_page_{page_count}.png")
+                wb.save(file_path)
+            finally:
+                if page:
+                    await page.close()
+                if browser:
+                    await browser.close()
+                
+                await asyncio.sleep(random.uniform(2, 5))
             
-            # Add delay between pages
-            await asyncio.sleep(random.uniform(2, 5))
-            
-        page_count += 1
+            page_count += 1
 
-
-    # Final save and database operations
+    # Final operations
     wb.save(file_path)
-    log_event(f"Data saved to {file_path}")
+    logging.info(f"Scraping completed. Total products: {len(all_records)}")
 
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
