@@ -124,7 +124,9 @@ async def handle_jacobandco(url, max_pages=None):
         page = None
         try:
             async with async_playwright() as p:
-                browser, page = await get_browser_with_proxy_strategy(p,url,".sc-jkTopv")
+                product_wrapper = ".sc-jkTopv"
+                
+                browser, page = await get_browser_with_proxy_strategy(p,url,product_wrapper)
                 log_event(f"Successfully loaded: {url}")
 
                 # Scroll to load all items

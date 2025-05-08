@@ -155,6 +155,7 @@ async def safe_goto_and_wait(page, url,isbri_data, retries=2):
       
 
 async def get_browser_with_proxy_strategy(p, url: str):
+    
     """
     Dynamically checks robots.txt and selects proxy accordingly
     Always uses proxies - never scrapes directly

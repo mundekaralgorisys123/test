@@ -159,7 +159,8 @@ async def handle_finks(url, max_pages):
             browser = None
             page = None
             try:
-                browser, page = await get_browser_with_proxy_strategy(p, current_url, ".product-card__img-wrapper")
+                product_wrapper = '.product-card__img-wrapper'
+                browser, page = await get_browser_with_proxy_strategy(p, url, product_wrapper)
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all products

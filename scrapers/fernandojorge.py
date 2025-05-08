@@ -194,7 +194,9 @@ async def handle_fernandojorge(url, max_pages=None):
     try:
         async with async_playwright() as p:
             # Browser setup
-            browser, page = await get_browser_with_proxy_strategy(p, url, "div.grid")
+            # browser, page = await get_browser_with_proxy_strategy(p, url, "div.grid")
+            product_wrapper = 'div.grid'
+            browser, page = await get_browser_with_proxy_strategy(p, url, product_wrapper)
             await scroll_to_bottom(page)
             
             # Enhanced product data extraction with more fields

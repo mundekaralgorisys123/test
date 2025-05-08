@@ -117,7 +117,8 @@ async def handle_jennifermeyer(url, max_pages):
 
         try:
             async with async_playwright() as p:
-                browser, page = await get_browser_with_proxy_strategy(p, current_url, ".ns-d-flex")
+                product_wrapper = ".ns-d-flex"
+                browser, page = await get_browser_with_proxy_strategy(p, current_url,product_wrapper )
                 log_event(f"Successfully loaded: {current_url}")
             
                 # Scroll to load all items

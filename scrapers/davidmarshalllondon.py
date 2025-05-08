@@ -175,7 +175,11 @@ async def handle_davidmarshalllondon(url, max_pages=None):
     
     try:
         async with async_playwright() as p:
-            browser, page = await get_browser_with_proxy_strategy(p, url, "li.product")
+            
+            # browser, page = await get_browser_with_proxy_strategy(p, url, "li.product")
+            
+            product_wrapper = 'li.product'
+            browser, page = await get_browser_with_proxy_strategy(p, url, product_wrapper)
             log_event(f"Successfully loaded: {url}")
 
             # Scroll to load all items

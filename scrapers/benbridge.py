@@ -73,15 +73,9 @@ async def handle_benbridge(url, max_pages):
         while load_more_clicks <= max_pages:
             async with async_playwright() as p:
                 # Create a new browser instance for each page
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                page = await browser.new_page()
-
-                try:
-                    await page.goto(url, timeout=120000)
-                except Exception as e:
-                    logging.warning(f"Failed to load URL {url}: {e}")
-                    await browser.close()
-                    continue  # move to the next iteration
+                
+                product_wrapper = '.col-sm-12.col-lg-9'
+                browser, page = await get_browser_with_proxy_strategy(p, url, product_wrapper)
 
                 # Simulate clicking 'Load More' number of times
                 for _ in range(load_more_clicks - 1):

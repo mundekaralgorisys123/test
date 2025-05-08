@@ -129,7 +129,9 @@ async def handle_gabriel(url, max_pages):
         page = None
         try:
             async with async_playwright() as p:
-                browser, page = await get_browser_with_proxy_strategy(p, current_url,".ProductCardWrapper")
+                product_wrapper = '.ProductCardWrapper'
+                browser, page = await get_browser_with_proxy_strategy(p, url, product_wrapper)
+                # browser, page = await get_browser_with_proxy_strategy(p, current_url,".ProductCardWrapper")
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all items

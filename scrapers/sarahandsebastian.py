@@ -116,7 +116,8 @@ async def handle_sarahandsebastian(url, max_pages):
                 current_url = f"{url}?page={page_count}"
         try:
             async with async_playwright() as p:
-                browser, page = await get_browser_with_proxy_strategy(p, current_url, ".grid")
+                product_wrapper = ".grid"
+                browser, page = await get_browser_with_proxy_strategy(p, current_url,product_wrapper )
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all items
