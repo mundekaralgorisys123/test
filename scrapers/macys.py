@@ -8,22 +8,29 @@ import random
 import time
 from datetime import datetime
 from io import BytesIO
-import mimetypes
+from PIL import Image
 import httpx
 from PIL import Image as PILImage
 from openpyxl import Workbook
-from openpyxl.drawing.image import Image
+from openpyxl.drawing.image import Image as XLImage
 from flask import Flask
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError, Error
-from PIL import Image
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
-from proxysetup import get_browser_with_proxy_strategy
+# from proxysetup import get_browser_with_proxy_strategy
+import traceback
+from typing import List, Tuple
+load_dotenv()
+PROXY_URL = os.getenv("PROXY_URL")
+
+
+PROXY_SERVER = os.getenv("PROXY_SERVER")
+PROXY_USERNAME = os.getenv("PROXY_USERNAME")
+PROXY_PASSWORD = os.getenv("PROXY_PASSWORD")
+
 # Load environment
-
-
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
@@ -41,7 +48,6 @@ def resize_image(image_data, max_size=(100, 100)):
         return image_data
 
 # Transform URL to get high-res image
-
 def modify_image_url(image_url):
     """Enhance Macy's image URL to get higher resolution version"""
     if not image_url or image_url == "N/A":
@@ -57,12 +63,11 @@ def modify_image_url(image_url):
     return modified_url
 
 
-# Async image downloader
-mimetypes.add_type('image/webp', '.webp')
+# Function to download image asynchronously
 async def download_image_async(image_url, product_name, timestamp, image_folder, unique_id, retries=3):
     if not image_url or image_url == "N/A":
         return "N/A"
-
+    
     image_filename = f"{unique_id}_{timestamp}.jpg"
     image_full_path = os.path.join(image_folder, image_filename)
     modified_url = modify_image_url(image_url)
@@ -72,20 +77,39 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
             try:
                 response = await client.get(modified_url)
                 response.raise_for_status()
-                with open(image_full_path, "wb") as f:
-                    f.write(response.content)
+                
+                # Detect WebP using content instead of URL
+                image_data = BytesIO(response.content)
+                try:
+                    img = Image.open(image_data)
+                    if img.format.lower() == 'webp':
+                        # Convert WebP to JPEG
+                        img = img.convert("RGB")
+                        img.save(image_full_path, "JPEG", quality=85)
+                    else:
+                        # Save as JPEG regardless of original format to ensure compatibility
+                        img.save(image_full_path, "JPEG", quality=85)
+                except Exception as e:
+                    logging.error(f"Error processing image for {product_name}: {e}")
+                    raise
+                
                 return image_full_path
             except httpx.RequestError as e:
                 logging.warning(f"Retry {attempt + 1}/{retries} - Error downloading {product_name}: {e}")
+                if attempt < retries - 1:
+                    await asyncio.sleep(random.uniform(1, 3))  # Add delay before retry
+            except Exception as e:
+                logging.warning(f"Error processing image for {product_name}: {e}")
+                if attempt < retries - 1:
+                    await asyncio.sleep(random.uniform(1, 3))
+    
     logging.error(f"Failed to download {product_name} after {retries} attempts.")
     return "N/A"
+
 
 # Human-like delay
 def random_delay(min_sec=1, max_sec=3):
     time.sleep(random.uniform(min_sec, max_sec))
-
-
-
 
 def build_macys_pagination_url(base_url: str, page_index: int) -> str:
     if page_index == 0:
@@ -97,10 +121,186 @@ def build_macys_pagination_url(base_url: str, page_index: int) -> str:
         path = parts[0]
         query = f"?{parts[1]}" if len(parts) > 1 else ""
         return f"{path}/Pageindex/{page_index}{query}"
+
+
+
+def convert_webp_to_jpg(image_path):
+    if image_path.lower().endswith(".webp"):
+        jpg_path = image_path.rsplit(".", 1)[0] + ".jpg"
+        try:
+            with Image.open(image_path).convert("RGB") as img:
+                img.save(jpg_path, "JPEG")
+            os.remove(image_path)  # Remove the original .webp
+            return jpg_path
+        except Exception as e:
+            logging.error(f"Failed to convert WEBP to JPG: {e}")
+            return "N/A"
+    return image_path
+
+
+
+########################################  safe_goto_and_wait ####################################################################
+
+
+async def safe_goto_and_wait(page, url,isbri_data, retries=2):
+    for attempt in range(retries):
+        try:
+            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
+            
+            if isbri_data:
+                await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
+            else:
+                await page.goto(url, wait_until="domcontentloaded", timeout=180_000)
+
+            # Wait for the selector with a longer timeout
+            product_cards = await page.wait_for_selector(".product-thumbnail-container", state="attached", timeout=30000)
+
+            # Optionally validate at least 1 is visible (Playwright already does this)
+            if product_cards:
+                print("[Success] Product cards loaded.")
+                return
+        except Error as e:
+            logging.error(f"Error navigating to {url} on attempt {attempt + 1}: {e}")
+            if attempt < retries - 1:
+                logging.info("Retrying after waiting a bit...")
+                random_delay(1, 3)  # Add a delay before retrying
+            else:
+                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
+                raise
+        except TimeoutError as e:
+            logging.warning(f"TimeoutError on attempt {attempt + 1} navigating to {url}: {e}")
+            if attempt < retries - 1:
+                logging.info("Retrying after waiting a bit...")
+                random_delay(1, 3)  # Add a delay before retrying
+            else:
+                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
+                raise
+
+
+########################################  get browser with proxy ####################################################################
+      
+
+async def get_browser_with_proxy_strategy(p, url: str):
+    """
+    Dynamically checks robots.txt and selects proxy accordingly
+    Always uses proxies - never scrapes directly
+    """
+    parsed_url = httpx.URL(url)
+    base_url = f"{parsed_url.scheme}://{parsed_url.host}"
     
+    # 1. Fetch and parse robots.txt
+    disallowed_patterns = await get_robots_txt_rules(base_url)
+    
+    # 2. Check if URL matches any disallowed pattern
+    is_disallowed = check_url_against_rules(str(parsed_url), disallowed_patterns)
+    
+    # 3. Try proxies in order (bri-data first if allowed, oxylabs if disallowed)
+    proxies_to_try = [
+        PROXY_URL if not is_disallowed else {
+            "server": PROXY_SERVER,
+            "username": PROXY_USERNAME,
+            "password": PROXY_PASSWORD
+        },
+        {  # Fallback to the other proxy
+            "server": PROXY_SERVER,
+            "username": PROXY_USERNAME,
+            "password": PROXY_PASSWORD
+        } if not is_disallowed else PROXY_URL
+    ]
+
+    last_error = None
+    for proxy_config in proxies_to_try:
+        browser = None
+        try:
+            isbri_data = False
+            if proxy_config == PROXY_URL:
+                logging.info("Attempting with bri-data proxy (allowed by robots.txt)")
+                browser = await p.chromium.connect_over_cdp(PROXY_URL)
+                isbri_data = True
+            else:
+                logging.info("Attempting with oxylabs proxy (required by robots.txt)")
+                browser = await p.chromium.launch(
+                    proxy=proxy_config,
+                    headless=True,
+                    args=[
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-web-security'
+                    ]
+                )
+
+            context = await browser.new_context()
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                })
+            """)
+            page = await context.new_page()
+            
+            await safe_goto_and_wait(page, url,isbri_data)
+            return browser, page
+
+        except Exception as e:
+            last_error = e
+            error_trace = traceback.format_exc()
+            logging.error(f"Proxy attempt failed:\n{error_trace}")
+            if browser:
+                await browser.close()
+            continue
+
+    error_msg = (f"Failed to load {url} using all proxy options. "
+                f"Last error: {str(last_error)}\n"
+                f"URL may be disallowed by robots.txt or proxies failed.")
+    logging.error(error_msg)
+    raise RuntimeError(error_msg)
+
+
+
+
+async def get_robots_txt_rules(base_url: str) -> List[str]:
+    """Dynamically fetch and parse robots.txt rules"""
+    robots_url = f"{base_url}/robots.txt"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(robots_url, timeout=10)
+            if resp.status_code == 200:
+                return [
+                    line.split(":", 1)[1].strip()
+                    for line in resp.text.splitlines()
+                    if line.lower().startswith("disallow:")
+                ]
+    except Exception as e:
+        logging.warning(f"Couldn't fetch robots.txt: {e}")
+    return []
+
+
+def check_url_against_rules(url: str, disallowed_patterns: List[str]) -> bool:
+    """Check if URL matches any robots.txt disallowed pattern"""
+    for pattern in disallowed_patterns:
+        try:
+            # Handle wildcard patterns
+            if "*" in pattern:
+                regex_pattern = pattern.replace("*", ".*")
+                if re.search(regex_pattern, url):
+                    return True
+            # Handle path patterns
+            elif url.startswith(f"{pattern}"):
+                return True
+            # Handle query parameters
+            elif ("?" in url) and any(
+                f"{param}=" in url 
+                for param in pattern.split("=")[0].split("*")[-1:]
+                if "=" in pattern
+            ):
+                return True
+        except Exception as e:
+            logging.warning(f"Error checking pattern {pattern}: {e}")
+    return False
+
+
     
 async def handle_macys(url, max_pages):
     ip_address = get_public_ip()
+    
     logging.info(f"Scraping started for: {url} from IP: {ip_address}, max_pages: {max_pages}")
 
     os.makedirs(EXCEL_DATA_PATH, exist_ok=True)
@@ -129,18 +329,8 @@ async def handle_macys(url, max_pages):
             page = None
             try:
                 product_wrapper = ".product-thumbnail-container"
-                browser, page = await get_browser_with_proxy_strategy(p, current_url, product_wrapper)
+                browser, page = await get_browser_with_proxy_strategy(p, current_url)
                 log_event(f"Successfully loaded: {current_url}")
-
-                # Scroll to load all items
-                prev_count = 0
-                for _ in range(10):
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await asyncio.sleep(random.uniform(1, 2))
-                    count = await page.locator('.v-carousel-content').count()
-                    if count == prev_count:
-                        break
-                    prev_count = count
 
                 page_title = await page.title()
                 current_date = datetime.now().strftime("%Y-%m-%d")
@@ -148,7 +338,7 @@ async def handle_macys(url, max_pages):
 
                 product_container = page.locator("ul.grid-x.small-up-2").first
                 products = await product_container.locator("li.cell.sortablegrid-product").all()
-                
+
                 logging.info(f"Total products scraped: {len(products)}")
                 records = []
                 image_tasks = []
@@ -164,117 +354,64 @@ async def handle_macys(url, max_pages):
                     except:
                         product_name = "N/A"
 
-                    # Price handling - capture both current and original price
                     price_info = []
                     try:
-                        # Current price
-                        discount_tag = product.locator("span.discount.is-tier2")
-                        if await discount_tag.count() > 0:
-                            discounted_text = await discount_tag.text_content()
-                            current_price = discounted_text.strip().split("(")[0].strip()
-                            price_info.append(current_price)
-                            
-                            # Original price
-                            original_price_tag = product.locator("span.price-strike-sm")
-                            if await original_price_tag.count() > 0:
-                                original_price = (await original_price_tag.text_content()).strip()
-                                if original_price and original_price != current_price:
-                                    price_info.append(original_price)
-                                    
-                                    # Discount percentage
-                                    discount_pct_tag = product.locator("span.sale-percent.percent-small")
-                                    if await discount_pct_tag.count() > 0:
-                                        discount_pct = await discount_pct_tag.text_content()
-                                        additional_info.append(f"Discount: {discount_pct.strip()}")
-                                    else:
-                                        try:
-                                            current_num = float(current_price.replace('INR', '').replace(',', '').strip())
-                                            original_num = float(original_price.replace('INR', '').replace(',', '').strip())
-                                            discount_pct = round((1 - (current_num / original_num)) * 100)
-                                            additional_info.append(f"Discount: {discount_pct}%")
-                                        except:
-                                            pass
-                        else:
-                            # Regular price
+                        # Current price and discount percentage
+                        current_price_tag = product.locator("span.discount.is-tier2")
+                        if await current_price_tag.count() > 0:
+                            current_price_text = await current_price_tag.text_content()
+                            current_price = current_price_text.strip().split(" ")[1]  # Extract price, ignore the "INR" part
+                            discount_pct = current_price_text.strip().split("(")[-1].replace(")", "").strip()  # Extract discount percent
+                            if current_price:
+                                price_info.append(f"Current price: INR {current_price}")
+                            if discount_pct:
+                                price_info.append(f"Discount: {discount_pct}")
+
+                        # Original price (strikethrough)
+                        original_price_tag = product.locator("span.price-strike-sm")
+                        if await original_price_tag.count() > 0:
+                            original_price = await original_price_tag.text_content()
+                            if original_price:
+                                price_info.append(f"Original price: INR {original_price.strip()}")
+
+                        # Fallback to regular price if no sale price is found
+                        if not price_info:
                             regular_price_tag = product.locator("span.price-reg.is-tier1")
                             if await regular_price_tag.count() > 0:
-                                price_info.append((await regular_price_tag.text_content()).strip())
+                                regular_price = await regular_price_tag.text_content()
+                                if regular_price:
+                                    price_info.append(f"Regular price: INR {regular_price.strip()}")
+
                     except Exception as e:
                         logging.warning(f"Error extracting price: {e}")
                         price_info = ["N/A"]
-                    
+
+                    # Final formatted price output
                     price = " | ".join(price_info) if price_info else "N/A"
+
 
                     # Image extraction with fallbacks
                     try:
-                        image_tag = product.locator('img[ref_key="imageRef"]').first
-                        if await image_tag.count() > 0:
-                            image_url = await image_tag.get_attribute("data-src") or await image_tag.get_attribute("src") or "N/A"
-                            if image_url and image_url.startswith("//"):
-                                image_url = f"https:{image_url}"
+                        active_slideshow = product.locator('li.slideshow-item.active .picture-container source').first
+                        if await active_slideshow.count() > 0:
+                            image_url = await active_slideshow.get_attribute("srcset")
                         else:
                             image_url = "N/A"
-                    except:
+                    except Exception as e:
                         image_url = "N/A"
 
-                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                    if product_name == "N/A" and price == "N/A" and image_url == "N/A":
                         print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
                         continue
 
-
-                    # Material Type (more general than just gold)
                     material_pattern = r"\b\d{1,2}K\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSterling Silver\b|\bTitanium\b"
                     material_match = re.search(material_pattern, product_name, re.IGNORECASE)
                     material = material_match.group() if material_match else "N/A"
 
-                    # Size/Weight (more generic than just diamond weight)
                     size_weight_pattern = r"(\d+(?:\.\d+)?\s*(?:ct|ctw|carat|inch|cm|mm)\b)"
                     size_weight_match = re.search(size_weight_pattern, product_name, re.IGNORECASE)
                     size_weight = size_weight_match.group() if size_weight_match else "N/A"
 
-                    # Additional product info
-                    try:
-                        # Check for promotions/badges
-                        promo_badge = product.locator("div.corner-badge")
-                        if await promo_badge.count() > 0:
-                            promo_text = await promo_badge.text_content()
-                            additional_info.append(f"Promo: {promo_text.strip()}")
-                        
-                        bonus_offer = product.locator("div.badge-wrapper span")
-                        if await bonus_offer.count() > 0:
-                            offer_text = await bonus_offer.text_content()
-                            if offer_text.strip():
-                                additional_info.append(f"Bonus: {offer_text.strip()}")
-                    except:
-                        pass
-
-                    try:
-                        # Check for ratings
-                        rating_container = product.locator("span.review-star-wrapper")
-                        if await rating_container.count() > 0:
-                            rating_aria = await rating_container.get_attribute("aria-label")
-                            if rating_aria:
-                                additional_info.append(f"Rating: {rating_aria.replace('Rated ', '').replace(' stars', '')}")
-                            
-                            review_count = product.locator("span.rating-description span")
-                            if await review_count.count() > 0:
-                                count_text = await review_count.text_content()
-                                if count_text.isdigit():
-                                    additional_info.append(f"Reviews: {count_text}")
-                    except:
-                        pass
-
-                    try:
-                        # Check for product brand
-                        brand_tag = product.locator("div.product-brand.medium")
-                        if await brand_tag.count() > 0:
-                            brand_text = await brand_tag.text_content()
-                            if brand_text.strip():
-                                additional_info.append(f"Brand: {brand_text.strip()}")
-                    except:
-                        pass
-
-                    # Combine all additional info with pipe delimiter
                     additional_info_str = " | ".join(additional_info) if additional_info else ""
 
                     unique_id = str(uuid.uuid4())
@@ -296,25 +433,43 @@ async def handle_macys(url, max_pages):
                         additional_info_str
                     ])
 
+                # import asyncio
+                # import logging
+                # from openpyxl.drawing.image import Image as XLImage
+                # from PIL import Image
+                # from io import BytesIO
+
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
                     try:
+                        # Wait for the image download task
                         image_path = await asyncio.wait_for(task, timeout=60)
+                        
+                        # image_path = convert_webp_to_jpg(image_path)
+                        
+                        # If image download is successful and not "N/A"
                         if image_path != "N/A":
                             try:
-                                img = Image(image_path)
+                                img = XLImage(image_path)
                                 img.width, img.height = 100, 100
                                 sheet.add_image(img, f"D{row_num}")
                             except Exception as e:
                                 logging.error(f"Error embedding image: {e}")
                                 image_path = "N/A"
+
+                                                    
+                           
                         
+                        # Update the records with the image path
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
                                 records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
+
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")
+                    except Exception as e:
+                        logging.error(f"Error processing image task for row {row_num}, unique_id {unique_id}: {e}")
 
                 all_records.extend(records)
                 success_count += 1
@@ -339,6 +494,7 @@ async def handle_macys(url, max_pages):
 
     if not all_records:
         return None, None, None
+
     # Final save and database operations
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")

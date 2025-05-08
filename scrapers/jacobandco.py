@@ -20,7 +20,7 @@ from database import insert_into_db
 from limit_checker import update_product_count
 import json
 import mimetypes
-
+from proxysetup import get_browser_with_proxy_strategy
 # Load environment
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
@@ -110,7 +110,7 @@ async def handle_jacobandco(url, max_pages=None):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -118,17 +118,13 @@ async def handle_jacobandco(url, max_pages=None):
     file_path = os.path.join(EXCEL_DATA_PATH, filename)
     prev_prod_cout = 0
     load_more_clicks = 1
+    
     while load_more_clicks <= max_pages:
         browser = None
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(1200000)
-
-                await safe_goto_and_wait(page, url)
+                browser, page = await get_browser_with_proxy_strategy(p,url,".sc-jkTopv")
                 log_event(f"Successfully loaded: {url}")
 
                 # Scroll to load all items
@@ -155,6 +151,8 @@ async def handle_jacobandco(url, max_pages=None):
                 image_tasks = []
                 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
+                    additional_info = []
+                    
                     try:
                         name_tag = await product.query_selector("[data-product-type='title']")
                         product_name = (await name_tag.inner_text()).strip() if name_tag else "N/A"
@@ -162,8 +160,18 @@ async def handle_jacobandco(url, max_pages=None):
                         product_name = "N/A"
 
                     try:
+                        # Handle price - check for both original and discounted price
                         price_tag = await product.query_selector("[data-product-type='price']")
-                        price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
+                        compare_price_tag = await product.query_selector(".product-price__compare")
+                        
+                        current_price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
+                        compare_price = (await compare_price_tag.inner_text()).strip() if compare_price_tag else None
+                        
+                        if compare_price and compare_price != current_price:
+                            price = f"{current_price}|{compare_price}"
+                            additional_info.append(f"Discount: {compare_price} → {current_price}")
+                        else:
+                            price = current_price
                     except Exception:
                         price = "N/A"
 
@@ -189,21 +197,82 @@ async def handle_jacobandco(url, max_pages=None):
                     except Exception:
                         product_description = ""
 
+                    # Extract gold type
                     gold_type_pattern = r"\b\d{1,2}(?:K|ct)?\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSterling Silver\b"
                     gold_type_match = re.search(gold_type_pattern, product_description or product_name, re.IGNORECASE)
                     kt = gold_type_match.group() if gold_type_match else "Not found"
 
+                    # Extract diamond weight
                     diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw)\b"
                     diamond_weight_match = re.search(diamond_weight_pattern, product_description or product_name, re.IGNORECASE)
                     diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+
+                    # Collect additional product information
+                    try:
+                        # Check for availability
+                        availability_tag = await product.query_selector(".product-availability")
+                        if availability_tag:
+                            availability = (await availability_tag.inner_text()).strip()
+                            additional_info.append(f"Availability: {availability}")
+                    except Exception:
+                        pass
+
+                    try:
+                        # Check for product options (like size, color)
+                        options = await product.query_selector_all(".product-option-item")
+                        if options:
+                            option_texts = []
+                            for option in options:
+                                option_text = (await option.inner_text()).strip()
+                                if option_text:
+                                    option_texts.append(option_text)
+                            if option_texts:
+                                additional_info.append(f"Options: {'|'.join(option_texts)}")
+                    except Exception:
+                        pass
+
+                    try:
+                        # Check for product badges (like "New", "Sale")
+                        badges = await product.query_selector_all(".product-badge")
+                        if badges:
+                            badge_texts = []
+                            for badge in badges:
+                                badge_text = (await badge.inner_text()).strip()
+                                if badge_text:
+                                    badge_texts.append(badge_text)
+                            if badge_texts:
+                                additional_info.append(f"Badges: {'|'.join(badge_texts)}")
+                    except Exception:
+                        pass
+
+                    try:
+                        # Check for rating information
+                        rating_tag = await product.query_selector(".product-rating")
+                        if rating_tag:
+                            rating = (await rating_tag.inner_text()).strip()
+                            additional_info.append(f"Rating: {rating}")
+                    except Exception:
+                        pass
+
+                    try:
+                        # Check for shipping information
+                        shipping_tag = await product.query_selector(".shipping-info")
+                        if shipping_tag:
+                            shipping = (await shipping_tag.inner_text()).strip()
+                            additional_info.append(f"Shipping: {shipping}")
+                    except Exception:
+                        pass
+
+                    # Combine all additional info with pipe delimiter
+                    additional_info_str = "|".join(additional_info) if additional_info else ""
 
                     unique_id = str(uuid.uuid4())
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, product_description, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, product_description, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, product_description, kt, price, diamond_weight, additional_info_str))
+                    sheet.append([current_date, page_title, product_name, product_description, kt, price, diamond_weight, time_only, image_url, additional_info_str])
                             
                 # Process image downloads
                 for row_num, unique_id, task in image_tasks:
@@ -219,10 +288,11 @@ async def handle_jacobandco(url, max_pages=None):
                                 image_path = "N/A"
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")
+                
                 load_more_clicks += 1
                 all_records.extend(records)
                 wb.save(file_path)

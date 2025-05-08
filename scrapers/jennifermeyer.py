@@ -18,7 +18,7 @@ from playwright.async_api import async_playwright, TimeoutError, Error
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
-
+from proxysetup import get_browser_with_proxy_strategy
 # Load environment
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
@@ -95,7 +95,8 @@ async def handle_jennifermeyer(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", 
+               "Time", "ImagePath", "Additional Info"]  # Added Additional Info column
     sheet.append(headers)
 
     all_records = []
@@ -107,17 +108,16 @@ async def handle_jennifermeyer(url, max_pages):
     while (page_count <= max_pages):
         logging.info(f"Processing page {page_count}: {current_url}")
         browser = None
-        context = None
+        page = None
         if page_count > 1:
-            current_url = f"{url}?p={page_count}"
+            if '?' in current_url:
+                current_url = f"{url}&p={page_count}"
+            else:
+                current_url = f"{url}?p={page_count}"
+
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(120000)
-
-                await safe_goto_and_wait(page, current_url)
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, ".ns-d-flex")
                 log_event(f"Successfully loaded: {current_url}")
             
                 # Scroll to load all items
@@ -141,46 +141,118 @@ async def handle_jennifermeyer(url, max_pages):
                 image_tasks = []
 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
+                    additional_info = []
+                    
                     try:
                         name_tag = await product.query_selector("div.ns-clipped")
                         product_name = (await name_tag.inner_text()).strip() if name_tag else "N/A"
                     except Exception:
                         product_name = "N/A"
 
+                    # Handle price - check for both original and discounted prices
+                    price = "N/A"
                     try:
-                        price_tag = await product.query_selector("div.category-product__price span:first-child")
-                        price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
+                        price_container = await product.query_selector("div.category-product__price")
+                        if price_container:
+                            current_price = await price_container.query_selector("span:first-child")
+                            original_price = await price_container.query_selector("span.ns-text-striked")
+                            
+                            if current_price and original_price:
+                                current_price_text = (await current_price.inner_text()).strip()
+                                original_price_text = (await original_price.inner_text()).strip()
+                                price = f"{current_price_text}|{original_price_text}"
+                                additional_info.append(f"Discount: {original_price_text}→{current_price_text}")
+                            elif current_price:
+                                price = (await current_price.inner_text()).strip()
                     except Exception:
                         price = "N/A"
 
+                    # Get product description if available
                     try:
-                        # Get the image directly from the img tag's src attribute
+                        description = await product.query_selector("div.category-product__description")
+                        if description:
+                            desc_text = (await description.inner_text()).strip()
+                            if desc_text and desc_text != "N/A":
+                                additional_info.append(f"Description: {desc_text}")
+                    except Exception:
+                        pass
+
+                    # Get product colors/variants if available
+                    try:
+                        color_options = await product.query_selector_all("div.color-option, div.swatch-option")
+                        if color_options:
+                            colors = []
+                            for color in color_options:
+                                color_text = (await color.inner_text()).strip()
+                                if color_text and color_text != "N/A":
+                                    colors.append(color_text)
+                            if colors:
+                                additional_info.append(f"Colors: {'|'.join(colors)}")
+                    except Exception:
+                        pass
+
+                    # Get availability status
+                    try:
+                        availability = await product.query_selector("div.stock-status, span.availability")
+                        if availability:
+                            avail_text = (await availability.inner_text()).strip()
+                            if avail_text and avail_text != "N/A":
+                                additional_info.append(f"Availability: {avail_text}")
+                    except Exception:
+                        pass
+
+                    # Get any badges (new, sale, etc.)
+                    try:
+                        badges = await product.query_selector_all("span.badge, div.product-badge")
+                        if badges:
+                            badge_texts = []
+                            for badge in badges:
+                                badge_text = (await badge.inner_text()).strip()
+                                if badge_text and badge_text != "N/A":
+                                    badge_texts.append(badge_text)
+                            if badge_texts:
+                                additional_info.append(f"Badges: {'|'.join(badge_texts)}")
+                    except Exception:
+                        pass
+
+                    # Get image URL
+                    try:
                         image_tag = await product.query_selector("img.ns-w-100")
                         if image_tag:
                             image_url = await image_tag.get_attribute("src")
-                            # Clean up the image URL by removing the version parameter if needed
                             if image_url and image_url != "N/A":
                                 image_url = image_url.split('?v=')[0]
+                                # Add image alt text if available
+                                alt_text = await image_tag.get_attribute("alt")
+                                if alt_text and alt_text != "N/A" and alt_text != product_name:
+                                    additional_info.append(f"Image Alt: {alt_text}")
                         else:
                             image_url = "N/A"
                     except Exception:
                         image_url = "N/A"
 
+                    # Extract gold type
                     gold_type_pattern = r"\b\d{1,2}(?:K|ct)?\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSterling Silver\b"
                     gold_type_match = re.search(gold_type_pattern, product_name, re.IGNORECASE)
                     kt = gold_type_match.group() if gold_type_match else "Not found"
 
+                    # Extract diamond weight
                     diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw)\b"
                     diamond_weight_match = re.search(diamond_weight_pattern, product_name, re.IGNORECASE)
                     diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+
+                    # Combine all additional info with | separator
+                    additional_info_text = " | ".join(additional_info) if additional_info else ""
 
                     unique_id = str(uuid.uuid4())
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, 
+                                  diamond_weight, additional_info_text))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, 
+                                diamond_weight, time_only, image_url, additional_info_text])
 
                 for row_num, unique_id, task in image_tasks:
                     try:
@@ -195,7 +267,8 @@ async def handle_jennifermeyer(url, max_pages):
                                 image_path = "N/A"
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, 
+                                             record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")

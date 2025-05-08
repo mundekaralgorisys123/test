@@ -19,6 +19,7 @@ from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
 import json
+from proxysetup import get_browser_with_proxy_strategy
 # Load environment
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
@@ -103,11 +104,11 @@ async def handle_mariemass(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
-    filename = f"handle_moriemass_{datetime.now().strftime('%Y-%m-%d_%H.%M')}.xlsx"
+    filename = f"handle_mariemass_{datetime.now().strftime('%Y-%m-%d_%H.%M')}.xlsx"
     file_path = os.path.join(EXCEL_DATA_PATH, filename)
 
     page_count = 1
@@ -117,15 +118,13 @@ async def handle_mariemass(url, max_pages):
         browser = None
         context = None
         if page_count > 1:
-            current_url = f"{url}?page={page_count}"
+            if '?' in current_url:
+                current_url = f"{url}&page={page_count}"
+            else:
+                current_url = f"{url}?page={page_count}"
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(120000)
-
-                await safe_goto_and_wait(page, current_url)
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, ".collection__main")
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all items
@@ -147,45 +146,72 @@ async def handle_mariemass(url, max_pages):
                 logging.info(f"Total products scraped:{page_count} :{len(products)}")
                 records = []
                 image_tasks = []
-                print(f"Total products found: {len(products)}")
+                
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
+                    additional_info = []
+                    
                     try:
                         name_tag = await product.query_selector("a.product-title")
                         product_name = (await name_tag.inner_text()).strip() if name_tag else "N/A"
                     except Exception:
                         product_name = "N/A"
 
+                    # Enhanced price extraction
                     try:
-                        price_tag = await product.query_selector("sale-price span.money")
-                        price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
-                        # Clean price text
-                        price = price.replace('€', '').replace(',', '').strip() if price != "N/A" else "N/A"
+                        price_tags = await product.query_selector_all("sale-price span.money")
+                        prices = []
+                        for price_tag in price_tags:
+                            price_text = (await price_tag.inner_text()).strip()
+                            if price_text:
+                                # Clean and format price
+                                clean_price = price_text.replace('€', '').replace('EUR', '').strip()
+                                if clean_price:
+                                    prices.append(f"€{clean_price}")
+                        
+                        if len(prices) > 1:
+                            price = " | ".join(prices)
+                            additional_info.append("Multiple prices available")
+                        elif prices:
+                            price = prices[0]
+                        else:
+                            price = "N/A"
                     except Exception:
                         price = "N/A"
 
+                    # Enhanced image extraction
                     try:
-                        # Get the primary image (first image in the media container)
+                        # Try to get primary image first
                         image_container = await product.query_selector("img.product-card__image--primary")
                         if image_container:
-                            # Get the src attribute which contains the image URL
-                            image_url = await image_container.get_attribute("src") or "N/A"
+                            # Get srcset to find highest resolution image
+                            srcset = await image_container.get_attribute("srcset")
+                            if srcset:
+                                sources = [s.strip().split() for s in srcset.split(',') if s.strip()]
+                                sources.sort(key=lambda x: int(x[1].replace('w', ''))) # Sort by width
+                                image_url = sources[-1][0] if sources else await image_container.get_attribute("src")
+                            else:
+                                image_url = await image_container.get_attribute("src")
                         else:
-                            image_url = "N/A"
+                            # Fallback to secondary image
+                            image_container = await product.query_selector("img.product-card__image--secondary")
+                            image_url = await image_container.get_attribute("src") if image_container else "N/A"
                     except Exception:
                         image_url = "N/A"
+                    
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue
 
-                    # Extract metal type from product name or variant data
+                    # Extract metal type and other product details
                     metal_type = "N/A"
                     try:
-                        # Check if there's a product-card element with variant data
-                        product_card = await product.query_selector("product-card")
-                        if product_card:
-                            variant_data = await product_card.get_attribute("data-current_variant")
-                            if variant_data:
-                                variant_json = json.loads(variant_data)
-                                # Extract metal type from options
-                                if "options" in variant_json and len(variant_json["options"]) >= 2:
-                                    metal_type = variant_json["options"][1]  # Assuming metal type is the second option
+                        # Check for variant data in product-card element
+                        variant_data = await product.get_attribute("data-current_variant")
+                        if variant_data:
+                            variant_json = json.loads(variant_data)
+                            if "options" in variant_json and len(variant_json["options"]) >= 2:
+                                metal_type = variant_json["options"][1]  # Assuming metal type is the second option
+                                additional_info.append(f"Variant: {variant_json['options'][0]}")  # First option
                     except Exception:
                         pass
 
@@ -195,18 +221,52 @@ async def handle_mariemass(url, max_pages):
                         gold_type_match = re.search(gold_type_pattern, product_name, re.IGNORECASE)
                         metal_type = gold_type_match.group() if gold_type_match else "N/A"
 
-                    diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw)\b"
-                    diamond_weight_match = re.search(diamond_weight_pattern, product_name, re.IGNORECASE)
-                    diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                    # Extract diamond weight and gemstone information
+                    diamond_weight = "N/A"
+                    try:
+                        diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw|carat)\b"
+                        diamond_weight_match = re.search(diamond_weight_pattern, product_name, re.IGNORECASE)
+                        diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                        
+                        # Extract gemstone information
+                        gemstone_pattern = r"\b(?:Diamond|Ruby|Sapphire|Emerald|Topaz|Opal|Amethyst|Aquamarine)\b"
+                        gemstones = re.findall(gemstone_pattern, product_name, re.IGNORECASE)
+                        if gemstones:
+                            additional_info.append(f"Gemstones: {', '.join(gemstones)}")
+                    except Exception:
+                        pass
+
+                    # Check for sale or special tags
+                    try:
+                        sale_tag = await product.query_selector(".price--on-sale, .sale-badge")
+                        if sale_tag:
+                            sale_text = (await sale_tag.inner_text()).strip()
+                            if sale_text:
+                                additional_info.append(f"Sale: {sale_text}")
+                    except Exception:
+                        pass
+
+                    # Check for product availability
+                    try:
+                        availability_tag = await product.query_selector(".product-availability")
+                        if availability_tag:
+                            availability_text = (await availability_tag.inner_text()).strip()
+                            if availability_text:
+                                additional_info.append(f"Availability: {availability_text}")
+                    except Exception:
+                        pass
+
+                    # Join all additional info with | delimiter
+                    additional_info_text = " | ".join(additional_info) if additional_info else "N/A"
 
                     unique_id = str(uuid.uuid4())
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, metal_type, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, metal_type, price, diamond_weight, time_only, image_url])
-                
+                    records.append((unique_id, current_date, page_title, product_name, None, metal_type, price, diamond_weight, additional_info_text))
+                    sheet.append([current_date, page_title, product_name, None, metal_type, price, diamond_weight, time_only, image_url, additional_info_text])
+
                 for row_num, unique_id, task in image_tasks:
                     try:
                         image_path = await asyncio.wait_for(task, timeout=60)
@@ -220,7 +280,7 @@ async def handle_mariemass(url, max_pages):
                                 image_path = "N/A"
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")

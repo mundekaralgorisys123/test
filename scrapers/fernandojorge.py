@@ -20,7 +20,7 @@ from database import insert_into_db
 from limit_checker import update_product_count
 import json
 import mimetypes
-
+from proxysetup import get_browser_with_proxy_strategy
 # Load environment
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
@@ -184,7 +184,7 @@ async def handle_fernandojorge(url, max_pages=None):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -194,29 +194,39 @@ async def handle_fernandojorge(url, max_pages=None):
     try:
         async with async_playwright() as p:
             # Browser setup
-            browser = await p.chromium.connect_over_cdp(PROXY_URL)
-            context = await browser.new_context()
-            page = await context.new_page()
-            page.set_default_timeout(120000)
-
-            # Navigation and loading
-            await safe_goto_and_wait(page, url)
+            browser, page = await get_browser_with_proxy_strategy(p, url, "div.grid")
             await scroll_to_bottom(page)
             
-            # Extract all product data at once using JavaScript
+            # Enhanced product data extraction with more fields
             product_data = await page.evaluate("""() => {
                 return Array.from(document.querySelectorAll('.product-card-grid-item')).map(product => {
                     try {
                         const nameElem = product.querySelector('p.product-item__title');
                         const priceElem = product.querySelector('span.price span.new-price');
+                        const comparePriceElem = product.querySelector('span.price span.old-price');
                         const imgElem = product.querySelector('figure.image-wrapper img');
+                        const availabilityElem = product.querySelector('.product-availability');
+                        const descriptionElem = product.querySelector('.product-item__description');
+                        const variantElems = product.querySelectorAll('.product-option-item');
+                        
+                        // Collect all hover images
+                        const hoverImages = Array.from(product.querySelectorAll('hover-images img')).map(img => img.src);
+                        
+                        // Collect variants if available
+                        const variants = Array.from(variantElems).map(v => v.innerText.trim()).filter(Boolean);
                         
                         return {
                             name: nameElem?.innerText?.trim() || 'N/A',
                             price: priceElem?.innerText?.trim() || 'N/A',
-                            imageUrl: imgElem?.src || 'N/A'
+                            comparePrice: comparePriceElem?.innerText?.trim() || null,
+                            imageUrl: imgElem?.src || 'N/A',
+                            hoverImages: hoverImages,
+                            availability: availabilityElem?.innerText?.trim() || null,
+                            description: descriptionElem?.innerText?.trim() || null,
+                            variants: variants.length ? variants : null
                         };
                     } catch (e) {
+                        console.error('Error parsing product:', e);
                         return {name: 'N/A', price: 'N/A', imageUrl: 'N/A'};
                     }
                 });
@@ -227,7 +237,7 @@ async def handle_fernandojorge(url, max_pages=None):
             page_title = await page.title()
 
             # Close browser early since we don't need it anymore
-            await context.close()
+            await page.close()
             await browser.close()
 
             # Process collected data
@@ -236,20 +246,56 @@ async def handle_fernandojorge(url, max_pages=None):
                 try:
                     product_name = data['name']
                     price = data['price']
+                    compare_price = data['comparePrice']
                     image_url = data['imageUrl']
+                    additional_info = []
+
+                    # Handle price with discount if available
+                    if compare_price and compare_price != price:
+                        price = f"{price}|{compare_price}"
+                        additional_info.append(f"Discount: {compare_price} → {price.split('|')[0]}")
 
                     # URL formatting
                     if image_url.startswith("//"):
                         image_url = f"https:{image_url}"
                     elif image_url.startswith("/"):
-                        image_url = f"https://fernandojorge.co.uk/{image_url}"
+                        image_url = f"https://fernandojorge.co.uk{image_url}"
+
+                    # Collect additional images
+                    if data['hoverImages'] and len(data['hoverImages']) > 0:
+                        additional_images = [img for img in data['hoverImages'] if img != image_url]
+                        if additional_images:
+                            additional_info.append(f"Additional Images: {'|'.join(additional_images[:3])}")
+
+                    # Add availability if present
+                    if data['availability']:
+                        additional_info.append(f"Availability: {data['availability']}")
+
+                    # Add variants if present
+                    if data['variants']:
+                        additional_info.append(f"Options: {'|'.join(data['variants'])}")
+
+                    # Add description if present
+                    if data['description']:
+                        additional_info.append(f"Description: {data['description']}")
 
                     # Specifications extraction
-                    gold_type_match = re.search(r"\b\d{1,2}K\b|\bRose Gold\b|\bWhite Gold\b|\bYellow Gold\b|\bPlatinum\b", product_name, re.I)
+                    gold_type_match = re.search(
+                        r"\b\d{1,2}K\b|\bRose Gold\b|\bWhite Gold\b|\bYellow Gold\b|\bPlatinum\b", 
+                        product_name, 
+                        re.I
+                    )
                     kt = gold_type_match.group() if gold_type_match else "N/A"
 
-                    diamond_match = re.search(r"\b\d+(?:\.\d+)?\s?(?:ct|tcw|carat)\b", product_name, re.I)
+                    diamond_match = re.search(
+                        r"\b\d+(?:\.\d+)?\s?(?:ct|tcw|carat|diamond)\b", 
+                        product_name + (data['description'] or ''), 
+                        re.I
+                    )
                     diamond_weight = diamond_match.group() if diamond_match else "N/A"
+
+                    # Combine all additional info
+                    additional_info_str = "|".join(additional_info) if additional_info else ""
 
                     unique_id = str(uuid.uuid4())
                     row_num = idx + 1  # Account for header row
@@ -265,12 +311,13 @@ async def handle_fernandojorge(url, max_pages=None):
                     all_records.append((
                         unique_id, current_date, 
                         page_title, product_name, 
-                        None, kt, price, diamond_weight
+                        None, kt, price, diamond_weight,
+                        additional_info_str
                     ))
                     sheet.append([
                         current_date, page_title, product_name,
                         None, kt, price, diamond_weight,
-                        time_only, image_url
+                        time_only, image_url, additional_info_str
                     ])
 
                 except Exception as e:

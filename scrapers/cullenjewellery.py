@@ -14,14 +14,15 @@ from database import insert_into_db
 from limit_checker import update_product_count
 import httpx
 from playwright.async_api import async_playwright, TimeoutError
+from proxysetup import get_browser_with_proxy_strategy
 
 # Load .env variables
-load_dotenv()
-PROXY_URL = os.getenv("PROXY_URL")
+# load_dotenv()
+# PROXY_URL = os.getenv("PROXY_URL")
 
-app = Flask(__name__)
+# Flask and paths
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-EXCEL_DATA_PATH = os.path.join(app.root_path, 'static', 'ExcelData')
+EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
 
 async def download_image(session, image_url, product_name, timestamp, image_folder, unique_id):
@@ -41,6 +42,38 @@ async def download_image(session, image_url, product_name, timestamp, image_fold
             logging.warning(f"Retry {attempt + 1}/3 - Error downloading {product_name}: {e}")
     logging.error(f"Failed to download {product_name} after 3 attempts.")
     return "N/A"
+
+
+def modify_image_url(image_url):
+    """Enhance Shopify image URLs to get higher resolution versions"""
+    if not image_url or image_url == "N/A":
+        return image_url
+
+    # Handle Shopify CDN URLs
+    if 'cdn.shopify.com' in image_url:
+        # Remove size constraints from filename (e.g., 500x500)
+        modified_url = re.sub(r'_(\d+x\d+)\.(jpg|jpeg|png)', r'.\2', image_url)
+        
+        # Remove any quality parameters
+        modified_url = re.sub(r'&?quality=\d+', '', modified_url)
+        
+        # Set maximum width/height parameters
+        modified_url = modified_url.replace('width=500', 'width=2000')
+        modified_url = modified_url.replace('height=500', 'height=2000')
+        
+        # Add lossless compression if not already present
+        if 'format=' not in modified_url:
+            modified_url += '&format=webp' if '?' in modified_url else '?format=webp'
+        
+        return modified_url
+
+    # Original Macy's handling (keep existing functionality)
+    modified_url = re.sub(r'wid=\d+', 'wid=1200', image_url)
+    modified_url = re.sub(r'hei=\d+', 'hei=1200', modified_url)
+    modified_url = re.sub(r'qlt=[^&]+', 'qlt=95', modified_url)
+    
+    return modified_url
+
 
 async def handle_cullenjewellery(url, max_pages):
     
@@ -63,7 +96,7 @@ async def handle_cullenjewellery(url, max_pages):
     current_date = datetime.now().strftime("%Y-%m-%d")
     time_only = datetime.now().strftime("%H.%M")
 
-    seen_ids = set()
+    
     records = []
     image_tasks = []
 
@@ -74,15 +107,10 @@ async def handle_cullenjewellery(url, max_pages):
         while load_more_clicks <= max_pages:
             async with async_playwright() as p:
                 # Create a new browser instance for each page
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                page = await browser.new_page()
-
-                try:
-                    await page.goto(url, timeout=120000)
-                except Exception as e:
-                    logging.warning(f"Failed to load URL {url}: {e}")
-                    await browser.close()
-                    continue  # move to the next iteration
+                
+                product_wrapper = '.root.svelte-19w1zzs'
+                
+                browser, page = await get_browser_with_proxy_strategy(p, url, product_wrapper)
 
                  # Simulate clicking 'Load More' number of times
                 for _ in range(load_more_clicks - 1):
@@ -114,45 +142,66 @@ async def handle_cullenjewellery(url, max_pages):
                 page_title = await page.title()
 
                 for idx, product in enumerate(new_products):
-                    # Extract product name from <h2>
-                    # Product name
+                   # --- Product Name ---
                     try:
-                        product_name_tag = await product.query_selector("h2.svelte-yv4ygw") or await product.query_selector("h3.svelte-yv4ygw")
-                        product_name = await product_name_tag.inner_text() if product_name_tag else "N/A"
+                        # First try to get the full name from h3 (which might be hidden but contains more details)
+                        product_name_tag = await product.query_selector('h3.svelte-yv4ygw')
+                        if product_name_tag:
+                            product_name = await product_name_tag.inner_text()
+                        else:  # Fallback to h2 if h3 isn't found
+                            product_name_tag = await product.query_selector('h2.svelte-yv4ygw')
+                            product_name = await product_name_tag.inner_text() if product_name_tag else "N/A"
+                        
+                        # Clean up the product name
+                        product_name = product_name.replace('hide_caption', '').strip()
                     except Exception as e:
                         logging.error(f"[Product Name] Error: {e}")
                         product_name = "N/A"
 
-
-                    # Extract price from <div class="price">
+                    # --- Price ---
                     try:
-                        price_tag = await product.query_selector("div.price.svelte-yv4ygw")
-                        price = await price_tag.inner_text() if price_tag else "N/A"
+                        price_tag = await product.query_selector('div.price.svelte-yv4ygw')
+                        if price_tag:
+                            price_text = await price_tag.inner_text()
+                            # Extract numeric value from price text
+                            price = ''.join(filter(lambda x: x.isdigit() or x == '.', price_text))
+                            price = f"${price}" if price else "N/A"
+                        else:
+                            price = "N/A"
                     except Exception as e:
                         logging.error(f"[Price] Error: {e}")
                         price = "N/A"
 
-
-
+                    # --- Image URL ---
                     try:
-                        # Directly select the image inside the slider div
+                        # First try to find visible images in the slider
                         await product.scroll_into_view_if_needed()
-                        img_element = await product.query_selector('div.slider.svelte-t7drm4 img.fillimage')
                         
-                        # Safely extract the src attribute
-                        image_url = await img_element.get_attribute("src") if img_element else "N/A"
-
-                        # Optional: Validate URL format
-                        if not image_url.startswith(('http:', 'https:')):
+                        # Wait for image container to load
+                        image_container = await product.wait_for_selector('div.images.svelte-yv4ygw', timeout=5000)
+                        
+                        # Get first image in the container (might need to wait for lazy loading)
+                        img_element = await image_container.wait_for_selector('img', timeout=5000)
+                        
+                        # Get high-resolution image URL
+                        image_url = await img_element.get_attribute('src')
+                        if image_url and 'placeholder' not in image_url:
+                            # Modify URL to get higher resolution if needed
+                            image_url = modify_image_url(image_url)
+                        else:
                             image_url = "N/A"
-
                     except Exception as e:
                         logging.error(f"[Image URL] Error: {e}")
                         image_url = "N/A"
+                        
+                        
+                    print(product_name)
+                    print(price)
+                    print(image_url)    
 
 
 
-                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                    if product_name == "N/A" and price == "N/A" and image_url == "N/A":
                         print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
                         continue  
 
@@ -190,17 +239,17 @@ async def handle_cullenjewellery(url, max_pages):
         # Save Excel
         filename = f'handle_cullenjewellery_{datetime.now().strftime("%Y-%m-%d_%H.%M")}.xlsx'
         file_path = os.path.join(EXCEL_DATA_PATH, filename)
+        if not records:
+            return None, None, None
+
+        # Final save and database operations
         wb.save(file_path)
         log_event(f"Data saved to {file_path} | IP: {ip_address}")
 
-        if records:
-            insert_into_db(records)
-        else:
-            logging.info("No data to insert into the database.")
+        with open(file_path, "rb") as file:
+            base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
-        update_product_count(len(seen_ids))
-
-        with open(file_path, "rb") as f:
-            base64_encoded = base64.b64encode(f.read()).decode("utf-8")
+        insert_into_db(records)
+        update_product_count(len(records))
 
         return base64_encoded, filename, file_path

@@ -246,12 +246,17 @@ def check_url_against_rules(url: str, disallowed_patterns: List[str]) -> bool:
         except Exception as e:
             logging.warning(f"Error checking pattern {pattern}: {e}")
     return False
-        
-        
+    
 
-async def handle_bash(start_url, max_pages):
+
+def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    separator = '&' if '?' in base_url else '?'
+    return f"{base_url}{separator}page={page_count}"   
+         
+         
+async def handle_bash(url, max_pages):
     ip_address = get_public_ip()
-    logging.info(f"Scraping started for: {start_url} from IP: {ip_address}, max_pages: {max_pages}")
+    logging.info(f"Scraping started for: {url} from IP: {ip_address}, max_pages: {max_pages}")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     image_folder = os.path.join(IMAGE_SAVE_PATH, timestamp)
@@ -270,24 +275,18 @@ async def handle_bash(start_url, max_pages):
     filename = f"handle_bash_{current_date}_{time_only}.xlsx"
     file_path = os.path.join(EXCEL_DATA_PATH, filename)
 
-    page_count = 0
-    current_url = start_url
+    page_count = 1
+    success_count = 0
+    
+    async with async_playwright() as p:
+        while page_count <= max_pages:
+            current_url = build_url_with_loadmore(url, page_count)
+            logging.info(f"Processing page {page_count}: {current_url}")
 
-    while current_url and (page_count < max_pages):
-        logging.info(f"Processing page {page_count + 1}: {current_url}")
-        if page_count > 0:
-            if '?' in current_url:
-                current_url = f"{current_url}&page={page_count + 1}"
-            else:
-                current_url = f"{current_url}?page={page_count + 1}"
-
-        # Create a new browser instance for each page
-        browser = None
-        page = None
-        try:
-            async with async_playwright() as p:
-            
-                
+            # Create a new browser instance for each page
+            browser = None
+            page = None
+            try:
                 browser, page = await get_browser_with_proxy_strategy(p, current_url)
                 log_event(f"Successfully loaded: {current_url}")
 
@@ -296,131 +295,125 @@ async def handle_bash(start_url, max_pages):
                 page_title = await page.title()
                 product_container = await page.query_selector("#product-cards")
                 products = await product_container.query_selector_all("[data-testid='card']") if product_container else []
-                print(len(products))
+                # print(len(products))
 
                 records = []
                 image_tasks = []
 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
-                    try:
-                        product_name_tag = await product.query_selector("h3.cursor-pointer.text-base.font-bold.leading-4.text-onyx-Black.line-clamp-2.h-8.z-5")
-                        product_name = (await product_name_tag.inner_text()).strip() if product_name_tag else "N/A"
+                    
+                    product_name_tag = await product.query_selector("h3.cursor-pointer.text-base.font-bold.leading-4.text-onyx-Black.line-clamp-2.h-8.z-5")
+                    product_name = (await product_name_tag.inner_text()).strip() if product_name_tag else "N/A"
 
-                        # Locate the price container
-                        price_tag = await product.query_selector("div[data-testid='price']")
-                        if price_tag:
-                            # Try to get sale price
-                            sale_price_el = await price_tag.query_selector("span[data-testid='sale-price']")
-                            sale_price = (await sale_price_el.inner_text()).strip() if sale_price_el else ""
+                    # Locate the price container
+                    price_tag = await product.query_selector("div[data-testid='price']")
+                    if price_tag:
+                        # Try to get sale price
+                        sale_price_el = await price_tag.query_selector("span[data-testid='sale-price']")
+                        sale_price = (await sale_price_el.inner_text()).strip() if sale_price_el else ""
 
-                            # Try to get original (strikethrough) price
-                            original_price_el = await price_tag.query_selector("span.line-through")
-                            original_price = (await original_price_el.inner_text()).strip() if original_price_el else ""
+                        # Try to get original (strikethrough) price
+                        original_price_el = await price_tag.query_selector("span.line-through")
+                        original_price = (await original_price_el.inner_text()).strip() if original_price_el else ""
 
-                            # Try to get discount percentage
-                            discount_el = await price_tag.query_selector("span.text-sale")
-                            discount = (await discount_el.inner_text()).strip() if discount_el else ""
+                        # Try to get discount percentage
+                        discount_el = await price_tag.query_selector("span.text-sale")
+                        discount = (await discount_el.inner_text()).strip() if discount_el else ""
 
-                            # Handle case where the entire price is just plain text without span
-                            if not (sale_price or original_price):
-                                price_text = (await price_tag.inner_text()).strip()
-                                price = price_text if price_text else "N/A"
-                            else:
-                                if sale_price and original_price and discount:
-                                    price = f"{sale_price} offer {original_price} ({discount})"
-                                elif sale_price:
-                                    price = sale_price
-                                elif original_price:
-                                    price = original_price
-                                else:
-                                    price = "N/A"
+                        # Handle case where the entire price is just plain text without span
+                        if not (sale_price or original_price):
+                            price_text = (await price_tag.inner_text()).strip()
+                            price = price_text if price_text else "N/A"
                         else:
-                            price = "N/A"
+                            if sale_price and original_price and discount:
+                                price = f"{sale_price} offer {original_price} ({discount})"
+                            elif sale_price:
+                                price = sale_price
+                            elif original_price:
+                                price = original_price
+                            else:
+                                price = "N/A"
+                    else:
+                        price = "N/A"
 
-                        image_tag = await product.query_selector("img[data-testid='image']")
-                        image_url = await image_tag.get_attribute("src") if image_tag else "N/A"
-                        
-                        additional_info = []
+                    image_tag = await product.query_selector("img[data-testid='image']")
+                    image_url = await image_tag.get_attribute("src") if image_tag else "N/A"
+                    
+                    additional_info = []
 
-                        # Extract sale tag (e.g., "SALE", "NEW", etc.)
-                        try:
-                            sale_tag_el = await product.query_selector("div.text-widget-text span[data-testid='widget']")
-                            if sale_tag_el:
-                                sale_tag_text = (await sale_tag_el.inner_text()).strip()
-                                if sale_tag_text:
-                                    additional_info.append(sale_tag_text)
-                        except Exception:
-                            pass  # Ignore errors silently if sale tag is missing
+                    # Extract sale tag (e.g., "SALE", "NEW", etc.)
+                    try:
+                        sale_tag_el = await product.query_selector("div.text-widget-text span[data-testid='widget']")
+                        if sale_tag_el:
+                            sale_tag_text = (await sale_tag_el.inner_text()).strip()
+                            if sale_tag_text:
+                                additional_info.append(sale_tag_text)
+                            else:
+                                additional_info.append("sale: N/A")    
+                    except Exception:
+                        pass  # Ignore errors silently if sale tag is missing
 
-                        # Extract brand name
-                        try:
-                            brand_el = await product.query_selector("h4 a[data-testid='link']")
-                            if brand_el:
-                                brand_text = (await brand_el.inner_text()).strip()
-                                if brand_text:
-                                    additional_info.append(f"Brand: {brand_text}")
-                                else:
-                                    additional_info.append("Brand: N/A")
+                    # Extract brand name
+                    try:
+                        brand_el = await product.query_selector("h4 a[data-testid='link']")
+                        if brand_el:
+                            brand_text = (await brand_el.inner_text()).strip()
+                            if brand_text:
+                                additional_info.append(f"Brand: {brand_text}")
                             else:
                                 additional_info.append("Brand: N/A")
-                        except Exception:
+                        else:
                             additional_info.append("Brand: N/A")
+                    except Exception:
+                        additional_info.append("Brand: N/A")
 
-                        # Combine into a single string
-                        additional_info_str = " | ".join(additional_info) if additional_info else "N/A"
+                    # Combine into a single string
+                    additional_info_str = " | ".join(additional_info) if additional_info else "N/A"
 
 
-                        
-                        
-                        
-                        # if product_name == "N/A" or price == "N/A" or image_url == "N/A":
-                        #     print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
-                        #     continue    
                     
 
-                        gold_type_match = re.search(r"(\d{1,2}K|Platinum|Silver|Gold|White Gold|Yellow Gold|Rose Gold)", product_name, re.IGNORECASE)
-                        kt = gold_type_match.group(0) if gold_type_match else "N/A"
+                    gold_type_match = re.search(r"(\d{1,2}K|Platinum|Silver|Gold|White Gold|Yellow Gold|Rose Gold)", product_name, re.IGNORECASE)
+                    kt = gold_type_match.group(0) if gold_type_match else "N/A"
 
-                        diamond_weight_match = re.search(r"(\d+(\.\d+)?)\s*(ct|carat)", product_name, re.IGNORECASE)
-                        diamond_weight = f"{diamond_weight_match.group(1)} ct" if diamond_weight_match else "N/A"
+                    diamond_weight_match = re.search(r"(\d+(\.\d+)?)\s*(ct|carat)", product_name, re.IGNORECASE)
+                    diamond_weight = f"{diamond_weight_match.group(1)} ct" if diamond_weight_match else "N/A"
 
-                        unique_id = str(uuid.uuid4())
-                        image_tasks.append((
-                            row_num,
-                            unique_id,
-                            asyncio.create_task(
-                                download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
-                            )
-                        ))
+                    unique_id = str(uuid.uuid4())
+                    image_tasks.append((
+                        row_num,
+                        unique_id,
+                        asyncio.create_task(
+                            download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
+                        )
+                    ))
 
-                        records.append((
-                            unique_id,
-                            current_date,
-                            page_title,
-                            product_name,
-                            None,  # Placeholder for image path
-                            kt,
-                            price,
-                            diamond_weight,
-                            additional_info_str
-                        ))
+                    records.append((
+                        unique_id,
+                        current_date,
+                        page_title,
+                        product_name,
+                        None,  # Placeholder for image path
+                        kt,
+                        price,
+                        diamond_weight,
+                        additional_info_str
+                    ))
 
-                        sheet.append([
-                            current_date,
-                            page_title,
-                            product_name,
-                            None,  # Placeholder for image
-                            kt,
-                            price,
-                            diamond_weight,
-                            time_only,
-                            image_url,
-                            additional_info_str
-                        ])
+                    sheet.append([
+                        current_date,
+                        page_title,
+                        product_name,
+                        None,  # Placeholder for image
+                        kt,
+                        price,
+                        diamond_weight,
+                        time_only,
+                        image_url,
+                        additional_info_str
+                    ])
 
-                    except Exception as e:
-                        logging.error(f"Error processing product {row_num}: {e}")
-                        continue
+                    
 
                 # Process downloaded images
                 for row_num, unique_id, task in image_tasks:
@@ -455,32 +448,34 @@ async def handle_bash(start_url, max_pages):
                         logging.warning(f"Timeout downloading image for row {row_num}")
 
                 all_records.extend(records)
+                success_count += 1
 
                 # Save progress after each page
                 wb.save(file_path)
-                logging.info(f"Progress saved after page {page_count + 1}")
-
-                # Pagination Handling
-                next_button = await page.query_selector("a[data-testid='next-page-icon']")
-                next_link = urljoin(current_url, await next_button.get_attribute("href")) if next_button else None
-                current_url = next_link
+                logging.info(f"Progress saved after page {page_count}")
+                if page:
+                    await page.close()
+                if browser:
+                    await browser.close()
+                
                 page_count += 1
-
-        except Exception as e:
-            logging.error(f"Error processing page {page_count + 1}: {str(e)}")
-            # Save what we have so far
-            wb.save(file_path)
-        finally:
-            # Clean up resources for this page
-            if page:
-                await page.close()
-            if browser:
-                await browser.close()
+                await asyncio.sleep(random.uniform(2, 5))
+                    
+            except Exception as e:
+                logging.error(f"Error processing page {page_count}: {str(e)}")
+                if page:
+                    await page.close()
+                if browser:
+                    await browser.close()
+                wb.save(file_path)
+                continue
             
             # Add delay between pages
             await asyncio.sleep(random.uniform(2, 5))
+            
+        page_count += 1
 
-    # Final save and database operations
+    # # Final save and database operations
     if not all_records:
         return None, None, None
 

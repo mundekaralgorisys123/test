@@ -18,7 +18,9 @@ from playwright.async_api import async_playwright, TimeoutError, Error
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
-
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+import json
+from proxysetup import get_browser_with_proxy_strategy
 # Load environment
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
@@ -98,6 +100,21 @@ async def safe_goto_and_wait(page, url, retries=3):
             else:
                 raise
 
+
+def get_next_page_url(current_url, next_page_number):
+    parsed_url = urlparse(current_url)
+    query_params = parse_qs(parsed_url.query)
+
+    # Update the 'paged' parameter
+    query_params['paged'] = [str(next_page_number)]
+
+    # Reconstruct the query string
+    new_query = urlencode(query_params, doseq=True)
+
+    # Rebuild the final URL
+    new_url = urlunparse(parsed_url._replace(query=new_query))
+    return new_url
+
 # Main scraper function
 async def handle_cerrone(url, max_pages):
     ip_address = get_public_ip()
@@ -111,7 +128,7 @@ async def handle_cerrone(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -125,15 +142,13 @@ async def handle_cerrone(url, max_pages):
         browser = None
         context = None
         if page_count > 1:
-            current_url = f"{url}/page/{page_count}/"
+            if '?' in current_url:
+                current_url = get_next_page_url(current_url, page_count)
+            else:
+                current_url = f"{url}/page/{page_count}/"
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(120000)
-
-                await safe_goto_and_wait(page, current_url)
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, ".products")
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all items
@@ -150,28 +165,49 @@ async def handle_cerrone(url, max_pages):
                 current_date = datetime.now().strftime("%Y-%m-%d")
                 time_only = datetime.now().strftime("%H.%M")
 
-                product_wrapper = await page.query_selector("ul.products")  # This might need updating based on the actual page structure
+                product_wrapper = await page.query_selector("ul.products")
                 products = await product_wrapper.query_selector_all("li.product") if product_wrapper else []
                 logging.info(f"Total products scraped:{page_count} :{len(products)}")
                 records = []
                 image_tasks = []
-                print(f"Total products on page {page_count}: {len(products)}")
+                
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
                     print(f"Processing product {row_num-1} of {len(products)}")
+                    additional_info = []
+                    
                     try:
                         name_tag = await product.query_selector("h2.woocommerce-loop-product__title")
                         product_name = (await name_tag.inner_text()).strip() if name_tag else "N/A"
                     except Exception:
                         product_name = "N/A"
 
+                    # Improved price extraction
                     try:
-                        price_tag = await product.query_selector("span.price .woocommerce-Price-amount")
-                        price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
+                        price_tags = await product.query_selector_all(".price .woocommerce-Price-amount")
+                        prices = []
+                        for price_tag in price_tags:
+                            price_text = (await price_tag.inner_text()).strip()
+                            if price_text and any(c.isdigit() for c in price_text):
+                                # Clean price text and format consistently
+                                clean_price = re.sub(r'[^\d.]', '', price_text)
+                                if clean_price:
+                                    # Get currency symbol
+                                    currency_tag = await price_tag.query_selector(".woocommerce-Price-currencySymbol")
+                                    currency = (await currency_tag.inner_text()).strip() if currency_tag else "$"
+                                    prices.append(f"{currency}{clean_price}")
+                        
+                        if len(prices) > 1:
+                            price = " | ".join(prices)
+                            additional_info.append("Multiple prices available")
+                        elif prices:
+                            price = prices[0]
+                        else:
+                            price = "N/A"
                     except Exception:
                         price = "N/A"
 
+                    # Enhanced image extraction
                     try:
-                        # Get the highest resolution image available
                         image_tag = await product.query_selector("img.attachment-woocommerce_thumbnail")
                         if image_tag:
                             # First try to get the full size image from data attributes
@@ -180,45 +216,89 @@ async def handle_cerrone(url, max_pages):
                             # If we have srcset, get the largest image (last one in the list)
                             srcset = await image_tag.get_attribute("srcset") or await image_tag.get_attribute("data-lazy-srcset")
                             if srcset:
-                                # Get all sources and sort by size (width)
                                 sources = [s.strip().split() for s in srcset.split(',') if s.strip()]
-                                # Sort by width (assuming format is "url width" or "url widthw")
                                 sources.sort(key=lambda x: int(x[1].replace('w', '')) if len(x) > 1 else 0)
                                 image_url = sources[-1][0] if sources else full_size_url
                             else:
                                 image_url = full_size_url
                                 
-                            # Fallback to regular src if we still don't have a valid URL
                             if not image_url or image_url.startswith('data:image'):
                                 image_url = await image_tag.get_attribute("src")
                         else:
                             image_url = "N/A"
-                            
-                        # If we got a WebP image, we'll convert it later in download_image_async
                     except Exception as e:
                         logging.warning(f"Error getting image URL: {e}")
                         image_url = "N/A"
 
-                    # For this site, the product name seems to contain most details
+                    # Extract product details from name and other elements
                     details_text = product_name
 
-                    # Extract gold type from product name
+                    # Extract gold type
                     gold_type_pattern = r"\b\d{1,2}(?:K|ct)?\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSilver\b"
                     gold_type_match = re.search(gold_type_pattern, details_text, re.IGNORECASE)
                     kt = gold_type_match.group() if gold_type_match else "Not found"
 
-                    # Extract diamond weight
-                    diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw|carat)\b"
-                    diamond_weight_match = re.search(diamond_weight_pattern, details_text, re.IGNORECASE)
-                    diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                    # Extract diamond weight and gemstone information
+                    diamond_weight = "N/A"
+                    try:
+                        diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw|carat)\b"
+                        diamond_weight_match = re.search(diamond_weight_pattern, details_text, re.IGNORECASE)
+                        diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                        
+                        # Extract gemstone information
+                        gemstone_pattern = r"\b(?:Topaz|Sapphire|Diamond|Ruby|Emerald|Amethyst|Opal|Aquamarine|Tourmaline)\b"
+                        gemstones = re.findall(gemstone_pattern, details_text, re.IGNORECASE)
+                        if gemstones:
+                            additional_info.append(f"Gemstones: {', '.join(gemstones)}")
+                    except Exception:
+                        pass
+
+                    # Get product categories and tags
+                    try:
+                        # Extract from hidden data elements
+                        gtm_data = await product.query_selector(".gtm4wp_productdata")
+                        if gtm_data:
+                            gtm_json = await gtm_data.get_attribute("data-gtm4wp_product_data")
+                            if gtm_json:
+                                gtm_data = json.loads(gtm_json)
+                                if "category" in gtm_data:
+                                    additional_info.append(f"Categories: {gtm_data['category']}")
+                                if "item_brand" in gtm_data and gtm_data["item_brand"]:
+                                    additional_info.append(f"Brand: {gtm_data['item_brand']}")
+                                if "sku" in gtm_data:
+                                    additional_info.append(f"SKU: {gtm_data['sku']}")
+                    except Exception:
+                        pass
+
+                    # Check for wishlist option
+                    try:
+                        wishlist = await product.query_selector(".yith-wcwl-add-to-wishlist")
+                        if wishlist:
+                            additional_info.append("Has wishlist option")
+                    except Exception:
+                        pass
+
+                    # Check for product tags
+                    try:
+                        tags_container = await product.query_selector(".product_tag")
+                        if tags_container:
+                            tags = await tags_container.query_selector_all("a")
+                            tag_list = [await tag.inner_text() for tag in tags]
+                            if tag_list:
+                                additional_info.append(f"Tags: {', '.join(tag_list)}")
+                    except Exception:
+                        pass
+
+                    # Join all additional info with | delimiter
+                    additional_info_text = " | ".join(additional_info) if additional_info else "N/A"
 
                     unique_id = str(uuid.uuid4())
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight, additional_info_text))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url, additional_info_text])
 
                 for row_num, unique_id, task in image_tasks:
                     try:
@@ -240,7 +320,7 @@ async def handle_cerrone(url, max_pages):
                                 # Update records
                                 for i, record in enumerate(records):
                                     if record[0] == unique_id:
-                                        records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                        records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                         break
                             except Exception as e:
                                 logging.error(f"Error embedding image: {e}")

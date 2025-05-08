@@ -135,7 +135,7 @@ async def safe_goto_and_wait(page, url,isbri_data, retries=2):
             if isbri_data:
                 await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
             else:
-                await page.goto(url, wait_until="networkidle", timeout=180_000)
+                await page.goto(url, wait_until="domcontentloaded", timeout=180_000)
 
             # Wait for the selector with a longer timeout
             product_cards = await page.wait_for_selector(".CategoryPage-ProductListWrapper", state="attached", timeout=30000)
@@ -206,7 +206,7 @@ async def get_browser_with_proxy_strategy(p, url: str):
                 logging.info("Attempting with oxylabs proxy (required by robots.txt)")
                 browser = await p.chromium.launch(
                     proxy=proxy_config,
-                    headless=True,
+                    headless=False,
                     args=[
                         '--disable-blink-features=AutomationControlled',
                         '--disable-web-security'

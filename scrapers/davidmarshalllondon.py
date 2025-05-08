@@ -20,7 +20,7 @@ from database import insert_into_db
 from limit_checker import update_product_count
 import json
 import mimetypes
-
+from proxysetup import get_browser_with_proxy_strategy
 # Load environment
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
@@ -137,10 +137,6 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
     logging.error(f"Failed to download {product_name} after {retries} attempts.")
     return "N/A"
 
-# Human-like delay
-def random_delay(min_sec=1, max_sec=3):
-    time.sleep(random.uniform(min_sec, max_sec))
-
 # Scroll to bottom of page to load all products
 async def scroll_to_bottom(page):
     last_height = await page.evaluate("document.body.scrollHeight")
@@ -153,22 +149,6 @@ async def scroll_to_bottom(page):
         if new_height == last_height:
             break
         last_height = new_height
-
-# Reliable page.goto wrapper
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-            await page.wait_for_selector("li.product", state="attached", timeout=30000)
-            print("[Success] Product listing loaded.")
-            return
-        except (Error, TimeoutError) as e:
-            logging.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
-            if attempt < retries - 1:
-                random_delay(1, 3)
-            else:
-                raise
 
 # Main scraper function
 async def handle_davidmarshalllondon(url, max_pages=None):
@@ -183,7 +163,8 @@ async def handle_davidmarshalllondon(url, max_pages=None):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", 
+               "Time", "ImagePath", "Additional Info"]  # Added Additional Info column
     sheet.append(headers)
 
     all_records = []
@@ -194,12 +175,7 @@ async def handle_davidmarshalllondon(url, max_pages=None):
     
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.connect_over_cdp(PROXY_URL)
-            context = await browser.new_context()
-            page = await context.new_page()
-            page.set_default_timeout(120000)
-
-            await safe_goto_and_wait(page, url)
+            browser, page = await get_browser_with_proxy_strategy(p, url, "li.product")
             log_event(f"Successfully loaded: {url}")
 
             # Scroll to load all items
@@ -209,26 +185,58 @@ async def handle_davidmarshalllondon(url, max_pages=None):
             current_date = datetime.now().strftime("%Y-%m-%d")
             time_only = datetime.now().strftime("%H.%M")
 
-            # Get all product tiles - updated selector
+            # Get all product tiles
             product_wrapper = await page.query_selector("ul.inner.clearfix")
             product_tiles = await product_wrapper.query_selector_all("li.product") if product_wrapper else []
 
             logging.info(f"Total products found: {len(product_tiles)}")
-            print(f"Total products found: {len(product_tiles)}")
             records = []
             image_tasks = []
             
             for row_num, product in enumerate(product_tiles, start=len(sheet["A"]) + 1):
+                additional_info = []
+                
                 try:
-                    # Extract product name - updated selector
+                    # Extract product name
                     name_tag = await product.query_selector("p.product-overlay span")
-                    product_name = await name_tag.inner_text() if name_tag else "N/A"
+                    product_name = (await name_tag.inner_text()).strip() if name_tag else "N/A"
                 except Exception:
                     product_name = "N/A"
 
-                
+                # Initialize price as N/A (price not visible in the HTML provided)
                 price = "N/A"
 
+                # Extract product metadata from class attributes
+                try:
+                    product_classes = await product.get_attribute("class")
+                    if product_classes:
+                        classes = product_classes.split()
+                        metadata = {
+                            'type': None,
+                            'material': None,
+                            'gemstones': []
+                        }
+                        
+                        for cls in classes:
+                            if cls.startswith('product-type_'):
+                                metadata['type'] = cls.split('_')[1].replace('-', ' ')
+                            elif cls.startswith('product-material_'):
+                                metadata['material'] = cls.split('_')[1].replace('-', ' ')
+                            elif cls.startswith('product-gemstone_'):
+                                gemstone = cls.split('_')[1].replace('-', ' ')
+                                metadata['gemstones'].append(gemstone)
+                        
+                        # Add metadata to additional info
+                        if metadata['type']:
+                            additional_info.append(f"Type: {metadata['type'].title()}")
+                        if metadata['material']:
+                            additional_info.append(f"Material: {metadata['material'].title()}")
+                        if metadata['gemstones']:
+                            additional_info.append(f"Gemstones: {', '.join([g.title() for g in metadata['gemstones']])}")
+                except Exception as e:
+                    logging.error(f"Error extracting product metadata: {e}")
+
+                # Extract image URL
                 image_url = "N/A"
                 try:
                     image_div = await product.query_selector("div.product-image")
@@ -236,26 +244,54 @@ async def handle_davidmarshalllondon(url, max_pages=None):
                         image_url_style = await image_div.get_attribute("style")
                         if "background-image: url(" in image_url_style:
                             # Extract the URL from the background-image style
-                            image_url = image_url_style.split("url(")[1].split(")")[0].strip('"')
+                            image_url = image_url_style.split("url(")[1].split(")")[0].strip('"\'')
                             # Ensure the URL has the proper protocol
                             if not image_url.startswith(("http://", "https://")):
-                                image_url = f"https://www.davidmarshalllondon.com{image_url}"  # Adjust base URL as needed
-                        else:
-                            image_url = "N/A"
+                                image_url = f"https://www.davidmarshalllondon.com{image_url}"
+                            
+                            # Check for image dimensions in URL and try to get highest quality
+                            if '-w265' in image_url:
+                                image_url = image_url.replace('-w265', '')  # Remove size parameter
                 except Exception as e:
                     log_event(f"Error getting image URL: {e}")
                     image_url = "N/A"
 
+                # Extract product URL
+                try:
+                    product_link = await product.query_selector("a")
+                    product_url = await product_link.get_attribute("href") if product_link else "N/A"
+                    if product_url and product_url != "N/A":
+                        additional_info.append(f"Product URL: {product_url}")
+                except Exception:
+                    pass
 
-                # Extract gold type (kt) from product name
-                gold_type_pattern = r"\b\d{1,2}(?:K|kt|ct)\b|\bRose Gold\b|\bWhite Gold\b|\bYellow Gold\b|\bPlatinum\b|\bSilver\b"
-                gold_type_match = re.search(gold_type_pattern, product_name, re.IGNORECASE)
-                kt = gold_type_match.group() if gold_type_match else "Not found"
+                # Extract gold type (kt) from product name and metadata
+                gold_type = "Not found"
+                try:
+                    # First try to get from product name
+                    gold_type_pattern = r"\b\d{1,2}(?:K|kt|ct)\b|\bRose Gold\b|\bWhite Gold\b|\bYellow Gold\b|\bPlatinum\b|\bSilver\b"
+                    gold_type_match = re.search(gold_type_pattern, product_name, re.IGNORECASE)
+                    gold_type = gold_type_match.group() if gold_type_match else "Not found"
+                    
+                    # If not found in name, check metadata
+                    if gold_type == "Not found" and 'material' in locals():
+                        material_match = re.search(gold_type_pattern, metadata.get('material', ''), re.IGNORECASE)
+                        if material_match:
+                            gold_type = material_match.group()
+                except Exception:
+                    gold_type = "Not found"
 
                 # Extract diamond weight from product name
-                diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw|carat)\b"
-                diamond_weight_match = re.search(diamond_weight_pattern, product_name, re.IGNORECASE)
-                diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                diamond_weight = "N/A"
+                try:
+                    diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw|carat)\b"
+                    diamond_weight_match = re.search(diamond_weight_pattern, product_name, re.IGNORECASE)
+                    diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                except Exception:
+                    diamond_weight = "N/A"
+
+                # Combine all additional info with | separator
+                additional_info_text = " | ".join(additional_info) if additional_info else ""
 
                 unique_id = str(uuid.uuid4())
                 if image_url and image_url != "N/A":
@@ -263,8 +299,10 @@ async def handle_davidmarshalllondon(url, max_pages=None):
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                records.append((unique_id, current_date, page_title, product_name, None, gold_type, 
+                              price, diamond_weight, additional_info_text))
+                sheet.append([current_date, page_title, product_name, None, gold_type, price, 
+                            diamond_weight, time_only, image_url, additional_info_text])
             
             # Process image downloads
             for row_num, unique_id, task in image_tasks:
@@ -280,7 +318,8 @@ async def handle_davidmarshalllondon(url, max_pages=None):
                             image_path = "N/A"
                     for i, record in enumerate(records):
                         if record[0] == unique_id:
-                            records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                            records[i] = (record[0], record[1], record[2], record[3], image_path, 
+                                         record[5], record[6], record[7], record[8])
                             break
                 except asyncio.TimeoutError:
                     logging.warning(f"Image download timed out for row {row_num}")

@@ -12,21 +12,17 @@ import httpx
 from PIL import Image as PILImage
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
-from flask import Flask
-from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError, Error
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
+from proxysetup import get_browser_with_proxy_strategy
 
-# Load environment
-load_dotenv()
-PROXY_URL = os.getenv("PROXY_URL")
 
 # Flask and paths
-app = Flask(__name__)
+# Flask and paths
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-EXCEL_DATA_PATH = os.path.join(app.root_path, 'static', 'ExcelData')
+EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
 
 # Resize image if needed
@@ -92,6 +88,24 @@ async def safe_goto_and_wait(page, url, retries=3):
                 raise
 
 # Main scraper function
+
+def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+    # Parse the base URL
+    parsed_url = urlparse(base_url)
+    query_params = parse_qs(parsed_url.query)
+
+    # Update or add the `page` parameter
+    query_params["page"] = [str(page_count)]
+
+    # Build new query string
+    new_query = urlencode(query_params, doseq=True)
+
+    # Return the full new URL
+    return urlunparse(parsed_url._replace(query=new_query))
+
+
 async def handle_diamondcollection(url, max_pages):
     ip_address = get_public_ip()
     logging.info(f"Scraping started for: {url} from IP: {ip_address}, max_pages: {max_pages}")
@@ -104,7 +118,7 @@ async def handle_diamondcollection(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -114,21 +128,16 @@ async def handle_diamondcollection(url, max_pages):
     page_count = 1
     current_url = url
     product_count = 0
-    while current_url and (page_count <= max_pages):
+    while page_count <= max_pages:
+        current_url = build_url_with_loadmore(url, page_count)
         logging.info(f"Processing page {page_count}: {current_url}")
         browser = None
         context = None
-        if page_count > 1:
-            current_url = f"{url}?page={page_count}"
+       
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(120000)
-
-                await safe_goto_and_wait(page, current_url)
-                log_event(f"Successfully loaded: {current_url}")
+                product_wrapper = '.collection__main'
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, product_wrapper)
 
                 # Scroll to load all items
                 prev_count = 0
@@ -153,7 +162,7 @@ async def handle_diamondcollection(url, max_pages):
                 product_count += len(products)
                 print(f"Total products on page {page_count}: {len(products)}")
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
-                    print(f"Processing product {row_num-1} of {len(products)}")
+                    # print(f"Processing product {row_num-1} of {len(products)}")
                     # Extract product name
                     try:
                         name_tag = await product.query_selector("a.product-title")
@@ -190,6 +199,26 @@ async def handle_diamondcollection(url, max_pages):
                             image_url = "N/A"
                     except Exception:
                         image_url = "N/A"
+                        
+                    additional_info = []
+
+                    try:
+                        
+                        # Extract from <p class="smallcaps text-subdued">
+                        color_info_el = await product.query_selector("p.smallcaps.text-subdued")
+                        if color_info_el:
+                            color_info_text = await color_info_el.inner_text()
+                            if color_info_text:
+                                additional_info.append(color_info_text.strip())
+
+                        if not additional_info:
+                            additional_info.append("N/A")
+
+                    except Exception as e:
+                        additional_info.append("N/A")
+
+                    additional_info_str = " | ".join(additional_info)
+    
 
                     # Extract metal type from product name
                     metal_type = "N/A"
@@ -222,8 +251,8 @@ async def handle_diamondcollection(url, max_pages):
                     )))
 
                     # Append to records and spreadsheet
-                    records.append((unique_id, current_date, page_title, product_name, None, metal_type, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, metal_type, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, metal_type, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, metal_type, price, diamond_weight, time_only, image_url,additional_info_str])
                 for row_num, unique_id, task in image_tasks:
                     try:
                         image_path = await asyncio.wait_for(task, timeout=60)
@@ -237,7 +266,7 @@ async def handle_diamondcollection(url, max_pages):
                                 image_path = "N/A"
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")
@@ -255,12 +284,20 @@ async def handle_diamondcollection(url, max_pages):
 
         page_count += 1
 
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
+
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

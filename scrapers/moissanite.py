@@ -12,22 +12,46 @@ import httpx
 from PIL import Image as PILImage
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
-from flask import Flask
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError, Error
-from utils import get_public_ip, log_event, sanitize_filename
+from utils import get_public_ip, log_event
 from database import insert_into_db
 from limit_checker import update_product_count
 import json
+from proxysetup import get_browser_with_proxy_strategy
 # Load environment
+from urllib.parse import urlparse, urlencode, parse_qs
+
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
 
 # Flask and paths
-app = Flask(__name__)
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-EXCEL_DATA_PATH = os.path.join(app.root_path, 'static', 'ExcelData')
+EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
+
+
+def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    # Parse the base URL to separate the path and query parameters
+    url_parts = urlparse(base_url)
+    
+    # Parse the query string into a dictionary
+    query_params = parse_qs(url_parts.query)
+    
+    # Add or update the page count parameter
+    query_params['page'] = page_count
+    
+    # Rebuild the query string with the updated page parameter
+    new_query = urlencode(query_params, doseq=True)
+    
+    # Rebuild the full URL
+    new_url = f"{url_parts.scheme}://{url_parts.netloc}{url_parts.path}?{new_query}"
+    
+    return new_url
+
+
+
+
 
 # Resize image if needed
 def resize_image(image_data, max_size=(100, 100)):
@@ -75,22 +99,6 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
 def random_delay(min_sec=1, max_sec=3):
     time.sleep(random.uniform(min_sec, max_sec))
 
-# Reliable page.goto wrapper
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-            await page.wait_for_selector(".grid-area--collection", state="attached", timeout=30000)
-            print("[Success] Product cards loaded.")
-            return
-        except (Error, TimeoutError) as e:
-            logging.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
-            if attempt < retries - 1:
-                random_delay(1, 3)
-            else:
-                raise
-
 # Main scraper function
 async def handle_moissanite(url, max_pages):
     ip_address = get_public_ip()
@@ -104,7 +112,7 @@ async def handle_moissanite(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -112,22 +120,17 @@ async def handle_moissanite(url, max_pages):
     file_path = os.path.join(EXCEL_DATA_PATH, filename)
 
     page_count = 1
-    current_url = url
-    while current_url and (page_count <= max_pages):
+    
+    while page_count <= max_pages:
+        current_url = build_url_with_loadmore(url, page_count)
         logging.info(f"Processing page {page_count}: {current_url}")
         browser = None
-        context = None
-        if page_count > 1:
-            current_url = f"{url}?page={page_count}"
+        page = None
+        
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(120000)
-
-                await safe_goto_and_wait(page, current_url)
-                log_event(f"Successfully loaded: {current_url}")
+                product_wrapper = '.grid-area--collection'
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, product_wrapper)
 
                 # Scroll to load all items
                 prev_count = 0
@@ -200,22 +203,27 @@ async def handle_moissanite(url, max_pages):
                         pass
 
                     # If metal type not found in variant data, try to extract from product name
-                    if metal_type == "N/A":
-                        gold_type_pattern = r"\b\d{1,2}(?:K|ct)?\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSilver\b"
-                        gold_type_match = re.search(gold_type_pattern, product_name, re.IGNORECASE)
-                        metal_type = gold_type_match.group() if gold_type_match else "N/A"
+                    gold_type_pattern = r"\b\d{1,2}(?:K|ct)?\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSilver\b"
+
+                    gold_type_match = re.search(gold_type_pattern, product_name, re.IGNORECASE)
+                    if gold_type_match:
+                        metal_type = gold_type_match.group().strip()
+                    else:
+                        metal_type = "N/A"
 
                     diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw)\b"
                     diamond_weight_match = re.search(diamond_weight_pattern, product_name, re.IGNORECASE)
                     diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                    
+                    additional_info_str = "N/A"
 
                     unique_id = str(uuid.uuid4())
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, metal_type, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, metal_type, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, metal_type, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, metal_type, price, diamond_weight, time_only, image_url,additional_info_str])
                 for row_num, unique_id, task in image_tasks:
                     try:
                         image_path = await asyncio.wait_for(task, timeout=60)
@@ -229,7 +237,7 @@ async def handle_moissanite(url, max_pages):
                                 image_path = "N/A"
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")
@@ -247,12 +255,20 @@ async def handle_moissanite(url, max_pages):
 
         page_count += 1
 
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
+
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

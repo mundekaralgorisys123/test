@@ -18,7 +18,7 @@ from playwright.async_api import async_playwright, TimeoutError, Error
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
-
+from proxysetup import get_browser_with_proxy_strategy
 # Load environment
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
@@ -95,7 +95,7 @@ async def handle_sarahandsebastian(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -110,15 +110,13 @@ async def handle_sarahandsebastian(url, max_pages):
         browser = None
         context = None
         if page_count > 1:
-            current_url = f"{url}?page={page_count}"
+            if '?' in current_url:
+                current_url = f"{url}&page={page_count}"
+            else:
+                current_url = f"{url}?page={page_count}"
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(120000)
-
-                await safe_goto_and_wait(page, current_url)
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, ".grid")
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all items
@@ -143,16 +141,35 @@ async def handle_sarahandsebastian(url, max_pages):
                 products = products[product_count:]  # Limit to first 10 products
                 product_count += len(products)
                 print(f"Total products on page {page_count}: {len(products)}")
+                
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
+                    additional_info = []
+                    
                     try:
                         name_tag = await product.query_selector("a[title] h3")
                         product_name = (await name_tag.inner_text()).strip() if name_tag else "N/A"
                     except Exception:
                         product_name = "N/A"
 
+                    # Improved price extraction
                     try:
-                        price_tag = await product.query_selector("p.text-xs.uppercase.font-calibre")
-                        price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
+                        price_tags = await product.query_selector_all("p.text-xs.uppercase.font-calibre")
+                        prices = []
+                        for price_tag in price_tags:
+                            price_text = (await price_tag.inner_text()).strip()
+                            if price_text and any(c.isdigit() for c in price_text):
+                                # Clean price text
+                                clean_price = re.sub(r'[^\d.]', '', price_text)
+                                if clean_price:
+                                    prices.append(f"${clean_price}")
+                        
+                        if len(prices) > 1:
+                            price = " | ".join(prices)
+                            additional_info.append(f"Multiple prices available")
+                        elif prices:
+                            price = prices[0]
+                        else:
+                            price = "N/A"
                     except Exception:
                         price = "N/A"
 
@@ -162,30 +179,64 @@ async def handle_sarahandsebastian(url, max_pages):
                     except Exception:
                         image_url = "N/A"
 
+                    # Get detailed description from hover section
+                    details_text = "N/A"
                     try:
-                        # Try to get more detailed description from hover section
                         details_tag = await product.query_selector("div.absolute.top-0.left-0.w-full h3")
-                        details_text = (await details_tag.inner_text()).strip() if details_tag else product_name
+                        details_text = (await details_tag.inner_text()).strip() if details_tag else "N/A"
+                        if details_text != "N/A":
+                            additional_info.append(f"Materials: {details_text}")
                     except Exception:
-                        details_text = product_name
+                        pass
 
                     # Extract gold type from either product name or details
                     gold_type_pattern = r"\b\d{1,2}(?:K|ct)?\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSilver\b"
                     gold_type_match = re.search(gold_type_pattern, details_text, re.IGNORECASE) or re.search(gold_type_pattern, product_name, re.IGNORECASE)
                     kt = gold_type_match.group() if gold_type_match else "Not found"
 
-                    # Extract diamond weight
-                    diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw|carat)\b"
-                    diamond_weight_match = re.search(diamond_weight_pattern, details_text, re.IGNORECASE) or re.search(diamond_weight_pattern, product_name, re.IGNORECASE)
-                    diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                    # Extract diamond weight and gemstone information
+                    diamond_weight = "N/A"
+                    try:
+                        diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw|carat)\b"
+                        diamond_weight_match = re.search(diamond_weight_pattern, details_text, re.IGNORECASE) or re.search(diamond_weight_pattern, product_name, re.IGNORECASE)
+                        diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                        
+                        # Extract gemstone information
+                        gemstone_pattern = r"\b(?:Opal|Sapphire|Diamond|Ruby|Emerald|Topaz|Amethyst)\b"
+                        gemstones = re.findall(gemstone_pattern, details_text, re.IGNORECASE)
+                        if gemstones:
+                            additional_info.append(f"Gemstones: {', '.join(gemstones)}")
+                    except Exception:
+                        pass
+
+                    # Check for sale or special tags
+                    try:
+                        sale_tag = await product.query_selector(".sale-badge, .sale-tag")
+                        if sale_tag:
+                            sale_text = (await sale_tag.inner_text()).strip()
+                            if sale_text:
+                                additional_info.append(f"Sale: {sale_text}")
+                    except Exception:
+                        pass
+
+                    # Check for wishlist button (popularity indicator)
+                    try:
+                        wishlist = await product.query_selector(".wishlist-icon")
+                        if wishlist:
+                            additional_info.append("Has wishlist option")
+                    except Exception:
+                        pass
+
+                    # Join all additional info with | delimiter
+                    additional_info_text = " | ".join(additional_info) if additional_info else "N/A"
 
                     unique_id = str(uuid.uuid4())
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight, additional_info_text))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url, additional_info_text])
 
                 for row_num, unique_id, task in image_tasks:
                     try:
@@ -200,7 +251,7 @@ async def handle_sarahandsebastian(url, max_pages):
                                 image_path = "N/A"
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")

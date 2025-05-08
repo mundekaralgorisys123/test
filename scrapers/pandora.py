@@ -44,29 +44,6 @@ def modify_image_url(image_url):
 
     return modified_url + query_params  # Append query parameters if they exist
 
-# async def download_image_async(image_url, product_name, timestamp, image_folder, unique_id, retries=3):
-#     if not image_url or image_url == "N/A":
-#         return "N/A"
-#     headers = {
-#     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-#         }
-
-#     image_filename = f"{unique_id}_{timestamp}.jpg"
-#     image_full_path = os.path.join(image_folder, image_filename)
- 
-
-#     async with httpx.AsyncClient(timeout=10.0) as client:
-#         for attempt in range(retries):
-#             try:
-#                 response = await client.get(image_url, headers=headers)
-#                 response.raise_for_status()
-#                 with open(image_full_path, "wb") as f:
-#                     f.write(response.content)
-#                 return image_full_path
-#             except httpx.RequestError as e:
-#                 logging.warning(f"Retry {attempt + 1}/{retries} - Error downloading {product_name}: {e}")
-#     logging.error(f"Failed to download {product_name} after {retries} attempts.")
-#     return "N/A"
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
