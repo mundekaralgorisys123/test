@@ -1,17 +1,14 @@
 import os
-import time
 import logging
 import aiohttp
 import asyncio
-import concurrent.futures
 from datetime import datetime
-from io import BytesIO
 from playwright.async_api import async_playwright, TimeoutError
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image
 import uuid
 import base64
-from utils import get_public_ip, log_event, sanitize_filename
+from utils import get_public_ip
 from database import insert_into_db, create_table
 from limit_checker import update_product_count
 import random
@@ -150,6 +147,7 @@ async def handle_helzberg(url, max_pages):
             async with async_playwright() as p:
                 product_wrapper = '.row.product-grid'
                 browser, page = await get_browser_with_proxy_strategy(p, current_url, product_wrapper)
+                
                 pages_processed += 1
 
                 # Scroll to load lazy content

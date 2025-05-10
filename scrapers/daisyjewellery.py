@@ -24,6 +24,7 @@ from openpyxl.drawing.image import Image as XLImage
 import httpx
 # Load environment variables from .env file
 from functools import partial
+from proxysetup import get_browser_with_proxy_strategy
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
 
@@ -139,7 +140,7 @@ async def handle_daisyjewellery(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -148,7 +149,7 @@ async def handle_daisyjewellery(url, max_pages):
 
     page_count = 1
     success_count = 0
-
+    prev_prod = 0
     while page_count <= max_pages:
         current_url = f"{url}?page={page_count}"
         logging.info(f"Processing page {page_count}: {current_url}")
@@ -158,14 +159,7 @@ async def handle_daisyjewellery(url, max_pages):
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                
-                # Configure timeouts for this page
-                page = await context.new_page()
-                page.set_default_timeout(120000)  # 2 minute timeout
-                
-                await safe_goto_and_wait(page, current_url)
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, ".product-items")
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all products
@@ -181,9 +175,10 @@ async def handle_daisyjewellery(url, max_pages):
 
 
                 product_wrapper = await page.query_selector("div.product-items > ul")
-                products =  await page.query_selector_all("div.product-items > ul > li")if product_wrapper else []
+                products =  await page.query_selector_all("div.product-items > ul > li") if product_wrapper else []
+                products = products[prev_prod:]
                 logging.info(f"Total products found on page {page_count}: {len(products)}")
-
+                prev_prod += len(products)
                 page_title = await page.title()
                 current_date = datetime.now().strftime("%Y-%m-%d")
                 time_only = datetime.now().strftime("%H.%M")
@@ -192,17 +187,49 @@ async def handle_daisyjewellery(url, max_pages):
                 image_tasks = []
 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
+                    additional_info = []
+                    
                     try:
+                        # Get product name and variant
                         product_name = await (await product.query_selector("h3")).inner_text()
-                    except:
+                        variant_tag = await product.query_selector("p.ais-hit--variant span")
+                        variant_text = await variant_tag.inner_text() if variant_tag else None
+                        
+                        # Merge product name with variant if available
+                        if variant_text and variant_text != "N/A":
+                            product_name = f"{product_name}, {variant_text}"
+                            
+                    except Exception as e:
+                        print(f"Error fetching product name: {e}")
                         product_name = "N/A"
 
                     try:
-                        price = await (await product.query_selector("span.price__amount")).inner_text()
-                    except:
+                        # Handle price information
+                        standard_price_tag = await product.query_selector("p.ais-hit--price b.standard-price")
+                        standard_price = await standard_price_tag.inner_text() if standard_price_tag else None
+                        
+                        discounted_price_tag = await product.query_selector("p.ais-hit--price b.full-price")
+                        discounted_price = await discounted_price_tag.inner_text() if discounted_price_tag else None
+                        
+                        if standard_price and discounted_price:
+                            price = f"{discounted_price}|{standard_price}"
+                        elif standard_price:
+                            price = standard_price
+                        else:
+                            price = "N/A"
+                            
+                        # Add discount info to additional info if available
+                        discount_percent_tag = await product.query_selector('span.ais-hit--price-discount')
+                        if discount_percent_tag:
+                            discount_text = await discount_percent_tag.inner_text()
+                            additional_info.append(f"Discount: {discount_text}")
+                            
+                    except Exception as e:
+                        print(f"Error fetching price: {e}")
                         price = "N/A"
-
+                        
                     try:
+                        # Get image URL
                         image_url = await (await product.query_selector("span.product__image--first")).get_attribute("style")
                         image_url = image_url.split('url(')[1].split(')')[0]  # Extract the URL from style attribute
                         # Prepend the 'https:' protocol to the relative URL
@@ -211,8 +238,11 @@ async def handle_daisyjewellery(url, max_pages):
                     except:
                         image_url = "N/A"
 
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue
 
-
+                    # Extract gold type
                     gold_type_match = re.findall(r"(\d{1,2}ct\s*(?:Yellow|White|Rose)?\s*Gold|Platinum)", product_name, re.IGNORECASE)
                     kt = ", ".join(gold_type_match) if gold_type_match else "N/A"
 
@@ -220,13 +250,54 @@ async def handle_daisyjewellery(url, max_pages):
                     diamond_weight_match = re.findall(r"(\d+(?:\.\d+)?\s*ct)", product_name, re.IGNORECASE)
                     diamond_weight = ", ".join(diamond_weight_match) if diamond_weight_match else "N/A"
 
+                    try:
+                        # Get availability information
+                        availability_tag = await product.query_selector('span.ais-hit--cart-button__disabled')
+                        if availability_tag:
+                            availability_text = await availability_tag.inner_text()
+                            additional_info.append(f"Availability: {availability_text}")
+                    except:
+                        pass
+
+                    try:
+                        # Get tags/labels
+                        tags = []
+                        tag_elements = await product.query_selector_all('span.ais-tag')
+                        for tag in tag_elements:
+                            tag_text = await tag.inner_text()
+                            if tag_text.strip():
+                                tags.append(tag_text)
+                        if tags:
+                            additional_info.append(f"Tags: {'|'.join(tags)}")
+                    except:
+                        pass
+
+                    try:
+                        # Get vendor information
+                        vendor = await product.get_attribute('data-vendor')
+                        if vendor:
+                            additional_info.append(f"Vendor: {vendor}")
+                    except:
+                        pass
+
+                    try:
+                        # Get SKU information
+                        sku = await product.get_attribute('data-sku')
+                        if sku:
+                            additional_info.append(f"SKU: {sku}")
+                    except:
+                        pass
+
+                    # Combine all additional info with pipe delimiter
+                    additional_info_text = "|".join(additional_info) if additional_info else ""
+
                     unique_id = str(uuid.uuid4())
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight, additional_info_text))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url, additional_info_text])
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -243,7 +314,7 @@ async def handle_daisyjewellery(url, max_pages):
                         
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")

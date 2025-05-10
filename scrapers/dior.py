@@ -12,18 +12,13 @@ import httpx
 from PIL import Image as PILImage
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
-from flask import Flask
-from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError, Error
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
-import json
 import mimetypes
+from proxysetup import get_browser_with_proxy_strategy
 
-# Load environment
-load_dotenv()
-PROXY_URL = os.getenv("PROXY_URL")
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
@@ -111,24 +106,10 @@ async def scroll_to_bottom(page):
             break
         last_height = new_height
 
-# Reliable page.goto wrapper
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-            await page.wait_for_selector(".MuiGrid-root.MuiGrid-container", state="attached", timeout=30000)
-            print("[Success] Product listing loaded.")
-            return
-        except (Error, TimeoutError) as e:
-            logging.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
-            if attempt < retries - 1:
-                random_delay(1, 3)
-            else:
-                raise
 
 # Main scraper function
 async def handle_dior(url, max_pages=None):
+    
     ip_address = get_public_ip()
     logging.info(f"Scraping started for: {url} from IP: {ip_address}")
 
@@ -140,7 +121,7 @@ async def handle_dior(url, max_pages=None):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -151,12 +132,8 @@ async def handle_dior(url, max_pages=None):
     
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.connect_over_cdp(PROXY_URL)
-            context = await browser.new_context()
-            page = await context.new_page()
-            page.set_default_timeout(120000)
-
-            await safe_goto_and_wait(page, url)
+            product_wrapper = '.MuiGrid-root.MuiGrid-container'
+            browser, page = await get_browser_with_proxy_strategy(p, url, product_wrapper)
             log_event(f"Successfully loaded: {url}")
 
             # Scroll to load all items
@@ -203,14 +180,24 @@ async def handle_dior(url, max_pages=None):
                     image_url = "N/A"
 
                 # Extract gold type (kt) from description
-                gold_type_pattern = r"\b\d{1,2}(?:K|ct)?\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSilver\b"
-                gold_type_match = re.search(gold_type_pattern, description, re.IGNORECASE)
-                kt = gold_type_match.group() if gold_type_match else "Not found"
+                try:
+                    # Extract metal type (e.g. “White Gold”)
+                    metal_tag = await product.query_selector(
+                        "span.MuiTypography-label-m-regular, span.DS-Typography"
+                    )
+                    kt = (await metal_tag.inner_text()).strip() if metal_tag else "N/A"
+                except Exception:
+                    kt = "N/A"
+
 
                 # Extract diamond weight from description
                 diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw)\b"
                 diamond_weight_match = re.search(diamond_weight_pattern, description, re.IGNORECASE)
                 diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                
+                additional_info_str = "N/A "
+                
+              
 
                 unique_id = str(uuid.uuid4())
                 if image_url and image_url != "N/A":
@@ -218,8 +205,8 @@ async def handle_dior(url, max_pages=None):
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
             
             # Process image downloads
             for row_num, unique_id, task in image_tasks:
@@ -235,7 +222,7 @@ async def handle_dior(url, max_pages=None):
                             image_path = "N/A"
                     for i, record in enumerate(records):
                         if record[0] == unique_id:
-                            records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                            records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                             break
                 except asyncio.TimeoutError:
                     logging.warning(f"Image download timed out for row {row_num}")
@@ -250,12 +237,20 @@ async def handle_dior(url, max_pages=None):
         if page: await page.close()
         if browser: await browser.close()
 
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
+
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

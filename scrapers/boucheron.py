@@ -10,22 +10,17 @@ from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError, Error
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image
-from flask import Flask
 from PIL import Image as PILImage
-import requests
-import concurrent.futures
-from utils import get_public_ip, log_event, sanitize_filename
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+from collections import OrderedDict
+from utils import get_public_ip, log_event
 from dotenv import load_dotenv
 from database import insert_into_db
 from limit_checker import update_product_count
-import aiohttp
 from io import BytesIO
 from openpyxl.drawing.image import Image as XLImage
 import httpx
-# Load environment variables from .env file
-from functools import partial
-load_dotenv()
-PROXY_URL = os.getenv("PROXY_URL")
+from proxysetup import get_browser_with_proxy_strategy
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
@@ -67,13 +62,12 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
     if not image_url or image_url == "N/A":
         return "N/A"
 
-    image_filename = f"{unique_id}_{timestamp}.webp"  # Start with .webp to handle the original format
+    image_filename = f"{unique_id}_{timestamp}.webp"
     image_full_path = os.path.join(image_folder, image_filename)
 
-    # Configure client to follow redirects and add browser-like headers
     async with httpx.AsyncClient(
         timeout=10.0,
-        follow_redirects=True,  # Automatically follow redirects
+        follow_redirects=True,
         headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "Accept": "image/webp,image/apng,image/*,*/*;q=0.8"
@@ -84,32 +78,34 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
                 response = await client.get(image_url)
                 response.raise_for_status()
 
-                # Get final URL after redirects
-                final_url = str(response.url)
-                logging.info(f"Successfully resolved redirect for {product_name}: {image_url} -> {final_url}")
+                # ✅ Check for image content-type
+                content_type = response.headers.get("Content-Type", "")
+                if not content_type.startswith("image/"):
+                    logging.warning(f"Invalid content-type for {product_name}: {content_type}")
+                    return "N/A"
 
-                # Save the .webp image initially
+                final_url = str(response.url)
+                logging.info(f"Resolved redirect for {product_name}: {image_url} -> {final_url}")
+
+                # Save the .webp file
                 with open(image_full_path, "wb") as f:
                     f.write(response.content)
 
-                # Convert the .webp image to a .jpg or .png
+                # Convert .webp to .jpg
                 if image_full_path.lower().endswith('.webp'):
                     with PILImage.open(image_full_path) as img:
-                        new_image_path = image_full_path.rsplit('.', 1)[0] + '.jpg'  # Convert to JPG
+                        new_image_path = image_full_path.rsplit('.', 1)[0] + '.jpg'
                         img.convert("RGB").save(new_image_path, 'JPEG')
-                    
-                    # Update the path to the new image format
                     image_full_path = new_image_path
 
                 return image_full_path
 
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 302:
-                    # Extract location from headers if needed
                     redirect_location = e.response.headers.get("location")
-                    logging.info(f"Following redirect for {product_name}: {redirect_location}")
-                    image_url = redirect_location  # Update URL to follow redirect
-                    continue
+                    if redirect_location:
+                        image_url = redirect_location
+                        continue
                 logging.warning(f"Retry {attempt + 1}/{retries} - HTTP error for {product_name}: {e}")
                 await asyncio.sleep(1)
 
@@ -117,48 +113,29 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
                 logging.warning(f"Retry {attempt + 1}/{retries} - Connection error for {product_name}: {e}")
                 await asyncio.sleep(1)
 
-        logging.error(f"Failed to download {product_name} after {retries} attempts")
+        logging.error(f"Failed to download image for {product_name} after {retries} attempts")
         return "N/A"
-        
+
 
 def random_delay(min_sec=1, max_sec=3):
     """Introduce a random delay to mimic human-like behavior."""
     time.sleep(random.uniform(min_sec, max_sec))
 
 
+def build_url_with_loadmore(base_url: str, page_number: int) -> str:
+    parsed_url = urlparse(base_url)
+    existing_params = OrderedDict(parse_qsl(parsed_url.query))
 
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
+    # Insert or move 'p' to the beginning
+    existing_params.pop('p', None)
+    new_params = OrderedDict()
+    new_params['p'] = str(page_number)
+    new_params.update(existing_params)
 
-
-            # Wait for the selector with a longer timeout
-            product_cards = await page.wait_for_selector('.products.wrapper', state="attached", timeout=30000)
-
-
-            # Optionally validate at least 1 is visible (Playwright already does this)
-            if product_cards:
-                print("[Success] Product cards loaded.")
-                return
-        except Error as e:
-            logging.error(f"Error navigating to {url} on attempt {attempt + 1}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
-        except TimeoutError as e:
-            logging.warning(f"TimeoutError on attempt {attempt + 1} navigating to {url}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
-
+    # Reconstruct URL with new query string
+    new_query = urlencode(new_params)
+    new_url = urlunparse(parsed_url._replace(query=new_query))
+    return new_url
             
 
 async def handle_boucheron(url, max_pages):
@@ -186,7 +163,7 @@ async def handle_boucheron(url, max_pages):
     success_count = 0
 
     while page_count <= max_pages:
-        current_url = f"{url}?p={page_count}"
+        current_url = build_url_with_loadmore(url, page_count)
         logging.info(f"Processing page {page_count}: {current_url}")
         
         # Create a new browser instance for each page
@@ -194,15 +171,9 @@ async def handle_boucheron(url, max_pages):
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
                 
-                # Configure timeouts for this page
-                page = await context.new_page()
-                page.set_default_timeout(120000)  # 2 minute timeout
-                
-                await safe_goto_and_wait(page, current_url)
-                log_event(f"Successfully loaded: {current_url}")
+                product_wrapper=".products.wrapper"
+                browser, page = await get_browser_with_proxy_strategy(p, current_url ,product_wrapper)
 
                 # Scroll to load all products
                 prev_product_count = 0

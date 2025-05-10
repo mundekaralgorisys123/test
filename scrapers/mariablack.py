@@ -20,7 +20,7 @@ from database import insert_into_db
 from limit_checker import update_product_count
 import json
 import mimetypes
-
+from proxysetup import get_browser_with_proxy_strategy
 # Load environment
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
@@ -173,21 +173,6 @@ async def scroll_to_bottom(page, max_wait_time=60):
 
         last_height = new_height
 
-# Reliable page.goto wrapper
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-            await page.wait_for_selector("div.listing-page", state="attached", timeout=30000)
-            print("[Success] Product listing loaded.")
-            return
-        except (Error, TimeoutError) as e:
-            logging.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
-            if attempt < retries - 1:
-                random_delay(1, 3)
-            else:
-                raise
 
 # Main scraper function
 async def handle_mariablack(url, max_pages=None):
@@ -202,23 +187,17 @@ async def handle_mariablack(url, max_pages=None):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Material", "Price", "Gemstone Info", 
+               "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
     filename = f"handle_mariablack_{datetime.now().strftime('%Y-%m-%d_%H.%M')}.xlsx"
     file_path = os.path.join(EXCEL_DATA_PATH, filename)
-    browser = None
-    page = None
     
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.connect_over_cdp(PROXY_URL)
-            context = await browser.new_context()
-            page = await context.new_page()
-            page.set_default_timeout(120000)
-
-            await safe_goto_and_wait(page, url)
+            browser, page = await get_browser_with_proxy_strategy(p, url, "div.listing-page")
             log_event(f"Successfully loaded: {url}")
 
             # Scroll to load all items
@@ -228,52 +207,117 @@ async def handle_mariablack(url, max_pages=None):
             current_date = datetime.now().strftime("%Y-%m-%d")
             time_only = datetime.now().strftime("%H.%M")
 
-            # Get all product tiles - updated selector
-           
+            # Get all product tiles
             product_tiles = await page.query_selector_all("div[data-product-listing-result-id]")
-
-
             logging.info(f"Total products found: {len(product_tiles)}")
-            print(f"Total products found: {len(product_tiles)}")
+            
             records = []
             image_tasks = []
             
             for row_num, product in enumerate(product_tiles, start=len(sheet["A"]) + 1):
+                additional_info = []
+                
+                # Extract product name and material
+                product_name = "N/A"
+                material = "N/A"
                 try:
                     name_tag = await product.query_selector("h2.css-1en0x6u")
-                    product_name = await name_tag.inner_text() if name_tag else "N/A"
-                except Exception:
+                    material_tag = await product.query_selector("p.css-1w0gz9y")
+                    
+                    name_text = (await name_tag.inner_text()).strip() if name_tag else ""
+                    material_text = (await material_tag.inner_text()).strip() if material_tag else ""
+                    
+                    if name_text and material_text:
+                        product_name = f"{name_text} - {material_text}"
+                    elif name_text:
+                        product_name = name_text
+                    else:
+                        product_name = "N/A"
+                        
+                    material = material_text if material_text else "N/A"
+                except Exception as e:
+                    logging.error(f"Error getting product name/material: {str(e)}")
                     product_name = "N/A"
+                    material = "N/A"
 
+                # Extract price information
+                price_text = "N/A"
                 try:
                     price_tag = await product.query_selector("p.css-1p1d7hf")
-                    price = await price_tag.inner_text() if price_tag else "N/A"
-                except Exception:
-                    price = "N/A"
-                                
-                
+                    if price_tag:
+                        price = (await price_tag.inner_text()).strip()
+                        price_text = f"Price: {price}"
+                except Exception as e:
+                    logging.error(f"Error getting price: {str(e)}")
+                    price_text = "N/A"
 
+                # Extract product URL
+                product_url = "N/A"
+                try:
+                    product_link = await product.query_selector("a.css-1qj8w5r")
+                    if product_link:
+                        product_url = await product_link.get_attribute("href")
+                        if product_url and product_url != "N/A":
+                            if not product_url.startswith('http'):
+                                product_url = f"https://www.maria-black.com{product_url}"
+                            additional_info.append(f"URL: {product_url}")
+                except Exception as e:
+                    logging.error(f"Error getting product URL: {str(e)}")
+
+                # Check for "New" badge
+                try:
+                    new_badge = await product.query_selector("div.css-1kc361l")
+                    if new_badge:
+                        badge_text = (await new_badge.inner_text()).strip()
+                        if badge_text and badge_text != "N/A":
+                            additional_info.append(f"Status: {badge_text}")
+                except Exception as e:
+                    logging.error(f"Error getting badge: {str(e)}")
+
+                # Extract image URLs - improved extraction
                 image_url = "N/A"
                 try:
-                    image_tag = await product.query_selector("a.css-rdseb6 img")
-                    if image_tag:
-                        image_url = await image_tag.get_attribute("src")
-                        if not image_url.startswith(("http://", "https://")):
-                            image_url = f"https://www.maria-black.com{image_url}"
+                    # First try the main product image container
+                    image_container = await product.query_selector("a.css-rdseb6")
+                    if image_container:
+                        # Try getting the first img tag within the container
+                        img_tag = await image_container.query_selector("img")
+                        if img_tag:
+                            image_url = await img_tag.get_attribute("src")
+                            if image_url and image_url != "N/A":
+                                if not image_url.startswith('http'):
+                                    image_url = f"https:{image_url}" if image_url.startswith('//') else f"https://www.maria-black.com{image_url}"
+                                # Clean up URL parameters if needed
+                                image_url = image_url.split('?')[0] if '?' in image_url else image_url
+                    
+                    # If still no image, try alternative selectors
+                    if image_url == "N/A":
+                        img_tags = await product.query_selector_all("img")
+                        for img in img_tags:
+                            src = await img.get_attribute("src")
+                            if src and "maria-black-products.imgix.net" in src:
+                                image_url = src.split('?')[0] if '?' in src else src
+                                break
                 except Exception as e:
-                    log_event(f"Error getting image URL: {e}")
+                    logging.error(f"Error getting image URL: {str(e)}")
                     image_url = "N/A"
 
+                if product_name == "N/A" or price_text == "N/A" or image_url == "N/A":
+                    logging.warning(f"Skipping product due to missing data: Name: {product_name}, Price: {price_text}, Image: {image_url}")
+                    continue
+                
+                # Extract gemstone information from product name
+                gemstone_info = "N/A"
+                try:
+                    gemstone_pattern = r"\b(Diamond|Ruby|Sapphire|Emerald|Aquamarine|Pearl|Onyx|Topaz|Opal|Amethyst|Citrine|Garnet|Peridot)\b"
+                    gemstone_match = re.search(gemstone_pattern, product_name, re.IGNORECASE)
+                    gemstone_info = gemstone_match.group() if gemstone_match else "N/A"
+                except Exception as e:
+                    logging.error(f"Error getting gemstone info: {str(e)}")
+                    gemstone_info = "N/A"
 
-                # Extract gold type (kt) from product name
-                gold_type_pattern = r"\b\d{1,2}(?:K|kt|ct)\b|\bRose Gold\b|\bWhite Gold\b|\bYellow Gold\b|\bPlatinum\b|\bSilver\b"
-                gold_type_match = re.search(gold_type_pattern, product_name, re.IGNORECASE)
-                kt = gold_type_match.group() if gold_type_match else "Not found"
-
-                # Extract diamond weight from product name
-                diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw|carat)\b"
-                diamond_weight_match = re.search(diamond_weight_pattern, product_name, re.IGNORECASE)
-                diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                # Combine all additional info with | separator
+                additional_info_text = " | ".join(additional_info) if additional_info else ""
 
                 unique_id = str(uuid.uuid4())
                 if image_url and image_url != "N/A":
@@ -281,8 +325,10 @@ async def handle_mariablack(url, max_pages=None):
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                records.append((unique_id, current_date, page_title, product_name, None, material, 
+                              price_text, gemstone_info, additional_info_text))
+                sheet.append([current_date, page_title, product_name, None, material, price_text, 
+                            gemstone_info, time_only, image_url, additional_info_text])
             
             # Process image downloads
             for row_num, unique_id, task in image_tasks:
@@ -298,7 +344,8 @@ async def handle_mariablack(url, max_pages=None):
                             image_path = "N/A"
                     for i, record in enumerate(records):
                         if record[0] == unique_id:
-                            records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                            records[i] = (record[0], record[1], record[2], record[3], image_path, 
+                                         record[5], record[6], record[7], record[8])
                             break
                 except asyncio.TimeoutError:
                     logging.warning(f"Image download timed out for row {row_num}")

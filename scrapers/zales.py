@@ -343,10 +343,6 @@ async def handle_zales(url, max_pages):
                     except:
                         product_name = "N/A"
 
-                    # try:
-                    #     price = await (await product.query_selector("div.price")).inner_text()
-                    # except:
-                    #     price = "N/A"
                     
                     try:
                         # Extract current price (the offer price if available)

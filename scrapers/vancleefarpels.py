@@ -1,10 +1,12 @@
 import asyncio
+import random
 import re
 import os
 import uuid
 import logging
 import base64
 from datetime import datetime
+import aiofiles
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image
 from flask import Flask
@@ -14,64 +16,52 @@ from database import insert_into_db
 from limit_checker import update_product_count
 import httpx
 from playwright.async_api import async_playwright, TimeoutError
-
-# Load .env variables
-load_dotenv()
-PROXY_URL = os.getenv("PROXY_URL")
+from proxysetup import get_browser_with_proxy_strategy
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
 
-def modify_image_url(image_url):
-    """Modify the image URL to replace '_260' with '_1200' while keeping query parameters."""
-    if not image_url or image_url == "N/A":
-        return image_url
-
-    # Extract and preserve query parameters
-    query_params = ""
-    if "?" in image_url:
-        image_url, query_params = image_url.split("?", 1)
-        query_params = f"?{query_params}"
-
-    # Replace '_260' with '_1200' while keeping the rest of the URL intact
-    modified_url = re.sub(r'(_260)(?=\.\w+$)', '_1200', image_url)
-
-    return modified_url + query_params  # Append query parameters if they exist
 
 async def download_image_async(image_url, product_name, timestamp, image_folder, unique_id, retries=3):
-    if not image_url or image_url == "N/A":
-        return "N/A"
+    image_name = f"{product_name}_{timestamp}_{unique_id}.jpg"
+    image_path = os.path.join(image_folder, image_name)
 
-    image_filename = f"{unique_id}_{timestamp}.jpg"
-    image_full_path = os.path.join(image_folder, image_filename)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://www.vancleefarpels.com/",
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
 
-    # Use httpx.AsyncClient for asynchronous requests
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        for attempt in range(retries):
-            try:
+    for attempt in range(retries):
+        try:
+            async with httpx.AsyncClient(timeout=20, headers=headers) as client:
                 response = await client.get(image_url)
-                response.raise_for_status()  # Raises an exception for 4xx/5xx status codes
-                
-                # Successfully downloaded image
-                with open(image_full_path, "wb") as f:
+                response.raise_for_status()
+                with open(image_path, 'wb') as f:
                     f.write(response.content)
+                print(f"[Downloaded] {image_path}")
+                return image_path
 
-                logging.info(f"Successfully downloaded {product_name} to {image_full_path}")
-                return image_full_path
+        except httpx.ReadTimeout:
+            print(f"[Timeout] Attempt {attempt + 1}/{retries} - {image_url}")
+            await asyncio.sleep(1.5 * (attempt + 1))
 
-            except httpx.RequestError as e:
-                logging.warning(f"Retry {attempt + 1}/{retries} - Error downloading {product_name} from {image_url}: {e}")
+        except httpx.HTTPStatusError as e:
+            print(f"[HTTP Error] {e.response.status_code} - {image_url}")
+            return None
 
-                # Optionally, log the response details if available
-                if e.response:
-                    logging.debug(f"Response status: {e.response.status_code}, content: {e.response.text}")
-                
-                # If it's the last attempt, log the failure
-                if attempt == retries - 1:
-                    logging.error(f"Failed to download {product_name} after {retries} attempts from {image_url}")
+        except Exception as e:
+            print(f"[Error] {e} while downloading {image_url}")
+            return None
 
-    return "N/A"
+    print(f"[Failed] {image_url}")
+    return None
 
 async def handle_vancleefarpels(url, max_pages):
     ip_address = get_public_ip()
@@ -104,16 +94,8 @@ async def handle_vancleefarpels(url, max_pages):
         while load_more_clicks <= max_pages:
             async with async_playwright() as p:
                 # Create a new browser instance for each page
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                page = await browser.new_page()
-
-                try:
-                    await page.goto(url, timeout=120000)
-                except Exception as e:
-                    logging.warning(f"Failed to load URL {url}: {e}")
-                    await browser.close()
-                    continue  # move to the next iteration
-
+                product_wrapper = "ul.results-list.grid-mode"
+                browser, page = await get_browser_with_proxy_strategy(p, url,product_wrapper)
                 # Simulate clicking 'Load More' number of times
                 for _ in range(load_more_clicks - 1):
                     try:
@@ -186,8 +168,12 @@ async def handle_vancleefarpels(url, max_pages):
 
                     # image_url should now contain the extracted URL or "N/A" if an error occurs
 
-
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue 
+                    
                     print(image_url)
+                    
                     kt_match = re.search(r"\b\d{1,2}K\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSilver\b", product_name, re.IGNORECASE)
                     kt = kt_match.group() if kt_match else "Not found"
 
@@ -220,17 +206,21 @@ async def handle_vancleefarpels(url, max_pages):
         # Save Excel
         filename = f'handle_vancleefarpels_{datetime.now().strftime("%Y-%m-%d_%H.%M")}.xlsx'
         file_path = os.path.join(EXCEL_DATA_PATH, filename)
+        if not records:
+            return None, None, None
+
+        # Save the workbook
         wb.save(file_path)
-        log_event(f"Data saved to {file_path} | IP: {ip_address}")
+        log_event(f"Data saved to {file_path}")
 
-        if records:
-            insert_into_db(records)
-        else:
-            logging.info("No data to insert into the database.")
+        # Encode the file in base64
+        with open(file_path, "rb") as file:
+            base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
-        update_product_count(len(seen_ids))
+        # Insert data into the database and update product count
+        insert_into_db(records)
+        update_product_count(len(records))
 
-        with open(file_path, "rb") as f:
-            base64_encoded = base64.b64encode(f.read()).decode("utf-8")
-
+        # Return necessary information
         return base64_encoded, filename, file_path
+

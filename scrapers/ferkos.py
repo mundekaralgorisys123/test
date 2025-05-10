@@ -17,8 +17,9 @@ from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError, Error
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
+import json
 from limit_checker import update_product_count
-
+from proxysetup import get_browser_with_proxy_strategy
 # Load environment
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
@@ -94,7 +95,7 @@ async def handle_ferkos(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -106,17 +107,15 @@ async def handle_ferkos(url, max_pages):
     while (page_count <= max_pages):
         logging.info(f"Processing page {page_count}: {current_url}")
         browser = None
-        context = None
+        page = None
         if page_count > 1:
-            current_url = f"{url}?page={page_count}"
+            if '?' in url:
+                current_url = f"{url}&page={page_count}"
+            else:
+                current_url = f"{url}?page={page_count}"
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(120000)
-
-                await safe_goto_and_wait(page, current_url)
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, ".itemlistbasildi")
                 log_event(f"Successfully loaded: {current_url}")
             
                 # Scroll to load all items
@@ -140,28 +139,74 @@ async def handle_ferkos(url, max_pages):
                 image_tasks = []
 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
+                    additional_info = []
+                    
                     try:
-                        # Product name
+                        # Improved product name extraction
                         name_tag = await product.query_selector(".boost-sd__product-title")
-                        product_name = (await name_tag.inner_text()).strip() if name_tag else "N/A"
-                    except Exception:
+                        if name_tag:
+                            product_name = (await name_tag.inner_text()).strip()
+                            # Fallback to data-product attribute if name is empty
+                            if not product_name:
+                                product_data = await product.get_attribute("data-product")
+                                if product_data:
+                                    product_json = json.loads(product_data.replace("&quot;", '"'))
+                                    product_name = product_json.get("handle", "").replace("-", " ").title()
+                        else:
+                            # Try alternative selectors if main selector fails
+                            alt_name_tag = await product.query_selector(".product-title") or \
+                                         await product.query_selector(".product-name") or \
+                                         await product.query_selector("h3")
+                            product_name = (await alt_name_tag.inner_text()).strip() if alt_name_tag else "N/A"
+                            
+                        # Clean up the product name
+                        if product_name != "N/A":
+                            product_name = ' '.join(product_name.split())  # Remove extra spaces
+                            
+                    except Exception as e:
+                        logging.error(f"Error extracting product name: {e}")
                         product_name = "N/A"
 
                     try:
-                        # Price (simplified)
-                        price_tag = await product.query_selector(".boost-sd__product-price--sale") or \
-                                await product.query_selector(".boost-sd__product-price--compare")
-                        price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
-                    except Exception:
+                        # Price handling - get both sale and compare prices
+                        sale_price_tag = await product.query_selector(".boost-sd__product-price--sale .boost-sd__format-currency")
+                        compare_price_tag = await product.query_selector(".boost-sd__product-price--compare .boost-sd__format-currency")
+                        
+                        sale_price = (await sale_price_tag.inner_text()).strip() if sale_price_tag else None
+                        compare_price = (await compare_price_tag.inner_text()).strip() if compare_price_tag else None
+                        
+                        if sale_price and compare_price:
+                            price = f"{sale_price}|{compare_price}"
+                            # Calculate discount percentage
+                            try:
+                                sale_num = float(sale_price.replace('$', '').replace(',', ''))
+                                compare_num = float(compare_price.replace('$', '').replace(',', ''))
+                                discount_percent = int(round((1 - (sale_num / compare_num)) * 100))
+                                additional_info.append(f"Discount: {discount_percent}%")
+                            except:
+                                pass
+                        elif sale_price:
+                            price = sale_price
+                        else:
+                            price = "N/A"
+                    except Exception as e:
+                        logging.error(f"Error extracting price: {e}")
                         price = "N/A"
 
                     try:
-                        # Simplified image extraction - just get first src
+                        # Image extraction - get main image
                         image_tag = await product.query_selector("img.boost-sd__product-image-img--main") or \
                                 await product.query_selector("img.boost-sd__product-image-img")
                         image_url = await image_tag.get_attribute("src") if image_tag else "N/A"
-                    except Exception:
+                        if image_url and image_url.startswith("//"):
+                            image_url = "https:" + image_url
+                    except Exception as e:
+                        logging.error(f"Error extracting image: {e}")
                         image_url = "N/A"
+
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue
 
                     # Gold type detection (from swatches or name)
                     gold_type = "Not found"
@@ -174,22 +219,43 @@ async def handle_ferkos(url, max_pages):
                                 if "Gold" in label_text:
                                     gold_type = label_text.split(": ")[-1]
                                     break
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logging.error(f"Error extracting gold type: {e}")
 
                     # Diamond weight from name
                     diamond_weight = "N/A"
-                    diamond_weight_match = re.search(r"\b\d+(\.\d+)?\s*(?:ct|tcw)\b", product_name, re.IGNORECASE)
-                    if diamond_weight_match:
-                        diamond_weight = diamond_weight_match.group()
+                    try:
+                        diamond_weight_match = re.search(r"\b\d+(\.\d+)?\s*(?:ct|tcw)\b", product_name, re.IGNORECASE)
+                        if diamond_weight_match:
+                            diamond_weight = diamond_weight_match.group()
+                    except Exception as e:
+                        logging.error(f"Error extracting diamond weight: {e}")
+
+                    # Get product labels/tags
+                    try:
+                        labels = []
+                        label_tags = await product.query_selector_all(".boost-sd__product-label-text")
+                        for label in label_tags:
+                            label_text = (await label.inner_text()).strip()
+                            if label_text:
+                                labels.append(label_text)
+                        if labels:
+                            additional_info.append(f"Labels: {'|'.join(labels)}")
+                    except Exception as e:
+                        logging.error(f"Error extracting labels: {e}")
+
+                    # Combine all additional info with pipe delimiter
+                    additional_info_text = "|".join(additional_info) if additional_info else ""
 
                     unique_id = str(uuid.uuid4())
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, gold_type, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, gold_type, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, gold_type, price, diamond_weight, additional_info_text))
+                    sheet.append([current_date, page_title, product_name, None, gold_type, price, diamond_weight, time_only, image_url, additional_info_text])
+
+                # Process images and update records
                 for row_num, unique_id, task in image_tasks:
                     try:
                         image_path = await asyncio.wait_for(task, timeout=60)
@@ -203,7 +269,7 @@ async def handle_ferkos(url, max_pages):
                                 image_path = "N/A"
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")

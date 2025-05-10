@@ -14,7 +14,7 @@ from database import insert_into_db
 from limit_checker import update_product_count
 import httpx
 from playwright.async_api import async_playwright, TimeoutError
-
+from proxysetup import get_browser_with_proxy_strategy
 # Load .env variables
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
@@ -90,7 +90,7 @@ async def handle_missoma(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     current_date = datetime.now().strftime("%Y-%m-%d")
@@ -107,15 +107,7 @@ async def handle_missoma(url, max_pages):
         while load_more_clicks <= max_pages:
             async with async_playwright() as p:
                 # Create a new browser instance for each page
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                page = await browser.new_page()
-
-                try:
-                    await page.goto(url, timeout=120000)
-                except Exception as e:
-                    logging.warning(f"Failed to load URL {url}: {e}")
-                    await browser.close()
-                    continue  # move to the next iteration
+                browser, page = await get_browser_with_proxy_strategy(p, url, "ol.ais-InfiniteHits-list")
 
                 # Simulate clicking 'Load More' number of times
                 for _ in range(load_more_clicks - 1):
@@ -170,35 +162,52 @@ async def handle_missoma(url, max_pages):
                 page_title = await page.title()
 
                 for row_num, product in enumerate(new_products, start=len(sheet["A"]) + 1):
+                    additional_info = []
+                    
                     try:
+                        # Get product name
                         product_name_tag = await product.query_selector('p.ais-hit--title a')
                         product_name = await product_name_tag.inner_text() if product_name_tag else "N/A"
+                        
+                        # Get variant and append to product name
+                        variant_tag = await product.query_selector('p.ais-hit--variant span')
+                        variant_text = await variant_tag.inner_text() if variant_tag else None
+                        if variant_text and variant_text != "N/A":
+                            product_name = f"{product_name}, {variant_text}"
+                            
                     except Exception as e:
                         print(f"Error fetching product name: {e}")
                         product_name = "N/A"
 
                     try:
-                        price_tag = await product.query_selector('p.ais-hit--price b.standard-price')
-                        price = await price_tag.inner_text() if price_tag else "N/A"
+                        # Handle price information
+                        standard_price_tag = await product.query_selector('p.ais-hit--price b.standard-price')
+                        standard_price = await standard_price_tag.inner_text() if standard_price_tag else None
+                        
+                        discounted_price_tag = await product.query_selector('p.ais-hit--price b.full-price')
+                        discounted_price = await discounted_price_tag.inner_text() if discounted_price_tag else None
+                        
+                        if standard_price and discounted_price:
+                            price = f"{discounted_price}|{standard_price}"
+                        elif standard_price:
+                            price = standard_price
+                        else:
+                            price = "N/A"
+                            
                     except Exception as e:
                         print(f"Error fetching price: {e}")
                         price = "N/A"
                         
                     try:
-                        # Update the selector to target the correct image class
+                        # Get image URL
                         image_tag = await product.query_selector('img.ais-first-img')
-
-                        # Extract the src attribute
                         image_url = await image_tag.get_attribute('src') if image_tag else None
 
-                        # If src is not available, try to get the srcset
                         if not image_url:
                             srcset = await image_tag.get_attribute('srcset')
                             if srcset:
-                                # Choose the highest resolution URL from srcset
                                 image_url = srcset.split(',')[-1].split(' ')[0]
 
-                        # Add protocol (https) if the URL is protocol-relative
                         if image_url and image_url.startswith('//'):
                             image_url = 'https:' + image_url
 
@@ -206,31 +215,70 @@ async def handle_missoma(url, max_pages):
                         print(f"Error fetching image URL: {e}")
                         image_url = "N/A"
 
-
-
-
-
-
-
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue
 
                     try:
+                        # Get karat information
                         variant_tag = await product.query_selector('p.ais-hit--variant span')
                         kt = await variant_tag.inner_text() if variant_tag else "N/A"
                     except Exception as e:
                         print(f"Error fetching product variant: {e}")
                         kt = "N/A"
 
-
+                    # Extract diamond weight from product name
                     diamond_match = re.search(r"\b(\d+(\.\d+)?)\s*(?:ct|ctw|carat)\b", product_name, re.IGNORECASE)
                     diamond_weight = f"{diamond_match.group(1)} ct" if diamond_match else "N/A"
+
+                    try:
+                        # Get availability information
+                        availability_tag = await product.query_selector('span.ais-hit--cart-button__disabled')
+                        if availability_tag:
+                            availability_text = await availability_tag.inner_text()
+                            additional_info.append(f"Availability: {availability_text}")
+                    except:
+                        pass
+
+                    try:
+                        # Get tags/labels
+                        tags = []
+                        tag_elements = await product.query_selector_all('span.ais-tag')
+                        for tag in tag_elements:
+                            tag_text = await tag.inner_text()
+                            if tag_text.strip():
+                                tags.append(tag_text)
+                        if tags:
+                            additional_info.append(f"Tags: {'|'.join(tags)}")
+                    except:
+                        pass
+
+                    try:
+                        # Get vendor information
+                        vendor = await product.get_attribute('data-vendor')
+                        if vendor:
+                            additional_info.append(f"Vendor: {vendor}")
+                    except:
+                        pass
+
+                    try:
+                        # Get SKU information
+                        sku = await product.get_attribute('data-sku')
+                        if sku:
+                            additional_info.append(f"SKU: {sku}")
+                    except:
+                        pass
+
+                    # Combine all additional info with pipe delimiter
+                    additional_info_text = "|".join(additional_info) if additional_info else ""
 
                     unique_id = str(uuid.uuid4())
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight, additional_info_text))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url, additional_info_text])
 
                 # Process image downloads and attach them to Excel
                 for row, unique_id, task in image_tasks:
@@ -241,7 +289,7 @@ async def handle_missoma(url, max_pages):
                         sheet.add_image(img, f"D{row}")
                     for i, record in enumerate(records):
                         if record[0] == unique_id:
-                            records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                            records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                             break
 
                 await browser.close()

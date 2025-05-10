@@ -10,15 +10,11 @@ from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError, Error
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image
-from flask import Flask
 from PIL import Image as PILImage
-import requests
-import concurrent.futures
 from utils import get_public_ip, log_event, sanitize_filename
 from dotenv import load_dotenv
 from database import insert_into_db
 from limit_checker import update_product_count
-import aiohttp
 from io import BytesIO
 from openpyxl.drawing.image import Image as XLImage
 import httpx
@@ -91,38 +87,6 @@ def random_delay(min_sec=1, max_sec=3):
     """Introduce a random delay to mimic human-like behavior."""
     time.sleep(random.uniform(min_sec, max_sec))
 
-
-
-# async def safe_goto_and_wait(page, url, retries=3):
-#     for attempt in range(retries):
-#         try:
-#             print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-#             await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-
-
-#             # Wait for the selector with a longer timeout
-#             product_cards = await page.wait_for_selector(".product-scroll-wrapper", state="attached", timeout=30000)
-
-#             # Optionally validate at least 1 is visible (Playwright already does this)
-#             if product_cards:
-#                 print("[Success] Product cards loaded.")
-#                 return
-#         except Error as e:
-#             logging.error(f"Error navigating to {url} on attempt {attempt + 1}: {e}")
-#             if attempt < retries - 1:
-#                 logging.info("Retrying after waiting a bit...")
-#                 random_delay(1, 3)  # Add a delay before retrying
-#             else:
-#                 logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-#                 raise
-#         except TimeoutError as e:
-#             logging.warning(f"TimeoutError on attempt {attempt + 1} navigating to {url}: {e}")
-#             if attempt < retries - 1:
-#                 logging.info("Retrying after waiting a bit...")
-#                 random_delay(1, 3)  # Add a delay before retrying
-#             else:
-#                 logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-#                 raise
 
 ########################################  safe_goto_and_wait ####################################################################
 

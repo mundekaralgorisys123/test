@@ -18,8 +18,7 @@ from playwright.async_api import async_playwright, TimeoutError, Error
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
-import json
-import urllib
+from proxysetup import get_browser_with_proxy_strategy
 
 # Load environment
 load_dotenv()
@@ -81,23 +80,13 @@ async def scroll_to_bottom(page):
             break
         last_height = new_height
 
-# Reliable page.goto wrapper
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-            await page.wait_for_selector(".mixed-grid", state="attached", timeout=30000)
-            print("[Success] Product listing loaded.")
-            return
-        except (Error, TimeoutError) as e:
-            logging.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
-            if attempt < retries - 1:
-                random_delay(1, 3)
-            else:
-                raise
+
 
 # Main scraper function
+def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    separator = '&' if '?' in base_url else '?'
+    return f"{base_url}{separator}page={page_count}"   
+
 async def handle_piaget(url, max_pages=None):
     ip_address = get_public_ip()
     logging.info(f"Scraping started for: {url} from IP: {ip_address}")
@@ -118,20 +107,15 @@ async def handle_piaget(url, max_pages=None):
     file_path = os.path.join(EXCEL_DATA_PATH, filename)
     prev_prod_cout = 0
     load_more_clicks = 1
-    prev_prod_cout = 0
     while load_more_clicks <= max_pages:
         browser = None
         page = None
-        if load_more_clicks > 1:
-            url = f"{url}?page={load_more_clicks}"
+        current_url = build_url_with_loadmore(url, load_more_clicks) 
+        
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(1200000)
-
-                await safe_goto_and_wait(page, url)
+                product_wrapper = '.mixed-grid'
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, product_wrapper)
                 log_event(f"Successfully loaded: {url}")
 
                 # Scroll to load all items
@@ -245,13 +229,22 @@ async def handle_piaget(url, max_pages=None):
         finally:
             if page: await page.close()
             if browser: await browser.close()
+        
 
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
+
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

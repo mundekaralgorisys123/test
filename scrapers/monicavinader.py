@@ -22,6 +22,7 @@ import aiohttp
 from io import BytesIO
 from openpyxl.drawing.image import Image as XLImage
 import httpx
+from proxysetup import get_browser_with_proxy_strategy
 # Load environment variables from .env file
 from functools import partial
 load_dotenv()
@@ -112,38 +113,6 @@ async def scroll_and_wait(page):
     await page.evaluate("window.scrollBy(0, document.body.scrollHeight);")
     new_height = await page.evaluate("document.body.scrollHeight")
     return new_height > previous_height  # Returns True if more content is loaded
-
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-
-
-            # Wait for the selector with a longer timeout
-            product_cards = await page.wait_for_selector(".product-catalogue", state="attached", timeout=30000)
-
-            # Optionally validate at least 1 is visible (Playwright already does this)
-            if product_cards:
-                print("[Success] Product cards loaded.")
-                return
-        except Error as e:
-            logging.error(f"Error navigating to {url} on attempt {attempt + 1}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
-        except TimeoutError as e:
-            logging.warning(f"TimeoutError on attempt {attempt + 1} navigating to {url}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
-
             
 
 async def safe_wait_for_selector(page, selector, timeout=15000, retries=3):
@@ -172,7 +141,8 @@ async def handle_monicavinader(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Material", "Price", "Gemstone Info", 
+               "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -183,22 +153,14 @@ async def handle_monicavinader(url, max_pages):
     success_count = 0
 
     while page_count <= max_pages:
-        current_url = f"{url}?page={page_count}"
+        current_url = f"{url}?page={page_count}" if page_count > 1 else url
         logging.info(f"Processing page {page_count}: {current_url}")
         
-        # Create a new browser instance for each page
         browser = None
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                
-                # Configure timeouts for this page
-                page = await context.new_page()
-                page.set_default_timeout(120000)  # 2 minute timeout
-                
-                await safe_goto_and_wait(page, current_url)
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, ".product-catalogue")
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all products
@@ -208,12 +170,11 @@ async def handle_monicavinader(url, max_pages):
                         ".product-catalogue-wrap",
                         "(el) => el.scrollTo(0, el.scrollHeight)"
                     )
-                    await asyncio.sleep(random.uniform(1, 2))  # Random delay between scrolls
+                    await asyncio.sleep(random.uniform(1, 2))
                     current_product_count = await page.locator('article.product-preview').count()
                     if current_product_count == prev_product_count:
                         break
                     prev_product_count = current_product_count
-
 
                 product_wrapper = await page.query_selector("div.product-catalogue-wrap") 
                 products = await product_wrapper.query_selector_all("article.product-preview") if product_wrapper else []
@@ -227,38 +188,133 @@ async def handle_monicavinader(url, max_pages):
                 image_tasks = []
 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
-                   # Extract product name
+                    additional_info = []
+                    
+                    # Extract product name and combine with description
+                    product_name = "N/A"
+                    material = "N/A"
                     try:
-                        product_name = await (await product.query_selector("h3.product-preview__title")).inner_text()  # Use correct h3 selector
-                    except:
+                        name_tag = await product.query_selector("h3.product-preview__title")
+                        desc_tag = await product.query_selector("p.product-preview__description")
+                        
+                        name_text = (await name_tag.inner_text()).strip() if name_tag else ""
+                        desc_text = (await desc_tag.inner_text()).strip() if desc_tag else ""
+                        
+                        if name_text and desc_text:
+                            product_name = f"{name_text}, {desc_text}"
+                        elif name_text:
+                            product_name = name_text
+                        else:
+                            product_name = "N/A"
+                            
+                        material = desc_text if desc_text else "N/A"
+                    except Exception:
                         product_name = "N/A"
+                        material = "N/A"
 
-                    # Extract price
+                    # Extract price information
+                    price = "N/A"
+                    original_price = "N/A"
                     try:
-                        price = await (await product.query_selector("p.product-preview__price")).inner_text()  # Use correct p selector for price
-                    except:
-                        price = "N/A"
+                        price_tag = await product.query_selector("p.product-preview__price")
+                        if price_tag:
+                            price = (await price_tag.inner_text()).strip()
+                            # Check for sale price if available (not visible in sample HTML)
+                            price_text = f"Price: {price}"
+                    except Exception:
+                        price_text = "N/A"
 
-                    # Extract image URL (the primary image)
+                    # Extract product URL
+                    product_url = "N/A"
                     try:
-                        image_url = await (await product.query_selector("img.product-listing__image")).get_attribute("src")  # Correct img selector
-                    except:
+                        product_link = await product.query_selector("a.product-preview__link")
+                        if product_link:
+                            product_url = await product_link.get_attribute("href")
+                            if product_url and product_url != "N/A":
+                                if not product_url.startswith('http'):
+                                    product_url = f"https://www.monicavinader.com{product_url}"
+                                additional_info.append(f"URL: {product_url}")
+                    except Exception:
+                        pass
+
+                    # Extract data attributes for additional info
+                    try:
+                        if product_link:
+                            data_attrs = {
+                                'Product ID': await product_link.get_attribute("data-gaid"),
+                                'Variation ID': await product_link.get_attribute("data-cnstrc-item-variation-id"),
+                                'Collection': await product_link.get_attribute("data-cnstrc-item-section")
+                            }
+                            
+                            for key, value in data_attrs.items():
+                                if value and value != "N/A":
+                                    additional_info.append(f"{key}: {value}")
+                    except Exception:
+                        pass
+
+                    # Extract color/material options from swatches
+                    try:
+                        swatches = await product.query_selector_all("button.swatch")
+                        if swatches:
+                            colors = []
+                            for swatch in swatches:
+                                color_label = await swatch.get_attribute("aria-label")
+                                if color_label and color_label != "N/A":
+                                    colors.append(color_label)
+                            if colors:
+                                additional_info.append(f"Available In: {'|'.join(colors)}")
+                    except Exception:
+                        pass
+
+                    # Check for badges (New In, Best Seller, etc.)
+                    try:
+                        badge = await product.query_selector("div.flash-badge--listing span")
+                        if badge:
+                            badge_text = (await badge.inner_text()).strip()
+                            if badge_text and badge_text != "N/A":
+                                additional_info.append(f"Status: {badge_text}")
+                    except Exception:
+                        pass
+
+                    # Extract image URLs (primary and hover)
+                    image_url = "N/A"
+                    try:
+                        # Primary image
+                        primary_img = await product.query_selector("figure.product-preview__image--no-blend img.product-listing__image")
+                        if primary_img:
+                            image_url = await primary_img.get_attribute("src")
+                            if image_url and image_url != "N/A":
+                                if not image_url.startswith('http'):
+                                    image_url = f"https:{image_url}" if image_url.startswith('//') else f"https://www.monicavinader.com{image_url}"
+                    except Exception:
                         image_url = "N/A"
 
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue
+                    
+                    # Extract gemstone information from product name
+                    gemstone_info = "N/A"
+                    try:
+                        gemstone_pattern = r"\b(Diamond|Ruby|Sapphire|Emerald|Aquamarine|Pearl|Onyx|Topaz|Opal|Amethyst|Citrine|Garnet|Peridot)\b"
+                        gemstone_match = re.search(gemstone_pattern, product_name, re.IGNORECASE)
+                        gemstone_info = gemstone_match.group() if gemstone_match else "N/A"
+                    except Exception:
+                        gemstone_info = "N/A"
 
-                    gold_type_match = re.search(r"\b\d+K\s+\w+\s+\w+\b", product_name)
-                    kt = gold_type_match.group() if gold_type_match else "Not found"
-
-                    diamond_weight_match = re.search(r"\d+[-/]?\d*/?\d*\s*ct\s*tw", product_name)
-                    diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                    # Combine all additional info with | separator
+                    additional_info_text = " | ".join(additional_info) if additional_info else ""
 
                     unique_id = str(uuid.uuid4())
-                    image_tasks.append((row_num, unique_id, asyncio.create_task(
-                        download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
-                    )))
+                    if image_url and image_url != "N/A":
+                        image_tasks.append((row_num, unique_id, asyncio.create_task(
+                            download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
+                        )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, material, 
+                                  price_text, gemstone_info, additional_info_text))
+                    sheet.append([current_date, page_title, product_name, None, material, price_text, 
+                                gemstone_info, time_only, image_url, additional_info_text])
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -275,7 +331,8 @@ async def handle_monicavinader(url, max_pages):
                         
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, 
+                                             record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")
@@ -289,20 +346,16 @@ async def handle_monicavinader(url, max_pages):
 
         except Exception as e:
             logging.error(f"Error processing page {page_count}: {str(e)}")
-            # Save what we have so far
             wb.save(file_path)
         finally:
-            # Clean up resources for this page
             if page:
                 await page.close()
             if browser:
                 await browser.close()
             
-            # Add delay between pages
             await asyncio.sleep(random.uniform(2, 5))
             
         page_count += 1
-
 
     # Final save and database operations
     wb.save(file_path)

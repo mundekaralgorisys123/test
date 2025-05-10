@@ -10,25 +10,29 @@ from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError, Error
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image
-from flask import Flask
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from PIL import Image as PILImage
 from PIL import Image as PILImage  # For image processing
 from openpyxl.drawing.image import Image as ExcelImage  # For Excel image insertion
 import aiofiles
-from utils import get_public_ip, log_event, sanitize_filename
-from dotenv import load_dotenv
+from utils import get_public_ip, log_event
 from database import insert_into_db
 from limit_checker import update_product_count
-
+from dotenv import load_dotenv
+import traceback
+from typing import List, Tuple
 import httpx
 from urllib.parse import urlparse
 from PIL import Image
 import io
-
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
 
-app = Flask(__name__)
+
+PROXY_SERVER = os.getenv("PROXY_SERVER")
+PROXY_USERNAME = os.getenv("PROXY_USERNAME")
+PROXY_PASSWORD = os.getenv("PROXY_PASSWORD")
+
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
@@ -111,14 +115,18 @@ def random_delay(min_sec=1, max_sec=3):
     """Introduce a random delay to mimic human-like behavior."""
     time.sleep(random.uniform(min_sec, max_sec))
 
+########################################  safe_goto_and_wait ####################################################################
 
 
-async def safe_goto_and_wait(page, url, retries=3):
+async def safe_goto_and_wait(page, url,isbri_data, retries=2):
     for attempt in range(retries):
         try:
             print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-
+            
+            if isbri_data:
+                await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
+            else:
+                await page.goto(url, wait_until="domcontentloaded", timeout=180_000)
 
             # Wait for the selector with a longer timeout
             product_cards = await page.wait_for_selector(".pdp-grid__main.pdp-desktop", state="attached", timeout=30000)
@@ -144,7 +152,150 @@ async def safe_goto_and_wait(page, url, retries=3):
                 logging.error(f"Failed to navigate to {url} after {retries} attempts.")
                 raise
 
+
+########################################  get browser with proxy ####################################################################
+      
+
+async def get_browser_with_proxy_strategy(p, url: str):
+    """
+    Dynamically checks robots.txt and selects proxy accordingly
+    Always uses proxies - never scrapes directly
+    """
+    parsed_url = httpx.URL(url)
+    base_url = f"{parsed_url.scheme}://{parsed_url.host}"
+    
+    # 1. Fetch and parse robots.txt
+    disallowed_patterns = await get_robots_txt_rules(base_url)
+    
+    # 2. Check if URL matches any disallowed pattern
+    is_disallowed = check_url_against_rules(str(parsed_url), disallowed_patterns)
+    
+    # 3. Try proxies in order (bri-data first if allowed, oxylabs if disallowed)
+    proxies_to_try = [
+        PROXY_URL if not is_disallowed else {
+            "server": PROXY_SERVER,
+            "username": PROXY_USERNAME,
+            "password": PROXY_PASSWORD
+        },
+        {  # Fallback to the other proxy
+            "server": PROXY_SERVER,
+            "username": PROXY_USERNAME,
+            "password": PROXY_PASSWORD
+        } if not is_disallowed else PROXY_URL
+    ]
+
+    last_error = None
+    for proxy_config in proxies_to_try:
+        browser = None
+        try:
+            isbri_data = False
+            if proxy_config == PROXY_URL:
+                logging.info("Attempting with bri-data proxy (allowed by robots.txt)")
+                browser = await p.chromium.connect_over_cdp(PROXY_URL)
+                isbri_data = True
+            else:
+                logging.info("Attempting with oxylabs proxy (required by robots.txt)")
+                browser = await p.chromium.launch(
+                    proxy=proxy_config,
+                    headless=False,
+                    args=[
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-web-security'
+                    ]
+                )
+
+            context = await browser.new_context()
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                })
+            """)
+            page = await context.new_page()
             
+            await safe_goto_and_wait(page, url,isbri_data)
+            return browser, page
+
+        except Exception as e:
+            last_error = e
+            error_trace = traceback.format_exc()
+            logging.error(f"Proxy attempt failed:\n{error_trace}")
+            if browser:
+                await browser.close()
+            continue
+
+    error_msg = (f"Failed to load {url} using all proxy options. "
+                f"Last error: {str(last_error)}\n"
+                f"URL may be disallowed by robots.txt or proxies failed.")
+    logging.error(error_msg)
+    raise RuntimeError(error_msg)
+
+
+
+
+async def get_robots_txt_rules(base_url: str) -> List[str]:
+    """Dynamically fetch and parse robots.txt rules"""
+    robots_url = f"{base_url}/robots.txt"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(robots_url, timeout=10)
+            if resp.status_code == 200:
+                return [
+                    line.split(":", 1)[1].strip()
+                    for line in resp.text.splitlines()
+                    if line.lower().startswith("disallow:")
+                ]
+    except Exception as e:
+        logging.warning(f"Couldn't fetch robots.txt: {e}")
+    return []
+
+
+def check_url_against_rules(url: str, disallowed_patterns: List[str]) -> bool:
+    """Check if URL matches any robots.txt disallowed pattern"""
+    for pattern in disallowed_patterns:
+        try:
+            # Handle wildcard patterns
+            if "*" in pattern:
+                regex_pattern = pattern.replace("*", ".*")
+                if re.search(regex_pattern, url):
+                    return True
+            # Handle path patterns
+            elif url.startswith(f"{pattern}"):
+                return True
+            # Handle query parameters
+            elif ("?" in url) and any(
+                f"{param}=" in url 
+                for param in pattern.split("=")[0].split("*")[-1:]
+                if "=" in pattern
+            ):
+                return True
+        except Exception as e:
+            logging.warning(f"Error checking pattern {pattern}: {e}")
+    return False
+
+
+def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    parsed_url = urlparse(base_url)
+    path = parsed_url.path
+    query = parse_qs(parsed_url.query)
+
+    page_str = f"page-{page_count}"
+
+    # Update path pagination regardless of query
+    if '/page-' in path:
+        # Replace existing /page-x with new page
+        path = re.sub(r'/page-\d+', f'/{page_str}', path)
+    else:
+        # Append /page-x/ if not already present
+        if not path.endswith('/'):
+            path += '/'
+        path += f"{page_str}/"
+
+    # If it's a filter URL (has ?q=...), don't touch query except preserve it
+    new_query = urlencode(query, doseq=True)
+
+    return urlunparse(parsed_url._replace(path=path, query=new_query))
+
+
 
 
 
@@ -162,7 +313,7 @@ async def handle_chanel(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -173,23 +324,18 @@ async def handle_chanel(url, max_pages):
     success_count = 0
 
     while page_count <= max_pages:
-        current_url = f"{url}/page-{page_count}/"
+        current_url = build_url_with_loadmore(url, page_count)
 
         logging.info(f"Processing page {page_count}: {current_url}")
         
         # Create a new browser instance for each page
         browser = None
         page = None
+        
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                
-                # Configure timeouts for this page
-                page = await context.new_page()
-                page.set_default_timeout(120000)  # 2 minute timeout
-                
-                await safe_goto_and_wait(page, current_url)
+                product_wrapper = '.pdp-grid__main.pdp-desktop'
+                browser, page = await get_browser_with_proxy_strategy(p, current_url)
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all products
@@ -229,7 +375,7 @@ async def handle_chanel(url, max_pages):
                         price_tag = await product.query_selector('p[data-test="lblProductPrice_PLP"]')
                         if price_tag:
                             price = (await price_tag.inner_text()).strip()
-                            price = price.replace('€', '').replace('$', '').replace('₹', '').strip()
+                            price = price.replace('€', '€')
                         else:
                             price = "N/A"
                             print("Price element not found")
@@ -255,28 +401,41 @@ async def handle_chanel(url, max_pages):
                         print(f"Error fetching image URL: {str(e)}")
                         image_url = "N/A"
 
-                    print(image_url)
+                    # print(image_url)
 
                     try:
                         description_tag = await product.query_selector('span[data-test="lblProductShrotDescription_PLP"]')
                         if description_tag:
-                            description = (await description_tag.inner_text()).strip()
+                            kt = (await description_tag.inner_text()).strip()
                         else:
-                            description = "N/A"
+                            kt = "N/A"
                             print("Description element not found")
                     except Exception as e:
                         print(f"Error fetching description: {str(e)}")
-                        description = "N/A"
+                        kt = "N/A"
 
 
 
+
+                    
+                        
+                    additional_info = []
 
                     try:
-                        kt_match = re.search(r'\d{1,2}K', description)
-                        kt = kt_match.group() if kt_match else "Not found"
+                        tag_els = await product.query_selector_all("p.flag.is-1")
+                        if tag_els:
+                            for tag_el in tag_els:
+                                tag_text = await tag_el.inner_text()
+                                if tag_text:
+                                    additional_info.append(tag_text.strip())
+                        else:
+                            additional_info.append("N/A")
+
                     except Exception as e:
-                        print(f"Error extracting kt from description: {str(e)}")
-                        kt = "Not found"
+                        additional_info.append("N/A")
+
+                    additional_info_str = " | ".join(additional_info)
+    
                         
                     # Extract Diamond Weight (supports "1.85ct", "2ct", "1.50ct", etc.)
                     diamond_weight_match = re.findall(r"(\d+(?:\.\d+)?\s*ct)", product_name, re.IGNORECASE)
@@ -287,8 +446,8 @@ async def handle_chanel(url, max_pages):
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -305,11 +464,17 @@ async def handle_chanel(url, max_pages):
                                 pil_image = pil_image.resize((100, 100))
 
                                 # Save the processed image temporarily to a new file
-                                temp_image_path = f"temp_{unique_id}.jpg"
-                                pil_image.save(temp_image_path, format="JPEG", quality=90)
+                                # temp_image_path = f"temp_{unique_id}.jpg"
+                               
+                                
+                                image_filename = f"temp_{unique_id}.jpg"
+                                image_full_path = os.path.join(image_folder, image_filename)
+                                pil_image.save(image_full_path, format="JPEG", quality=90)
+                                
+                                
 
                                 # Use openpyxl's Image to add the image to Excel
-                                img = ExcelImage(temp_image_path)  # This uses openpyxl.drawing.image.Image for Excel
+                                img = ExcelImage(image_full_path)  # This uses openpyxl.drawing.image.Image for Excel
                                 img.width, img.height = 100, 100  # Resize for Excel
                                 sheet.add_image(img, f"D{row_num}")  # Insert the image into the Excel sheet
                                 
@@ -320,7 +485,7 @@ async def handle_chanel(url, max_pages):
                         # Update the records with the image path
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
 
                     except asyncio.TimeoutError:
@@ -351,13 +516,21 @@ async def handle_chanel(url, max_pages):
 
 
     # Final save and database operations
+  
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
 
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

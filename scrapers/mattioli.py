@@ -20,8 +20,7 @@ from database import insert_into_db
 from limit_checker import update_product_count
 import json
 # Load environment
-load_dotenv()
-PROXY_URL = os.getenv("PROXY_URL")
+from proxysetup import get_browser_with_proxy_strategy
 
 # Flask and paths
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -90,6 +89,9 @@ async def safe_goto_and_wait(page, url, retries=3):
             else:
                 raise
 
+def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    separator = '&' if '?' in base_url else '?'
+    return f"{base_url}{separator}page={page_count}"   
 # Main scraper function
 async def handle_mattioli(url, max_pages):
     ip_address = get_public_ip()
@@ -112,20 +114,16 @@ async def handle_mattioli(url, max_pages):
 
     page_count = 1
     current_url = url
+    
     while current_url and (page_count <= max_pages):
         logging.info(f"Processing page {page_count}: {current_url}")
         browser = None
-        context = None
-        if page_count > 1:
-            current_url = f"{url}?page={page_count}"
+        page = None
+        current_url = build_url_with_loadmore(url, page_count)
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(120000)
-
-                await safe_goto_and_wait(page, current_url)
+                product_wrapper = '.grid-outer'
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, product_wrapper)
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all items
@@ -217,12 +215,20 @@ async def handle_mattioli(url, max_pages):
 
         page_count += 1
 
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
+
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

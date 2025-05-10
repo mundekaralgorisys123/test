@@ -7,7 +7,7 @@ import base64
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image
-from flask import Flask
+from proxysetup import get_browser_with_proxy_strategy
 from dotenv import load_dotenv
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
@@ -54,6 +54,7 @@ async def download_image(session, image_url, product_name, timestamp, image_fold
     return "N/A"
 
 async def handle_buccellati(url, max_pages):
+    
     ip_address = get_public_ip()
     logging.info(f"Starting scrape for {url} from IP: {ip_address}")
 
@@ -79,8 +80,8 @@ async def handle_buccellati(url, max_pages):
 
     async with httpx.AsyncClient() as session:
         async with async_playwright() as p:
-            browser = await p.chromium.connect_over_cdp(PROXY_URL)
-            page = await browser.new_page()
+            product_wrapper = 'li.item.product.product-item'
+            browser, page = await get_browser_with_proxy_strategy(p, url, product_wrapper)
             
             try:
                 # Initial page load

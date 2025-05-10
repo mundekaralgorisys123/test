@@ -20,7 +20,7 @@ from database import insert_into_db
 from limit_checker import update_product_count
 import json
 import mimetypes
-
+from proxysetup import get_browser_with_proxy_strategy
 # Load environment
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
@@ -178,25 +178,23 @@ async def handle_mateo(url, max_pages=None):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
     filename = f"handle_mateo_{datetime.now().strftime('%Y-%m-%d_%H.%M')}.xlsx"
     file_path = os.path.join(EXCEL_DATA_PATH, filename)
-    prev_prod_cout = 0
+    prev_prod_count = 0
     load_more_clicks = 1
-    while load_more_clicks <= max_pages:
+    
+    while load_more_clicks <= max_pages if max_pages else True:
         browser = None
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(1200000)
-
-                await safe_goto_and_wait(page, url)
+                product_wrapper = '.collection__window'
+                browser, page = await get_browser_with_proxy_strategy(p, url, product_wrapper)
+                # browser, page = await get_browser_with_proxy_strategy(p, url, ".collection__window")
                 log_event(f"Successfully loaded: {url}")
 
                 # Scroll to load all items
@@ -210,8 +208,8 @@ async def handle_mateo(url, max_pages=None):
                 product_wrapper = await page.query_selector("div.collection__window")
                 products = await page.query_selector_all("div.product-item") if product_wrapper else []
                 max_prod = len(products)
-                products = products[prev_prod_cout: min(max_prod, prev_prod_cout + 30)]
-                prev_prod_cout += len(products)
+                products = products[prev_prod_count: min(max_prod, prev_prod_count + 30)]
+                prev_prod_count += len(products)
 
                 if len(products) == 0:
                     log_event("No new products found, stopping the scraper.")
@@ -223,6 +221,7 @@ async def handle_mateo(url, max_pages=None):
                 image_tasks = []
                 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
+                    additional_info = []
                     try:
                         # Extract product name - from the anchor tag in product-item__details
                         name_tag = await product.query_selector(".product-item__details a")
@@ -230,17 +229,70 @@ async def handle_mateo(url, max_pages=None):
                     except Exception:
                         product_name = "N/A"
 
+                    # Handle prices - collect all price information
+                    price_text = "N/A"
                     try:
-                        # Extract price - look for price-item--sale first, then fallback to price-item--regular
-                        price_tag = await product.query_selector(".price-item--sale") or await product.query_selector(".price-item--regular")
-                        price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
+                        # Get regular price
+                        regular_price_tag = await product.query_selector(".price-item--regular")
+                        regular_price = (await regular_price_tag.inner_text()).strip() if regular_price_tag else None
+                        
+                        # Get sale price
+                        sale_price_tag = await product.query_selector(".price-item--sale")
+                        sale_price = (await sale_price_tag.inner_text()).strip() if sale_price_tag else None
+                        
+                        # Format price text
+                        if regular_price and sale_price:
+                            price_text = f"Regular: {regular_price} | Sale: {sale_price}"
+                        elif regular_price:
+                            price_text = f"Regular: {regular_price}"
+                        elif sale_price:
+                            price_text = f"Sale: {sale_price}"
+                            
                         # Clean up price string
-                        price = re.sub(r'\s+', ' ', price).strip()
-                    except Exception:
-                        price = "N/A"
+                        price_text = re.sub(r'\s+', ' ', price_text).strip()
+                    except Exception as e:
+                        logging.warning(f"Error getting prices: {str(e)}")
+                        price_text = "N/A"
 
-                    # For Mateo, the description is in the product name itself
-                    description = product_name
+                    # Get additional product information
+                    try:
+                        # Check for product type/category
+                        category_element = await product.query_selector(".product-item__category")
+                        if category_element:
+                            category = await category_element.inner_text()
+                            additional_info.append(f"Category: {category.strip()}")
+                    except:
+                        pass
+
+                    try:
+                        # Check for product materials
+                        material_elements = await product.query_selector_all(".product-item__material")
+                        if material_elements:
+                            materials = [await el.inner_text() for el in material_elements]
+                            additional_info.append(f"Materials: {', '.join(m.strip() for m in materials)}")
+                    except:
+                        pass
+
+                    try:
+                        # Check for product badges (like "New", "Bestseller")
+                        badge_elements = await product.query_selector_all(".product-item__badge")
+                        if badge_elements:
+                            badges = [await el.inner_text() for el in badge_elements]
+                            additional_info.append(f"Badges: {', '.join(b.strip() for b in badges)}")
+                    except:
+                        pass
+
+                    try:
+                        # Check for product variations (like sizes, colors)
+                        variant_elements = await product.query_selector_all(".product-item__variant")
+                        if variant_elements:
+                            variants = [await el.inner_text() for el in variant_elements]
+                            additional_info.append(f"Variants: {', '.join(v.strip() for v in variants)}")
+                    except:
+                        pass
+
+                    # Join all additional info with pipe delimiter
+                    additional_info_text = " | ".join(additional_info) if additional_info else "N/A"
 
                     image_url = "N/A"
                     try:
@@ -251,12 +303,12 @@ async def handle_mateo(url, max_pages=None):
 
                     # Extract gold type (kt) from product name/description
                     gold_type_pattern = r"\b\d{1,2}(?:K|kt|ct|Kt)\b|\bPlatinum\b|\bSilver\b|\bWhite Gold\b|\bYellow Gold\b|\bRose Gold\b"
-                    gold_type_match = re.search(gold_type_pattern, description, re.IGNORECASE)
+                    gold_type_match = re.search(gold_type_pattern, product_name, re.IGNORECASE)
                     kt = gold_type_match.group() if gold_type_match else "Not found"
 
                     # Extract diamond weight from description
                     diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw|carat)\b"
-                    diamond_weight_match = re.search(diamond_weight_pattern, description, re.IGNORECASE)
+                    diamond_weight_match = re.search(diamond_weight_pattern, product_name, re.IGNORECASE)
                     diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
 
                     unique_id = str(uuid.uuid4())
@@ -265,8 +317,8 @@ async def handle_mateo(url, max_pages=None):
                             download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                         )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price_text, diamond_weight, additional_info_text))
+                    sheet.append([current_date, page_title, product_name, None, kt, price_text, diamond_weight, time_only, image_url, additional_info_text])
                             
                 # Process image downloads
                 for row_num, unique_id, task in image_tasks:
@@ -282,11 +334,13 @@ async def handle_mateo(url, max_pages=None):
                                 image_path = "N/A"
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")
-                load_more_clicks += 1
+                
+                if max_pages:
+                    load_more_clicks += 1
                 all_records.extend(records)
                 wb.save(file_path)
                 

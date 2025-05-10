@@ -12,18 +12,14 @@ from openpyxl import Workbook
 from openpyxl.drawing.image import Image
 from flask import Flask
 from PIL import Image as PILImage
-import requests
-import concurrent.futures
+from proxysetup import get_browser_with_proxy_strategy
 from utils import get_public_ip, log_event, sanitize_filename
 from dotenv import load_dotenv
 from database import insert_into_db
 from limit_checker import update_product_count
-import aiohttp
 from io import BytesIO
 from openpyxl.drawing.image import Image as XLImage
 import httpx
-# Load environment variables from .env file
-from functools import partial
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
 
@@ -159,38 +155,6 @@ def random_delay(min_sec=1, max_sec=3):
 
 
 
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-
-
-            # Wait for the selector with a longer timeout
-            product_cards = await page.wait_for_selector(".search-results-container", state="attached", timeout=30000)
-
-            # Optionally validate at least 1 is visible (Playwright already does this)
-            if product_cards:
-                print("[Success] Product cards loaded.")
-                return
-        except Error as e:
-            logging.error(f"Error navigating to {url} on attempt {attempt + 1}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
-        except TimeoutError as e:
-            logging.warning(f"TimeoutError on attempt {attempt + 1} navigating to {url}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
-
-            
 
 
 
@@ -219,41 +183,54 @@ async def handle_forevermark(url, max_pages):
     success_count = 0
 
     while page_count <= max_pages:
-        current_url = f"{url}?pageNo={page_count}"
-        logging.info(f"Processing page {page_count}: {current_url}")
-        
+        # current_url = f"{url}?pageNo={page_count}"  
+        logging.info(f"Processing page {page_count}: {url}")
+        prev_prod_cout = 0
         # Create a new browser instance for each page
         browser = None
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                
-                # Configure timeouts for this page
-                page = await context.new_page()
-                page.set_default_timeout(120000)  # 2 minute timeout
-                
-                await safe_goto_and_wait(page, current_url)
-                log_event(f"Successfully loaded: {current_url}")
+                product_wrapper = '.filters-wrapper'
+                browser, page = await get_browser_with_proxy_strategy(p, url, product_wrapper)
+                log_event(f"Successfully loaded: {url}")
 
-                # Scroll to load all products
-                prev_product_count = 0
-                for _ in range(10):
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await asyncio.sleep(random.uniform(1, 2))  # Random delay between scrolls
-                    current_product_count = await page.locator('.col-4_of_12').count()
-                    if current_product_count == prev_product_count:
-                        break
-                    prev_product_count = current_product_count
+                
+                # Simulate clicking 'Load More' number of times
+                # for _ in range(page_count - 1):
+                #     try:
+                #         load_more_button = page.locator("button#load-more.show")
+                #         if await load_more_button.is_visible():
+                #             await load_more_button.click()
+                #             await asyncio.sleep(2)  # Wait for new products to load
+                #         else:
+                #             logging.info("'Load More' button not visible.")
+                #             break
+                #     except Exception as e:
+                #         logging.warning(f"Could not click 'Load More': {e}")
+                #         break
+
 
 
                 # After scrolling, get the products
-                # After scrolling, get the products
-                product_wrapper = await page.query_selector("div.row")
-                products = await page.query_selector_all("div.col-4_of_12") if product_wrapper else []
+                product_wrapper = await page.query_selector("div.row.filter-search-results-container")
+                products = await product_wrapper.query_selector_all("div.search-results-col") if product_wrapper else []
+                logging.info(f"New products found: {len(products)}")
+                print(f"New products found: {len(products)}")
 
-                logging.info(f"Total products found on page {page_count}: {len(products)}")
+                
+                max_prod = len(products)
+                products = products[prev_prod_cout: min(max_prod, prev_prod_cout + 30)]
+                prev_prod_cout += len(products)
+
+                if len(products) == 0:
+                    log_event("No new products found, stopping the scraper.")
+                    break
+
+                logging.info(f"New products found: {len(products)}")
+                print(f"New products found: {len(products)}")
+
+                
 
                 page_title = await page.title()
                 current_date = datetime.now().strftime("%Y-%m-%d")
@@ -264,22 +241,32 @@ async def handle_forevermark(url, max_pages):
 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
                     try:
-                        # Look for the plain <h2> inside product
-                        name_tag = await product.query_selector("h2")
+                        name_tag = await product.query_selector("p.item-title")
                         product_name = (await name_tag.inner_text()).strip() if name_tag else "N/A"
                     except Exception:
                         product_name = "N/A"
 
-                    price = "N/A"
+                    try:
+                        price_tag = await product.query_selector("p.discover-jewelry-block__content__footer__price")
+                        price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
+                    except Exception:
+                        price = "N/A"
 
                     try:
-                        img_tag = await product.query_selector("picture img")
-                        image_url = await img_tag.get_attribute("srcset") if img_tag else "N/A"
+                        # Extract from style background-image first
+                        img_div = await product.query_selector("div.discover-jewelry-block__content__img")
+                        if img_div:
+                            style = await img_div.get_attribute("style")
+                            match = re.search(r'url\((.*?)\)', style)
+                            image_url = match.group(1) if match else "N/A"
+                        else:
+                            image_url = "N/A"
 
                         if image_url and image_url.startswith("/"):
-                            image_url = "https://www.forevermark.com" + image_url.split("?")[0]  # Make absolute, remove query params
+                            image_url = "https://www.forevermark.com" + image_url.split("?")[0]
                     except Exception:
                         image_url = "N/A"
+
 
 
                     gold_type_match = re.findall(r"\b(\d{1,2}ct\s*(?:Yellow|White|Rose)?\s*Gold|Platinum)\b", product_name, re.IGNORECASE)
@@ -342,13 +329,20 @@ async def handle_forevermark(url, max_pages):
 
 
     # Final save and database operations
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
 
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

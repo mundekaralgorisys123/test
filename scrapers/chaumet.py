@@ -18,10 +18,9 @@ from limit_checker import update_product_count
 from io import BytesIO
 from openpyxl.drawing.image import Image as XLImage
 import httpx
-# Load environment variables from .env file
+from proxysetup import get_browser_with_proxy_strategy
 from urllib.parse import urlparse, urlunparse
-load_dotenv()
-PROXY_URL = os.getenv("PROXY_URL")
+
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
@@ -117,39 +116,10 @@ def random_delay(min_sec=1, max_sec=3):
     time.sleep(random.uniform(min_sec, max_sec))
 
 
-
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-
-
-            # Wait for the selector with a longer timeout
-            product_cards = await page.wait_for_selector('.products.wrapper.grid.products-grid', state="attached", timeout=30000)
-
-            # Optionally validate at least 1 is visible (Playwright already does this)
-            if product_cards:
-                print("[Success] Product cards loaded.")
-                return
-        except Error as e:
-            logging.error(f"Error navigating to {url} on attempt {attempt + 1}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
-        except TimeoutError as e:
-            logging.warning(f"TimeoutError on attempt {attempt + 1} navigating to {url}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
-
             
+def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    separator = '&' if '?' in base_url else '?'
+    return f"{base_url}{separator}p={page_count}"   
 
 async def handle_chaumet(url, max_pages):
     ip_address = get_public_ip()
@@ -165,7 +135,7 @@ async def handle_chaumet(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -176,22 +146,17 @@ async def handle_chaumet(url, max_pages):
     success_count = 0
 
     while page_count <= max_pages:
-        current_url = f"{url}?p={page_count}"
+        current_url = build_url_with_loadmore(url, page_count)
         logging.info(f"Processing page {page_count}: {current_url}")
         
         # Create a new browser instance for each page
         browser = None
         page = None
         try:
+            
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                
-                # Configure timeouts for this page
-                page = await context.new_page()
-                page.set_default_timeout(120000)  # 2 minute timeout
-                
-                await safe_goto_and_wait(page, current_url)
+                product_wrapper = '.products.wrapper.grid.products-grid'
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, product_wrapper)
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all products
@@ -240,10 +205,10 @@ async def handle_chaumet(url, max_pages):
                     try:
                         # Extract description (e.g., "White gold, 2.5 mm")
                         description_tag = await product.query_selector('.c-product-card__title-second')
-                        description = await description_tag.inner_text() if description_tag else "N/A"
+                        kt = await description_tag.inner_text() if description_tag else "N/A"
                     except Exception as e:
                         print(f"Error fetching description: {e}")
-                        description = "N/A"    
+                        kt = "N/A"    
 
                     try:
                         # Extract image URL from lazy-loaded image inside slick-slide
@@ -257,19 +222,49 @@ async def handle_chaumet(url, max_pages):
                     except Exception as e:
                         print(f"Error fetching image URL: {e}")
                         image_url = "N/A"
+                        
+                    additional_info = []
 
+                    try:
+                        # Collect tags from both known tag classes
+                        tag_els = await product.query_selector_all("span.u-gold-light")
 
+                        if tag_els:
+                            for tag_el in tag_els:
+                                tag_text = await tag_el.inner_text()
+                                if tag_text:
+                                    additional_info.append(tag_text.strip())
+                        else:
+                            additional_info.append("N/A")
 
+                    except Exception as e:
+                        additional_info.append("N/A")
+                        
+                    try:
+                        # Collect tags from both known tag classes
+                        tag_els_demand = await product.query_selector_all("span.normal-price div")
 
-                    # print(product_name)
-                    # print(price)
-                    # print(image_url)
+                        if tag_els_demand:
+                            for tag_ele in tag_els_demand:
+                                tag_text1 = await tag_ele.inner_text()
+                                if tag_text1:
+                                    additional_info.append(tag_text1.strip())
+                        else:
+                            additional_info.append("N/A")
 
+                    except Exception as e:
+                        additional_info.append("N/A")
+                        
+                            
 
-                    gold_type_match = re.search(r"\b\d+K\s+\w+\s+\w+\b", description)
-                    kt = gold_type_match.group() if gold_type_match else "Not found"
+                    additional_info_str = " | ".join(additional_info)
+                    
+                    if product_name == "N/A" and price == "N/A" and image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue    
+    
 
-                    diamond_weight_match = re.search(r"\d+[-/]?\d*/?\d*\s*ct\s*tw", product_name)
+                    diamond_weight_match = re.search(r"\d+[-/]?\d*/?\d*\s*ct\s*tw", kt)
                     diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
 
                     unique_id = str(uuid.uuid4())
@@ -277,8 +272,8 @@ async def handle_chaumet(url, max_pages):
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -295,7 +290,7 @@ async def handle_chaumet(url, max_pages):
                         
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")
@@ -323,8 +318,9 @@ async def handle_chaumet(url, max_pages):
             
         page_count += 1
 
-
     # Final save and database operations
+    if not all_records:
+        return None, None, None    # Final save and database operations
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
 

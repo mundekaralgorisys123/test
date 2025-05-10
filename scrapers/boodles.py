@@ -162,7 +162,8 @@ async def handle_boodles(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Material", "Price", 
+               "Diamond Weight", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -173,18 +174,15 @@ async def handle_boodles(url, max_pages):
     success_count = 0
 
     while page_count <= max_pages:
-        current_url = f"{url}?page={page_count}"
+        current_url = f"{url}?page={page_count}" if page_count > 1 else url
         logging.info(f"Processing page {page_count}: {current_url}")
         
-        # Create a new browser instance for each page
         browser = None
         page = None
         try:
             async with async_playwright() as p:
                 browser = await p.chromium.connect_over_cdp(PROXY_URL)
                 context = await browser.new_context()
-                
-                # Configure timeouts for this page
                 page = await context.new_page()
                 page.set_default_timeout(120000)  # 2 minute timeout
                 
@@ -195,17 +193,13 @@ async def handle_boodles(url, max_pages):
                 prev_product_count = 0
                 for _ in range(10):
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await asyncio.sleep(random.uniform(1, 2))  # Random delay between scrolls
+                    await asyncio.sleep(random.uniform(1, 2))
                     current_product_count = await page.locator('div[data-collection-item]').count()
-
                     if current_product_count == prev_product_count:
                         break
                     prev_product_count = current_product_count
 
-
                 product_wrapper = await page.wait_for_selector("div#product-grid", timeout=5000)
-
-            # Adjust this to target the correct elements based on your HTML
                 products = await product_wrapper.query_selector_all("div[data-collection-item]") if product_wrapper else []
 
                 logging.info(f"Total products found on page {page_count}: {len(products)}")
@@ -218,50 +212,117 @@ async def handle_boodles(url, max_pages):
                 image_tasks = []
 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
-                   # Extract product name
+                    additional_info = []
+                    
+                    # Extract product name
                     try:
-                        product_name_element = await product.query_selector("div.text-lg.text-brand_dark_grey.pb-2")
-                        product_name = await product_name_element.inner_text() if product_name_element else "N/A"
+                        name_element = await product.query_selector("div.text-lg.text-brand_dark_grey.pb-2")
+                        product_name = await name_element.inner_text() if name_element else "N/A"
                     except Exception as e:
                         product_name = "N/A"
-                        print(f"Error extracting product name: {e}")
-
+                        logging.error(f"Error extracting product name: {e}")
 
                     # Extract price
                     try:
                         price_element = await product.query_selector("span[data-price]")
                         price = await price_element.inner_text() if price_element else "N/A"
+                        price_text = f"Price: {price}"
                     except Exception as e:
-                        price = "N/A"
-                        print(f"Error extracting price: {e}")
+                        price_text = "N/A"
+                        logging.error(f"Error extracting price: {e}")
 
-
+                    # Extract material from product name
+                    material = "N/A"
                     try:
-                        image_element = await product.query_selector("img")  # Select the first img element
-                        image_url = await image_element.get_attribute("src") if image_element else "N/A"
-                        
-                        # Fix for relative URL, prepend the base URL
-                        if image_url and image_url.startswith("//"):
-                            image_url = "https:" + image_url  # Prepend 'https:' to relative URLs
+                        material_pattern = r"\b(Platinum|Gold|Silver|Rose Gold|White Gold|Yellow Gold)\b"
+                        material_match = re.search(material_pattern, product_name, re.IGNORECASE)
+                        material = material_match.group() if material_match else "N/A"
                     except Exception as e:
+                        logging.error(f"Error extracting material: {e}")
+
+                    # Extract diamond weight from product name
+                    diamond_weight = "N/A"
+                    try:
+                        weight_pattern = r"\b(\d+(\.\d+)?\s*ct|carat)\b"
+                        weight_match = re.search(weight_pattern, product_name, re.IGNORECASE)
+                        diamond_weight = weight_match.group() if weight_match else "N/A"
+                    except Exception as e:
+                        logging.error(f"Error extracting diamond weight: {e}")
+
+                    # Extract product URL
+                    product_url = "N/A"
+                    try:
+                        url_element = await product.query_selector("a[href^='/products/']")
+                        if url_element:
+                            product_url = await url_element.get_attribute("href")
+                            if product_url and not product_url.startswith('http'):
+                                product_url = f"https://www.boodles.com{product_url}"
+                            additional_info.append(f"URL: {product_url}")
+                    except Exception as e:
+                        logging.error(f"Error extracting product URL: {e}")
+
+                    # Extract variant options
+                    try:
+                        variant_elements = await product.query_selector_all("div[data-add-to-cart]")
+                        if variant_elements:
+                            variants = []
+                            for variant in variant_elements:
+                                variant_text = await variant.inner_text()
+                                if variant_text and variant_text.strip():
+                                    variants.append(variant_text.strip())
+                            if variants:
+                                additional_info.append(f"Variants: {'|'.join(variants)}")
+                    except Exception as e:
+                        logging.error(f"Error extracting variants: {e}")
+
+                    # Improved image extraction
+                    image_url = "N/A"
+                    try:
+                        # First try the main product image
+                        img_element = await product.query_selector("picture img")
+                        if img_element:
+                            image_url = await img_element.get_attribute("src")
+                        
+                        # If no image found, try alternative selectors
+                        if image_url == "N/A":
+                            img_elements = await product.query_selector_all("img")
+                            for img in img_elements:
+                                src = await img.get_attribute("src")
+                                if src and "boodles.com/cdn/shop/products/" in src:
+                                    image_url = src
+                                    break
+                        
+                        # Clean up image URL
+                        if image_url and image_url != "N/A":
+                            if image_url.startswith("//"):
+                                image_url = f"https:{image_url}"
+                            # Remove size parameters for higher quality image
+                            image_url = image_url.split('?')[0] if '?' in image_url else image_url
+                    except Exception as e:
+                        logging.error(f"Error extracting image URL: {e}")
                         image_url = "N/A"
-                        print(f"Error extracting image URL: {e}")
+                    
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue
 
-
-
-                    gold_type_match = re.search(r"\b\d+K\s+\w+\s+\w+\b", product_name)
-                    kt = gold_type_match.group() if gold_type_match else "Not found"
-
-                    diamond_weight_match = re.search(r"\d+[-/]?\d*/?\d*\s*ct\s*tw", product_name)
-                    diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                    if product_name == "N/A" or price_text == "N/A" or image_url == "N/A":
+                        logging.warning(f"Skipping product due to missing data: Name: {product_name}, Price: {price_text}, Image: {image_url}")
+                        continue
+                    
+                    # Combine all additional info
+                    additional_info_text = " | ".join(additional_info) if additional_info else "N/A"
 
                     unique_id = str(uuid.uuid4())
-                    image_tasks.append((row_num, unique_id, asyncio.create_task(
-                        download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
-                    )))
+                    if image_url and image_url != "N/A":
+                        image_tasks.append((row_num, unique_id, asyncio.create_task(
+                            download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
+                        )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, material, 
+                                  price_text, diamond_weight, additional_info_text))
+                    sheet.append([current_date, page_title, product_name, None, material, price_text, 
+                                diamond_weight, time_only, image_url, additional_info_text])
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -278,7 +339,8 @@ async def handle_boodles(url, max_pages):
                         
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, 
+                                             record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")
@@ -292,20 +354,16 @@ async def handle_boodles(url, max_pages):
 
         except Exception as e:
             logging.error(f"Error processing page {page_count}: {str(e)}")
-            # Save what we have so far
             wb.save(file_path)
         finally:
-            # Clean up resources for this page
             if page:
                 await page.close()
             if browser:
                 await browser.close()
             
-            # Add delay between pages
             await asyncio.sleep(random.uniform(2, 5))
             
         page_count += 1
-
 
     # Final save and database operations
     wb.save(file_path)

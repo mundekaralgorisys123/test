@@ -61,7 +61,7 @@ async def handle_warrenjames(url, max_pages):
     current_date = datetime.now().strftime("%Y-%m-%d")
     time_only = datetime.now().strftime("%H.%M")
 
-    seen_ids = set()
+    
     records = []
     image_tasks = []
 
@@ -75,12 +75,12 @@ async def handle_warrenjames(url, max_pages):
                 product_wrapper = "div.category_product_holder.categoryListMinHeight"
                 browser, page = await get_browser_with_proxy_strategy(p,url, product_wrapper)
 
-                try:
-                    await page.goto(url, timeout=120000)
-                except Exception as e:
-                    logging.warning(f"Failed to load URL {url}: {e}")
-                    await browser.close()
-                    continue  # move to the next iteration
+                # try:
+                #     await page.goto(url, timeout=120000)
+                # except Exception as e:
+                #     logging.warning(f"Failed to load URL {url}: {e}")
+                #     await browser.close()
+                #     continue  # move to the next iteration
 
                 # Simulate clicking 'Load More' number of times
                 for _ in range(load_more_clicks - 1):

@@ -12,15 +12,13 @@ import httpx
 from PIL import Image as PILImage
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
-from flask import Flask
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright, TimeoutError, Error
-from utils import get_public_ip, log_event, sanitize_filename
+from playwright.async_api import async_playwright
+from utils import get_public_ip, log_event
 from database import insert_into_db
 from limit_checker import update_product_count
-import json
-import urllib
-
+from proxysetup import get_browser_with_proxy_strategy
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 # Load environment
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
@@ -29,6 +27,7 @@ PROXY_URL = os.getenv("PROXY_URL")
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
+
 # Resize image if needed
 def resize_image(image_data, max_size=(100, 100)):
     try:
@@ -85,21 +84,37 @@ async def scroll_to_bottom(page):
             break
         last_height = new_height
 
-# Reliable page.goto wrapper
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-            await page.wait_for_selector(".product-grid", state="attached", timeout=30000)
-            print("[Success] Product listing loaded.")
-            return
-        except (Error, TimeoutError) as e:
-            logging.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
-            if attempt < retries - 1:
-                random_delay(1, 3)
-            else:
-                raise
+def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    """
+    Builds paginated URL while preserving existing parameters
+    Handles both filtered and non-filtered URLs:
+    - Without filters: https://domain.com/path?page=2
+    - With filters: https://domain.com/path?filter=val&page=2
+    """
+    
+    # Parse existing URL components
+    parsed = urlparse(base_url)
+    query_params = parse_qs(parsed.query)
+    
+    # Update page parameter (replace if exists)
+    query_params['page'] = [str(page_count)]
+    
+    # Rebuild query string with proper encoding
+    new_query = []
+    for key in sorted(query_params.keys()):
+        values = query_params[key]
+        for value in values:
+            new_query.append(f"{key}={value}")
+    
+    # Construct new URL
+    return urlunparse((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        parsed.params,
+        '&'.join(new_query),
+        parsed.fragment
+    ))     
 
 # Main scraper function
 async def handle_cartier(url, max_pages=None):
@@ -114,7 +129,7 @@ async def handle_cartier(url, max_pages=None):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -122,20 +137,18 @@ async def handle_cartier(url, max_pages=None):
     file_path = os.path.join(EXCEL_DATA_PATH, filename)
     prev_prod_cout = 0
     load_more_clicks = 1
-    while load_more_clicks <= max_pages:
+    page_count = 1
+    while page_count <= max_pages:
         browser = None
         page = None
-        if load_more_clicks > 1:
-            url = f"{url}?page={load_more_clicks}"
+        # if load_more_clicks > 1:
+        #     url = f"{url}?page={load_more_clicks}"
+        current_url = build_url_with_loadmore(url, page_count)
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(1200000)
-
-                await safe_goto_and_wait(page, url)
-                log_event(f"Successfully loaded: {url}")
+                product_wrapper = '.product-grid'
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, product_wrapper)
+                log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all items
                 await scroll_to_bottom(page)
@@ -163,11 +176,12 @@ async def handle_cartier(url, max_pages=None):
                         product_name = "N/A"
 
                     try:
-                        # Extract material - from product-tile__material
                         material_tag = await product.query_selector(".product-tile__material")
-                        material = (await material_tag.inner_text()).strip() if material_tag else "N/A"
-                    except Exception:
-                        material = "N/A"
+                        kt = (await material_tag.inner_text()).strip() if material_tag else "N/A"
+                    except Exception as e:
+                        logging.warning(f"Failed to extract material info: {e}")
+                        kt = "N/A"
+
 
                     try:
                         # Extract price - from price__sales
@@ -178,8 +192,7 @@ async def handle_cartier(url, max_pages=None):
                     except Exception:
                         price = "N/A"
 
-                    # Description combines product name and material
-                    description = f"{product_name} - {material}" if material != "N/A" else product_name
+                    
 
                     image_url = "N/A"
                     try:
@@ -199,16 +212,33 @@ async def handle_cartier(url, max_pages=None):
                     except Exception as e:
                         log_event(f"Error getting image URL: {e}")
                         image_url = "N/A"
-
-                    # Extract gold type (kt) from material
-                    gold_type_pattern = r"\b\d{1,2}(?:K|kt|ct|Kt)\b|\bPlatinum\b|\bSilver\b|\bWhite Gold\b|\bYellow Gold\b|\bRose Gold\b"
-                    gold_type_match = re.search(gold_type_pattern, material, re.IGNORECASE) if material != "N/A" else None
-                    kt = gold_type_match.group() if gold_type_match else "Not found"
+                        
+                    # print(product_name) 
+                    # print(image_url)    
+                    if product_name == "N/A" and price == "N/A" and image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue 
 
                     # Extract diamond weight from description
                     diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw|carat)\b"
-                    diamond_weight_match = re.search(diamond_weight_pattern, description, re.IGNORECASE)
+                    diamond_weight_match = re.search(diamond_weight_pattern, product_name, re.IGNORECASE)
                     diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                    
+                    additional_info = []
+
+                    try:
+                        material_el = await product.query_selector("p.product-tile__body-section.product-tile__material")
+                        if material_el:
+                            material_text = await material_el.inner_text()
+                            if material_text:
+                                additional_info.append(material_text.strip())
+                        else:
+                            additional_info.append("N/A")
+                    except Exception as e:
+                        additional_info.append("N/A")
+
+                    additional_info_str = " | ".join(additional_info)
+
 
                     unique_id = str(uuid.uuid4())
                     if image_url and image_url != "N/A":
@@ -216,8 +246,8 @@ async def handle_cartier(url, max_pages=None):
                             download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                         )))
 
-                    records.append((unique_id, current_date, "Cartier", product_name, description, kt, price, diamond_weight))
-                    sheet.append([current_date, "Cartier", product_name, description, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
                             
                 # Process image downloads
                 for row_num, unique_id, task in image_tasks:
@@ -233,27 +263,39 @@ async def handle_cartier(url, max_pages=None):
                                 image_path = "N/A"
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")
                 load_more_clicks += 1
+                page_count += 1
                 all_records.extend(records)
                 wb.save(file_path)
                 
+                  
         except Exception as e:
             logging.error(f"Error during scraping: {str(e)}")
             wb.save(file_path)
         finally:
             if page: await page.close()
             if browser: await browser.close()
+            
+    page_count += 1        
 
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
+
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

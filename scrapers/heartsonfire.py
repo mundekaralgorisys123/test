@@ -18,7 +18,7 @@ from playwright.async_api import async_playwright, TimeoutError, Error
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
-
+from proxysetup import get_browser_with_proxy_strategy
 # Load environment
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
@@ -96,7 +96,7 @@ async def handle_heartsonfire(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -108,17 +108,19 @@ async def handle_heartsonfire(url, max_pages):
     while (page_count <= max_pages):
         logging.info(f"Processing page {page_count}: {current_url}")
         browser = None
-        context = None
-        
-        current_url = f"{url}?start={12*(page_count-1)}&amp;sz=12"
+        page = None
+        if '?' in url:
+            match = re.split(r"&sz=\d+", url)
+            if len(match) == 2:
+                part1, _ = match
+            else:
+                part1 = url
+            current_url = f"{part1}&start={12*(page_count-1)}&sz=12"
+        else:
+            current_url = f"{url}?start={12*(page_count-1)}&sz=12"  # Fixed the URL parameter format
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(120000)
-
-                await safe_goto_and_wait(page, current_url)
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, "div.product-grid")
                 log_event(f"Successfully loaded: {current_url}")
             
                 # Scroll to load all items
@@ -142,30 +144,83 @@ async def handle_heartsonfire(url, max_pages):
                 image_tasks = []
 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
+                    additional_info = []
+                    
                     try:
-                        # Product name
-                        name_tag = await product.query_selector(".pdp-link .animated-line")
+                        # Product name extraction with multiple fallbacks
+                        name_tag = await product.query_selector(".pdp-link .animated-line") or \
+                                  await product.query_selector(".product-tile .js-gtm-product-tile-name") or \
+                                  await product.query_selector("h2.product-name") or \
+                                  await product.query_selector(".product-name")
+                        
                         product_name = (await name_tag.inner_text()).strip() if name_tag else "N/A"
-                    except Exception:
+                        
+                        # Clean up product name
+                        if product_name != "N/A":
+                            product_name = ' '.join(product_name.split())  # Remove extra whitespace
+                            
+                    except Exception as e:
+                        logging.error(f"Error extracting product name: {e}")
                         product_name = "N/A"
 
                     try:
-                        # Price
+                        # Price handling
                         price_tag = await product.query_selector(".price .value")
                         price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
-                    except Exception:
+                        
+                        # Check for sale price vs regular price
+                        sale_price_tag = await product.query_selector(".price .sales .value")
+                        regular_price_tag = await product.query_selector(".price .strike-through")
+                        
+                        if sale_price_tag and regular_price_tag:
+                            sale_price = (await sale_price_tag.inner_text()).strip()
+                            regular_price = (await regular_price_tag.inner_text()).strip()
+                            price = f"{sale_price}|{regular_price}"
+                            
+                            # Calculate discount percentage if possible
+                            try:
+                                sale_num = float(sale_price.replace('$', '').replace(',', ''))
+                                regular_num = float(regular_price.replace('$', '').replace(',', ''))
+                                discount_percent = int(round((1 - (sale_num / regular_num)) * 100))
+                                additional_info.append(f"Discount: {discount_percent}%")
+                            except:
+                                pass
+                        elif price_tag:
+                            price = (await price_tag.inner_text()).strip()
+                        else:
+                            price = "N/A"
+                            
+                    except Exception as e:
+                        logging.error(f"Error extracting price: {e}")
                         price = "N/A"
 
                     try:
-                        # Image URL - get the first source from the picture tag
-                        image_tag = await product.query_selector(".tile-image-primary source")
+                        # Improved image URL extraction
+                        image_tag = await product.query_selector(".tile-image-primary source") or \
+                                   await product.query_selector(".tile-image source") or \
+                                   await product.query_selector("picture source")
+                        
                         if image_tag:
-                            image_url = await image_tag.get_attribute("srcset")
-                            # Take the first URL from srcset (before the space)
-                            image_url = image_url.split()[0] if image_url else "N/A"
+                            srcset = await image_tag.get_attribute("srcset")
+                            if srcset:
+                                # Take the highest resolution image from srcset
+                                urls = [url for url in srcset.split() if url.startswith('http')]
+                                image_url = urls[-1] if urls else "N/A"
+                            else:
+                                image_url = await image_tag.get_attribute("src") or "N/A"
                         else:
-                            image_url = "N/A"
-                    except Exception:
+                            # Fallback to img tag if source not found
+                            img_tag = await product.query_selector(".tile-image-primary img") or \
+                                      await product.query_selector(".tile-image img") or \
+                                      await product.query_selector("picture img")
+                            image_url = await img_tag.get_attribute("src") if img_tag else "N/A"
+                            
+                        # Ensure URL is complete
+                        if image_url != "N/A" and image_url.startswith("//"):
+                            image_url = "https:" + image_url
+                            
+                    except Exception as e:
+                        logging.error(f"Error extracting image URL: {e}")
                         image_url = "N/A"
 
                     # Gold type detection from swatches
@@ -176,24 +231,60 @@ async def handle_heartsonfire(url, max_pages):
                             gold_type = await active_swatch.get_attribute("aria-label")
                             if gold_type:
                                 # Extract just the metal type (e.g., "18K White Gold")
-                                gold_type = gold_type.split(",")[1].strip() if "," in gold_type else gold_type
-                    except Exception:
-                        pass
+                                parts = gold_type.split(",")
+                                if len(parts) > 1:
+                                    gold_type = parts[1].strip()
+                                else:
+                                    gold_type = parts[0].strip()
+                                    
+                                # Add to additional info
+                                additional_info.append(f"Metal: {gold_type}")
+                    except Exception as e:
+                        logging.error(f"Error extracting gold type: {e}")
 
                     # Diamond weight from name
                     diamond_weight = "N/A"
-                    diamond_weight_match = re.search(r"\b\d+(\.\d+)?\s*(?:ct|tcw)\b", product_name, re.IGNORECASE)
-                    if diamond_weight_match:
-                        diamond_weight = diamond_weight_match.group()
+                    try:
+                        diamond_weight_match = re.search(r"\b\d+(\.\d+)?\s*(?:ct|tcw)\b", product_name, re.IGNORECASE)
+                        if diamond_weight_match:
+                            diamond_weight = diamond_weight_match.group()
+                            additional_info.append(f"Diamond Weight: {diamond_weight}")
+                    except Exception as e:
+                        logging.error(f"Error extracting diamond weight: {e}")
+
+                    # Extract product badges/labels
+                    try:
+                        badges = []
+                        badge_tags = await product.query_selector_all(".tile-badge div")
+                        for badge in badge_tags:
+                            badge_text = (await badge.inner_text()).strip()
+                            if badge_text:
+                                badges.append(badge_text)
+                        if badges:
+                            additional_info.append(f"Badges: {'|'.join(badges)}")
+                    except Exception as e:
+                        logging.error(f"Error extracting badges: {e}")
+
+                    # Extract product ID if available
+                    try:
+                        product_id = await product.get_attribute("data-pid")
+                        if product_id:
+                            additional_info.append(f"Product ID: {product_id}")
+                    except Exception as e:
+                        logging.error(f"Error extracting product ID: {e}")
+
+                    # Combine all additional info
+                    additional_info_text = "|".join(additional_info) if additional_info else ""
 
                     unique_id = str(uuid.uuid4())
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, gold_type, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, gold_type, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, gold_type, price, diamond_weight, additional_info_text))
+                    sheet.append([current_date, page_title, product_name, None, gold_type, price, diamond_weight, time_only, image_url, additional_info_text])
                     
+                # Process image downloads
                 for row_num, unique_id, task in image_tasks:
                     try:
                         image_path = await asyncio.wait_for(task, timeout=60)
@@ -205,9 +296,10 @@ async def handle_heartsonfire(url, max_pages):
                             except Exception as e:
                                 logging.error(f"Error embedding image: {e}")
                                 image_path = "N/A"
+                        # Update records with image path
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")
@@ -227,6 +319,7 @@ async def handle_heartsonfire(url, max_pages):
 
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
+
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 

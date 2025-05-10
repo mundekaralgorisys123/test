@@ -7,23 +7,19 @@ import uuid
 import asyncio
 import base64
 from datetime import datetime
-from playwright.async_api import async_playwright, TimeoutError, Error
+from playwright.async_api import async_playwright
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image
-from flask import Flask
 from PIL import Image as PILImage
-import requests
-import concurrent.futures
 from utils import get_public_ip, log_event, sanitize_filename
 from dotenv import load_dotenv
 from database import insert_into_db
 from limit_checker import update_product_count
-import aiohttp
 from io import BytesIO
 from openpyxl.drawing.image import Image as XLImage
 import httpx
 # Load environment variables from .env file
-from functools import partial
+from proxysetup import get_browser_with_proxy_strategy
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
 
@@ -112,39 +108,10 @@ def random_delay(min_sec=1, max_sec=3):
 
 
 
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
 
-
-            # Wait for the selector with a longer timeout
-            product_cards = await page.wait_for_selector('ul[data-testid="products-list-page"]', state="attached", timeout=30000)
-
-
-            # Optionally validate at least 1 is visible (Playwright already does this)
-            if product_cards:
-                print("[Success] Product cards loaded.")
-                return
-        except Error as e:
-            logging.error(f"Error navigating to {url} on attempt {attempt + 1}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
-        except TimeoutError as e:
-            logging.warning(f"TimeoutError on attempt {attempt + 1} navigating to {url}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
-
-            
+def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    separator = '&' if '?' in base_url else '?'
+    return f"{base_url}{separator}page={page_count}"              
 
 async def handle_mejuri(url, max_pages):
     ip_address = get_public_ip()
@@ -160,7 +127,7 @@ async def handle_mejuri(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -171,7 +138,7 @@ async def handle_mejuri(url, max_pages):
     success_count = 0
 
     while page_count <= max_pages:
-        current_url = f"{url}?page={page_count}"
+        current_url = build_url_with_loadmore(url, page_count)
         logging.info(f"Processing page {page_count}: {current_url}")
         
         # Create a new browser instance for each page
@@ -179,14 +146,8 @@ async def handle_mejuri(url, max_pages):
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                
-                # Configure timeouts for this page
-                page = await context.new_page()
-                page.set_default_timeout(120000)  # 2 minute timeout
-                
-                await safe_goto_and_wait(page, current_url)
+                product_wrapper = 'ul[data-testid="products-list-page"]'
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, product_wrapper)
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all products
@@ -260,11 +221,40 @@ async def handle_mejuri(url, max_pages):
                         image_url = "N/A"
 
 
+                    try:
+                        # Extract the product variant info
+                        variant_tag = await product.query_selector('span[data-testid="variant-selector-label"]')
+                        if variant_tag:
+                            kt = await variant_tag.inner_text()
+                        else:
+                            kt = "N/A"
+                    except Exception as e:
+                        print(f"Error fetching product variant: {e}")
+                        kt = "N/A"
+                        
+                    additional_info = []
 
-                    gold_type_match = re.search(r"\b\d+K\s+\w+\s+\w+\b", product_name)
-                    kt = gold_type_match.group() if gold_type_match else "Not found"
+                    try:
+                        tag_els = await product.query_selector_all("div.bg-content-inv.text-content.capitalize")
+                        if tag_els:
+                            for tag_el in tag_els:
+                                tag_text = await tag_el.inner_text()
+                                if tag_text:
+                                    additional_info.append(tag_text.strip())
+                        else:
+                            additional_info.append("N/A")
 
-                    diamond_weight_match = re.search(r"\d+[-/]?\d*/?\d*\s*ct\s*tw", product_name)
+                    except Exception as e:
+                        additional_info.append("N/A")
+
+                    additional_info_str = " | ".join(additional_info)    
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue    
+                    
+
+
+                    diamond_weight_match = re.search(r"\d+[-/]?\d*/?\d*\s*ct\s*tw", kt)
                     diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
 
                     unique_id = str(uuid.uuid4())
@@ -272,8 +262,8 @@ async def handle_mejuri(url, max_pages):
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
 
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
@@ -290,7 +280,7 @@ async def handle_mejuri(url, max_pages):
                         
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")
@@ -320,13 +310,20 @@ async def handle_mejuri(url, max_pages):
 
 
     # Final save and database operations
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
 
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

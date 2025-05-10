@@ -252,7 +252,6 @@ def build_url_with_loadmore(base_url: str, page_count: int) -> str:
     separator = '&' if '?' in base_url else '?'
     return f"{base_url}{separator}loadMore={page_count}"   
          
-
 ########################################  Main Function Call ####################################################################
 async def handle_kay(url, max_pages):
     ip_address = get_public_ip()
@@ -282,6 +281,7 @@ async def handle_kay(url, max_pages):
             # logging.info(f"Processing page {page_count}: {current_url}")
             browser = None
             page = None
+            
             try:
                 # Use the new proxy strategy function
                 browser, page = await get_browser_with_proxy_strategy(p, current_url)
@@ -378,7 +378,7 @@ async def handle_kay(url, max_pages):
                     
                     
 
-                    gold_type_match = re.search(r"\b\d+K\s+\w+\s+\w+\b", product_name)
+                    gold_type_match = re.search(r"\b\d{1,2}K\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSilver\b", product_name, re.IGNORECASE)
                     kt = gold_type_match.group() if gold_type_match else "Not found"
 
 

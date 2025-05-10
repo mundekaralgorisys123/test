@@ -221,28 +221,20 @@ async def handle_diamondcollection(url, max_pages):
     
 
                     # Extract metal type from product name
-                    metal_type = "N/A"
-                    gold_type_pattern = r"\b\d{1,2}(?:K|ct)?\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSilver\b"
-                    gold_type_match = re.search(gold_type_pattern, product_name, re.IGNORECASE)
-                    metal_type = gold_type_match.group() if gold_type_match else "N/A"
+                    gold_match = re.search(
+                        r"\b(?:\d+K\s+)?(?:Rose|White|Yellow)\s+Gold\b",
+                        product_name,
+                        flags=re.IGNORECASE
+                    )
+                    metal_type = gold_match.group() if gold_match else "N/A"
 
-                    # Extract diamond weight
-                    diamond_weight = "N/A"
-                    diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw|carat)\b"
-                    diamond_weight_match = re.search(diamond_weight_pattern, product_name, re.IGNORECASE)
-                    if diamond_weight_match:
-                        diamond_weight = diamond_weight_match.group()
-                    else:
-                        # Try to extract from variant if available
-                        try:
-                            quick_buy = await product.query_selector("quick-buy-modal")
-                            if quick_buy:
-                                variant = await quick_buy.get_attribute("handle")
-                                if variant and "variant=" in variant:
-                                    diamond_match = re.search(r"(\d+\.?\d*)\s*(?:ct|tcw|carat)", variant, re.IGNORECASE)
-                                    diamond_weight = diamond_match.group() if diamond_match else "N/A"
-                        except Exception:
-                            pass
+                    # 2) Diamond total weight: look for patterns like "1.25 ct tw" or "1-1.5 ct tw"
+                    weight_match = re.search(
+                        r"\b\d+(?:[-/]\d+(?:\.\d+)?)?(?:\s*\d+/\d+)?\s*ct\s*tw\b",
+                        product_name,
+                        flags=re.IGNORECASE
+                    )
+                    diamond_weight = weight_match.group() if weight_match else "N/A"
 
                     # Generate unique ID and prepare image download
                     unique_id = str(uuid.uuid4())

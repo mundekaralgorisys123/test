@@ -461,6 +461,7 @@ async def handle_jared(url, max_pages):
             await asyncio.sleep(random.uniform(2, 5))
             
         page_count += 1
+    
     if not all_records:
         return None, None, None    # Final save and database operations
     wb.save(file_path)

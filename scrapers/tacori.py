@@ -5,19 +5,15 @@ import uuid
 import logging
 import base64
 from datetime import datetime
+from xml.dom.minidom import Document
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image
-from flask import Flask
-from dotenv import load_dotenv
-from utils import get_public_ip, log_event, sanitize_filename
+from utils import get_public_ip, log_event
 from database import insert_into_db
 from limit_checker import update_product_count
 import httpx
 from playwright.async_api import async_playwright, TimeoutError
-
-# Load .env variables
-load_dotenv()
-PROXY_URL = os.getenv("PROXY_URL")
+from proxysetup import get_browser_with_proxy_strategy
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
@@ -55,13 +51,13 @@ async def handle_tacori(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     current_date = datetime.now().strftime("%Y-%m-%d")
     time_only = datetime.now().strftime("%H.%M")
 
-    seen_ids = set()
+   
     records = []
     image_tasks = []
 
@@ -72,15 +68,8 @@ async def handle_tacori(url, max_pages):
         while load_more_clicks <= max_pages:
             async with async_playwright() as p:
                 # Create a new browser instance for each page
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                page = await browser.new_page()
-
-                try:
-                    await page.goto(url, timeout=120000)
-                except Exception as e:
-                    logging.warning(f"Failed to load URL {url}: {e}")
-                    await browser.close()
-                    continue  # move to the next iteration
+                product_wrapper = '.LayoutDefault-children'
+                browser, page = await get_browser_with_proxy_strategy(p, url, product_wrapper)
                 
                 for _ in range(load_more_clicks - 1):
                     try:
@@ -116,14 +105,36 @@ async def handle_tacori(url, max_pages):
                         logging.warning(f"Stopping pagination: {str(e)}")
                         break
 
+
+
                
                 
     
-                all_products = await page.query_selector_all("div.plp-card.config")
+                # all_products = await page.query_selector_all("div.plp-card.config")
+                wrapper_selector = (
+                    "div.MuiGrid-root"
+                    ".grid"
+                    ".grid-cols-2"
+                    ".tb\\:grid-cols-4"
+                    ".text-center"
+                    ".mt-8"
+                    ".gap-2"
+                    ".mui-style-yc8scu"
+                )
 
+                # 2) Item selector: pick the key class(es) inside the grid
+                item_selector = "div.simple.plp-card"
 
-                total_products = len(all_products)
-                new_products = all_products[previous_count:]
+                # 3) Query once, then all items
+                product_wrapper = await page.query_selector(wrapper_selector)
+                if product_wrapper:
+                    products = await product_wrapper.query_selector_all(item_selector)
+                else:
+                    products = []
+
+                print(f"Found {len(products)} products")
+                total_products = len(products)
+                new_products = products[previous_count:]
                 logging.info(f"Page {load_more_clicks}: Total = {total_products}, New = {len(new_products)}")
                 previous_count = total_products
 
@@ -178,7 +189,7 @@ async def handle_tacori(url, max_pages):
 
 
 
-
+                    additional_info_str = "N/A"
                     kt_match = re.search(r"\b\d{1,2}K\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSilver\b", product_name, re.IGNORECASE)
                     kt = kt_match.group() if kt_match else "Not found"
 
@@ -189,8 +200,8 @@ async def handle_tacori(url, max_pages):
                     task = asyncio.create_task(download_image(session, image_url, product_name, timestamp, image_folder, unique_id))
                     image_tasks.append((len(sheet['A']) + 1, unique_id, task))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
 
                 # Process image downloads and attach them to Excel
                 for row, unique_id, task in image_tasks:
@@ -201,7 +212,7 @@ async def handle_tacori(url, max_pages):
                         sheet.add_image(img, f"D{row}")
                     for i, record in enumerate(records):
                         if record[0] == unique_id:
-                            records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                            records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                             break
 
                 await browser.close()
@@ -210,17 +221,25 @@ async def handle_tacori(url, max_pages):
         # Save Excel
         filename = f'handle_tacori_{datetime.now().strftime("%Y-%m-%d_%H.%M")}.xlsx'
         file_path = os.path.join(EXCEL_DATA_PATH, filename)
+        
+    
+        if not records:
+            return None, None, None
+
+        # Save the workbook
         wb.save(file_path)
-        log_event(f"Data saved to {file_path} | IP: {ip_address}")
+        log_event(f"Data saved to {file_path}")
 
-        if records:
-            insert_into_db(records)
-        else:
-            logging.info("No data to insert into the database.")
+        # Encode the file in base64
+        with open(file_path, "rb") as file:
+            base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
-        update_product_count(len(seen_ids))
+        # Insert data into the database and update product count
+        insert_into_db(records)
+        update_product_count(len(records))
 
-        with open(file_path, "rb") as f:
-            base64_encoded = base64.b64encode(f.read()).decode("utf-8")
-
+        # Return necessary information
         return base64_encoded, filename, file_path
+
+
+       

@@ -12,14 +12,12 @@ import httpx
 from PIL import Image as PILImage
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
-from flask import Flask
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError, Error
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
-import json
-import urllib
+from proxysetup import get_browser_with_proxy_strategy
 
 # Load environment
 load_dotenv()
@@ -80,21 +78,10 @@ async def scroll_to_bottom(page):
             break
         last_height = new_height
 
-# Reliable page.goto wrapper
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-            await page.wait_for_selector(".grid", state="attached", timeout=30000)
-            print("[Success] Product listing loaded.")
-            return
-        except (Error, TimeoutError) as e:
-            logging.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
-            if attempt < retries - 1:
-                random_delay(1, 3)
-            else:
-                raise
+
+def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    separator = '&' if '?' in base_url else '?'
+    return f"{base_url}{separator}page={page_count}"
 
 # Main scraper function
 async def handle_harrods(url, max_pages=None):
@@ -109,7 +96,7 @@ async def handle_harrods(url, max_pages=None):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -119,16 +106,11 @@ async def handle_harrods(url, max_pages=None):
     while load_more_clicks <= max_pages:
         browser = None
         page = None
-        if load_more_clicks > 1:
-            url = f"{url}?page={load_more_clicks}"
+        current_url = build_url_with_loadmore(url, load_more_clicks)
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(1200000)
-
-                await safe_goto_and_wait(page, url)
+                product_wrapper = '.grid'
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, product_wrapper)
                 log_event(f"Successfully loaded: {url}")
 
                 # Scroll to load all items
@@ -148,13 +130,7 @@ async def handle_harrods(url, max_pages=None):
                 image_tasks = []
                 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
-                    try:
-                        # Extract brand name - from the headline element
-                        brand_tag = await product.query_selector("[data-test-id='headline']")
-                        brand = (await brand_tag.inner_text()).strip() if brand_tag else "N/A"
-                    except Exception:
-                        brand = "N/A"
-
+                    
                     try:
                         # Extract product name - from product-card-product-name
                         name_tag = await product.query_selector("[data-test-id='product-card-product-name']")
@@ -172,7 +148,7 @@ async def handle_harrods(url, max_pages=None):
                         price = "N/A"
 
                     # Description is same as product name in this case
-                    description = product_name
+                   
 
                     image_url = "N/A"
                     try:
@@ -189,16 +165,32 @@ async def handle_harrods(url, max_pages=None):
                     except Exception as e:
                         log_event(f"Error getting image URL: {e}")
                         image_url = "N/A"
+                        
 
                     # Extract gold type (kt) from product name/description
                     gold_type_pattern = r"\b\d{1,2}(?:K|kt|ct|Kt)\b|\bPlatinum\b|\bSilver\b|\bWhite Gold\b|\bYellow Gold\b|\bRose Gold\b"
-                    gold_type_match = re.search(gold_type_pattern, description, re.IGNORECASE)
+                    gold_type_match = re.search(gold_type_pattern, product_name, re.IGNORECASE)
                     kt = gold_type_match.group() if gold_type_match else "Not found"
 
                     # Extract diamond weight from description
                     diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw|carat)\b"
-                    diamond_weight_match = re.search(diamond_weight_pattern, description, re.IGNORECASE)
+                    diamond_weight_match = re.search(diamond_weight_pattern, product_name, re.IGNORECASE)
                     diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                    
+                    additional_info = []
+
+                    try:
+                        # Extract headline (e.g., brand name)
+                        headline_tag = await product.query_selector('p[data-test-id="headline"]')
+                        if headline_tag:
+                            headline_text = (await headline_tag.inner_text()).strip()
+                            if headline_text:
+                                additional_info.append(headline_text)
+                    except Exception as e:
+                        additional_info.append("N/A")
+
+                    additional_info_str = " | ".join(additional_info)
+
 
                     unique_id = str(uuid.uuid4())
                     if image_url and image_url != "N/A":
@@ -206,8 +198,8 @@ async def handle_harrods(url, max_pages=None):
                             download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                         )))
 
-                    records.append((unique_id, current_date, brand, product_name, description, kt, price, diamond_weight))
-                    sheet.append([current_date, brand, product_name, description, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
                             
                 # Process image downloads
                 for row_num, unique_id, task in image_tasks:
@@ -223,7 +215,7 @@ async def handle_harrods(url, max_pages=None):
                                 image_path = "N/A"
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")
@@ -238,12 +230,20 @@ async def handle_harrods(url, max_pages=None):
             if page: await page.close()
             if browser: await browser.close()
 
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
+
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

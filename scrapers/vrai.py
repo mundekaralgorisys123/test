@@ -20,7 +20,7 @@ from database import insert_into_db
 from limit_checker import update_product_count
 import json
 import mimetypes
-
+from proxysetup import get_browser_with_proxy_strategy
 # Load environment
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
@@ -109,42 +109,35 @@ async def handle_vrai(url, max_pages=None):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
     filename = f"handle_vrai_{datetime.now().strftime('%Y-%m-%d_%H.%M')}.xlsx"
     file_path = os.path.join(EXCEL_DATA_PATH, filename)
-    prev_prod_cout = 0
+    prev_prod_count = 0
     load_more_clicks = 1
+    
     while load_more_clicks <= max_pages:
         browser = None
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(1200000)
-
-                await safe_goto_and_wait(page, url)
+                browser, page = await get_browser_with_proxy_strategy(p, url, ".small-product-grid")
                 log_event(f"Successfully loaded: {url}")
 
                 try:
-                    # Wait for the overlay to appear (if it exists)
+                    # Handle overlay if present
                     overlay_selector = "div.relative.z-\\[100\\]"
                     close_button_selector = "button.absolute.right-sm.top-sm.z-10"
                     
-                    # Try to close the overlay if it exists
                     if await page.is_visible(overlay_selector):
                         log_event("Overlay detected, attempting to close...")
                         try:
-                            # Click the close button (X) in the top right corner
                             await page.click(close_button_selector)
                             log_event("Overlay closed successfully")
                         except Exception as e:
                             log_event(f"Error clicking close button: {e}")
-                            # If clicking fails, try removing the overlay element directly
                             await page.evaluate('''() => {
                                 const overlay = document.querySelector('div.relative.z-\\[100\\]');
                                 if (overlay) overlay.remove();
@@ -161,11 +154,11 @@ async def handle_vrai(url, max_pages=None):
                 time_only = datetime.now().strftime("%H.%M")
 
                 # Get all product tiles
-                product_wrapper = await page.query_selector("div.collection__window")
+                product_wrapper = await page.query_selector("div.small-product-grid")
                 products = await page.query_selector_all("div.plp-product-item") if product_wrapper else []
                 max_prod = len(products)
-                products = products[prev_prod_cout: min(max_prod, prev_prod_cout + 30)]
-                prev_prod_cout += len(products)
+                products = products[prev_prod_count: min(max_prod, prev_prod_count + 30)]
+                prev_prod_count += len(products)
 
                 if len(products) == 0:
                     log_event("No new products found, stopping the scraper.")
@@ -177,35 +170,63 @@ async def handle_vrai(url, max_pages=None):
                 image_tasks = []
                 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
+                    additional_info = []
                     try:
-                        # Extract product name - from the title element
+                        # Extract product name
                         name_tag = await product.query_selector(".title-m")
                         product_name = (await name_tag.inner_text()).strip() if name_tag else "N/A"
                     except Exception:
                         product_name = "N/A"
 
+                    # Price handling
+                    price = "N/A"
                     try:
-                        # Extract price - from the price element
+                        # Extract price element
                         price_tag = await product.query_selector(".body-m")
-                        price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
-                        # Clean up price string
-                        price = re.sub(r'\s+', ' ', price).strip()
-                        # Extract just the price value (remove "From" if present)
-                        price = price.replace("From", "").strip()
+                        if price_tag:
+                            price_text = (await price_tag.inner_text()).strip()
+                            # Clean up price string
+                            price_text = re.sub(r'\s+', ' ', price_text).strip()
+                            
+                            # Check if it's a "From" price
+                            if price_text.startswith("From"):
+                                price = price_text.replace("From", "").strip()
+                                additional_info.append("Multiple price points available")
+                            else:
+                                price = price_text
                     except Exception:
                         price = "N/A"
 
-                    # Description is same as product name in this case
+                    # Extract product description and style info
                     description = product_name
-
-                    image_url = "N/A"
                     try:
-                        # Get first img tag's src attribute from the product image section
-                        img_tag = await product.query_selector(".embla__slide img")
-                        if img_tag:
-                            image_url = await img_tag.get_attribute("src")
-                            # Clean up the URL by removing query parameters if needed
-                            image_url = image_url.split('?')[0] if image_url else "N/A"
+                        # Get style information (like "Cushion · Yellow Gold")
+                        style_tag = await product.query_selector(".body-m:has(span.whitespace-nowrap)")
+                        if style_tag:
+                            style_info = (await style_tag.inner_text()).strip()
+                            description = f"{product_name} - {style_info}"
+                            additional_info.append(f"Style: {style_info}")
+                    except Exception:
+                        pass
+
+                    # Extract all available images
+                    image_urls = []
+                    try:
+                        # Get all image slides
+                        img_slides = await product.query_selector_all(".embla__slide img")
+                        for img in img_slides:
+                            img_url = await img.get_attribute("src")
+                            if img_url:
+                                # Clean up the URL by removing query parameters
+                                img_url = img_url.split('?')[0]
+                                image_urls.append(img_url)
+                                
+                        # Use first available image as primary image_url
+                        image_url = image_urls[0] if image_urls else "N/A"
+                        
+                        # Add info about multiple images if available
+                        if len(image_urls) > 1:
+                            additional_info.append(f"Multiple images available ({len(image_urls)})")
                     except Exception as e:
                         log_event(f"Error getting image URL: {e}")
                         image_url = "N/A"
@@ -220,14 +241,43 @@ async def handle_vrai(url, max_pages=None):
                     diamond_weight_match = re.search(diamond_weight_pattern, description, re.IGNORECASE)
                     diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
 
+                    # Collect additional product information
+                    try:
+                        # Check for customization option
+                        customize_btn = await product.query_selector("div.absolute.left-0 img[alt*='Customize']")
+                        if customize_btn:
+                            additional_info.append("Customizable")
+                            
+                        # Check for product ID in the div
+                        product_id = await product.get_attribute("id")
+                        if product_id and "plp-product-item" in product_id:
+                            clean_id = product_id.replace("plp-product-item-", "")
+                            additional_info.append(f"Product ID: {clean_id}")
+                            
+                        # Check for alt text on images
+                        alt_texts = set()
+                        img_tags = await product.query_selector_all("img")
+                        for img in img_tags:
+                            alt = await img.get_attribute("alt")
+                            if alt and alt.lower() not in ["alt", "product image", "icon: customize"]:
+                                alt_texts.add(alt.strip())
+                        if alt_texts:
+                            additional_info.append(f"Image alts: {' | '.join(alt_texts)}")
+                            
+                    except Exception as e:
+                        log_event(f"Error collecting additional info: {e}")
+
+                    # Combine all additional info with pipe delimiter
+                    additional_info_str = " | ".join(additional_info) if additional_info else ""
+
                     unique_id = str(uuid.uuid4())
                     if image_url and image_url != "N/A":
                         image_tasks.append((row_num, unique_id, asyncio.create_task(
                             download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                         )))
 
-                    records.append((unique_id, current_date, page_title, product_name, description, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, description, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, description, kt, price, diamond_weight, additional_info_str))
+                    sheet.append([current_date, page_title, product_name, description, kt, price, diamond_weight, time_only, image_url, additional_info_str])
                             
                 # Process image downloads
                 for row_num, unique_id, task in image_tasks:
@@ -243,10 +293,11 @@ async def handle_vrai(url, max_pages=None):
                                 image_path = "N/A"
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")
+                        
                 load_more_clicks += 1
                 all_records.extend(records)
                 wb.save(file_path)

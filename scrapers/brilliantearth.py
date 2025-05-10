@@ -12,20 +12,12 @@ import httpx
 from PIL import Image as PILImage
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
-from flask import Flask
-from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError, Error
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
-import json
-import urllib
+from proxysetup import get_browser_with_proxy_strategy
 
-# Load environment
-load_dotenv()
-PROXY_URL = os.getenv("PROXY_URL")
-
-# Flask and paths
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
@@ -125,38 +117,7 @@ async def scroll_to_bottom(page):
             break
         last_height = new_height
 
-# Reliable page.goto wrapper
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
 
-
-            # Wait for the selector with a longer timeout
-            product_cards = await page.wait_for_selector(".listing-grid", state="attached", timeout=30000)
-
-            # Optionally validate at least 1 is visible (Playwright already does this)
-            if product_cards:
-                print("[Success] Product cards loaded.")
-                return
-        except Error as e:
-            logging.error(f"Error navigating to {url} on attempt {attempt + 1}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
-        except TimeoutError as e:
-            logging.warning(f"TimeoutError on attempt {attempt + 1} navigating to {url}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
-            
             
 # Main scraper function
 async def handle_brilliantearth(url, max_pages=None):
@@ -172,7 +133,7 @@ async def handle_brilliantearth(url, max_pages=None):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -185,12 +146,8 @@ async def handle_brilliantearth(url, max_pages=None):
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(1200000)
-
-                await safe_goto_and_wait(page, url)
+                product_wrapper = '.listing-grid'
+                browser, page = await get_browser_with_proxy_strategy(p, url, product_wrapper)
                 log_event(f"Successfully loaded: {url}")
 
                 # Scroll to load all items
@@ -259,17 +216,44 @@ async def handle_brilliantearth(url, max_pages=None):
                     except Exception as e:
                         log_event(f"Error getting image URL: {e}")
                         image_url = "N/A"
+                        
+                    try:
+                        material_el = await product.query_selector("small.firstline.hidden")
+                        if material_el:
+                            kt = (await material_el.inner_text()).strip()
+                        else:
+                            kt = "N/A"
+                    except Exception as e:
+                        kt = "N/A"
 
+                        
+                    print(kt)    
 
-                    # Extract gold type (kt) from product name/description
-                    gold_type_pattern = r"\b\d{1,2}(?:K|kt|ct|Kt)\b|\bPlatinum\b|\bSilver\b|\bWhite Gold\b|\bYellow Gold\b|\bRose Gold\b"
-                    gold_type_match = re.search(gold_type_pattern, product_name, re.IGNORECASE)
-                    kt = gold_type_match.group() if gold_type_match else "Not found"
 
                     # Extract diamond weight from description
                     diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw|carat)\b"
                     diamond_weight_match = re.search(diamond_weight_pattern, product_name, re.IGNORECASE)
                     diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                    
+                    additional_info = []
+
+                    try:
+                        # Correct selector for Best Seller badge
+                        tag_els_demand = await product.query_selector_all("div.ir327-badge.invert span")
+
+                        if tag_els_demand:
+                            for tag_ele in tag_els_demand:
+                                tag_text1 = await tag_ele.inner_text()
+                                if tag_text1:
+                                    additional_info.append(tag_text1.strip())
+                        else:
+                            additional_info.append("N/A")
+
+                    except Exception as e:
+                        additional_info.append("N/A")
+
+                    additional_info_str = " | ".join(additional_info)
+
 
                     unique_id = str(uuid.uuid4())
                     if image_url and image_url != "N/A":
@@ -278,8 +262,8 @@ async def handle_brilliantearth(url, max_pages=None):
                         )))
 
                 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
                             
                 # Process image downloads
                 for row_num, unique_id, task in image_tasks:
@@ -295,7 +279,7 @@ async def handle_brilliantearth(url, max_pages=None):
                                 image_path = "N/A"
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")
@@ -310,8 +294,11 @@ async def handle_brilliantearth(url, max_pages=None):
             if page: await page.close()
             if browser: await browser.close()
 
+    if not all_records:
+        return None, None, None    # Final save and database operations
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
+
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
@@ -319,3 +306,4 @@ async def handle_brilliantearth(url, max_pages=None):
     update_product_count(len(all_records))
 
     return base64_encoded, filename, file_path
+

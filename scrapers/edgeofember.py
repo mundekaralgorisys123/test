@@ -20,7 +20,7 @@ from database import insert_into_db
 from limit_checker import update_product_count
 import json
 import mimetypes
-
+from proxysetup import get_browser_with_proxy_strategy
 # Load environment
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
@@ -99,25 +99,21 @@ async def handle_edgeofember(url, max_pages=None):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Material", "Price", "Gemstone Info", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
     filename = f"handle_edgeofember_{datetime.now().strftime('%Y-%m-%d_%H.%M')}.xlsx"
     file_path = os.path.join(EXCEL_DATA_PATH, filename)
-    prev_prod_cout = 0
+    prev_prod_count = 0
     load_more_clicks = 1
-    while load_more_clicks<= max_pages:
+    
+    while load_more_clicks <= max_pages if max_pages else True:
         browser = None
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(1200000)
-
-                await safe_goto_and_wait(page, url)
+                browser, page = await get_browser_with_proxy_strategy(p, url, ".collection-products")
                 log_event(f"Successfully loaded: {url}")
 
                 # Handle overlay if it appears
@@ -140,8 +136,8 @@ async def handle_edgeofember(url, max_pages=None):
                 # Get all product tiles
                 products = await page.query_selector_all("div.product-grid-item")
                 max_prod = len(products)
-                products = products[prev_prod_cout: min(max_prod, prev_prod_cout + 30)]
-                prev_prod_cout += len(products)
+                products = products[prev_prod_count: min(max_prod, prev_prod_count + 30)]
+                prev_prod_count += len(products)
 
                 if len(products) == 0:
                     log_event("No new products found, stopping the scraper.")
@@ -153,6 +149,7 @@ async def handle_edgeofember(url, max_pages=None):
                 image_tasks = []
                 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
+                    additional_info = []
                     try:
                         # Extract product name
                         name_tag = await product.query_selector("a .eoe.line-small")
@@ -167,32 +164,87 @@ async def handle_edgeofember(url, max_pages=None):
                     except Exception:
                         material = "N/A"
 
+                    # Handle prices - collect all price information
+                    price_text = "N/A"
                     try:
-                        # Extract price - look for visible price span
-                        price_tag = await product.query_selector(".price-container .price:not(.price-hide)")
-                        price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
+                        # Get visible price (could be sale or regular)
+                        visible_price_tag = await product.query_selector(".price-container .price:not(.price-hide)")
+                        visible_price = (await visible_price_tag.inner_text()).strip() if visible_price_tag else None
+                        
+                        # Get hidden price (could be original price if on sale)
+                        hidden_price_tag = await product.query_selector(".price-container .price.price-hide")
+                        hidden_price = (await hidden_price_tag.inner_text()).strip() if hidden_price_tag else None
+                        
+                        # Format price text
+                        if visible_price and hidden_price:
+                            price_text = f"Sale: {visible_price} | Original: {hidden_price}"
+                        elif visible_price:
+                            price_text = f"Price: {visible_price}"
+                            
                         # Clean up price string
-                        price = re.sub(r'\s+', ' ', price).strip()
-                    except Exception:
-                        price = "N/A"
+                        price_text = re.sub(r'\s+', ' ', price_text).strip()
+                    except Exception as e:
+                        logging.warning(f"Error getting prices: {str(e)}")
+                        price_text = "N/A"
 
-                    # For Edge of Ember, the description is in the product name itself
-                    description = product_name
+                    # Get additional product information
+                    try:
+                        # Check for product badges (like "Bestseller", "New")
+                        badge_elements = await product.query_selector_all(".product-badges span")
+                        if badge_elements:
+                            badges = [await el.inner_text() for el in badge_elements]
+                            additional_info.append(f"Badges: {', '.join(b.strip() for b in badges if b.strip())}")
+                    except:
+                        pass
+
+                    try:
+                        # Check for gemstone/birthstone information
+                        gemstone_match = re.search(r"\b(Aquamarine|Diamond|Ruby|Sapphire|Emerald|Topaz|Opal|Pearl|Amethyst|Citrine|Garnet|Peridot)\b", product_name, re.IGNORECASE)
+                        if gemstone_match:
+                            additional_info.append(f"Gemstone: {gemstone_match.group()}")
+                    except:
+                        pass
+
+                    try:
+                        # Check for birthstone month
+                        birthstone_match = re.search(r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\b", product_name, re.IGNORECASE)
+                        if birthstone_match:
+                            additional_info.append(f"Birthstone Month: {birthstone_match.group()}")
+                    except:
+                        pass
+
+                    try:
+                        # Check for product type (earrings, necklace, etc.)
+                        product_type_match = re.search(r"\b(Earrings|Necklace|Bracelet|Ring|Pendant|Choker|Band|Drop|Stud|Hoops)\b", product_name, re.IGNORECASE)
+                        if product_type_match:
+                            additional_info.append(f"Type: {product_type_match.group()}")
+                    except:
+                        pass
+
+                    # Join all additional info with pipe delimiter
+                    additional_info_text = " | ".join(additional_info) if additional_info else "N/A"
 
                     image_url = "N/A"
                     try:
-                        # Get first image from the image container
-                        img_element = await product.query_selector(".image-container img")
+                        # Get first image from the image container (prefer desktop version)
+                        img_element = await product.query_selector(".image-container.desktop img") or await product.query_selector(".image-container.mobile img")
                         if img_element:
                             image_url = await img_element.get_attribute("src")
+                            # Ensure we get the full resolution image if possible
+                            if image_url and "width=" in image_url:
+                                image_url = image_url.split("width=")[0] + "width=1000"
                     except Exception as e:
                         log_event(f"Error getting image URL: {e}")
                         image_url = "N/A"
 
-                    # Extract diamond weight from description if available
-                    diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw|carat)\b"
-                    diamond_weight_match = re.search(diamond_weight_pattern, description, re.IGNORECASE)
-                    diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                    # Extract gemstone/diamond information from description
+                    gemstone_info = "N/A"
+                    try:
+                        gemstone_matches = re.findall(r"\b\d+(\.\d+)?\s*(?:ct|tcw|carat)?\s*(Aquamarine|Diamond|Ruby|Sapphire|Emerald|Topaz|Opal|Pearl|Amethyst|Citrine|Garnet|Peridot)\b", product_name, re.IGNORECASE)
+                        if gemstone_matches:
+                            gemstone_info = ", ".join([f"{size[0] if size[0] else ''} {stone}" for size, stone in gemstone_matches])
+                    except:
+                        pass
 
                     unique_id = str(uuid.uuid4())
                     if image_url and image_url != "N/A":
@@ -200,8 +252,8 @@ async def handle_edgeofember(url, max_pages=None):
                             download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                         )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, material, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, material, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, material, price_text, gemstone_info, additional_info_text))
+                    sheet.append([current_date, page_title, product_name, None, material, price_text, gemstone_info, time_only, image_url, additional_info_text])
                             
                 # Process image downloads
                 for row_num, unique_id, task in image_tasks:
@@ -217,14 +269,15 @@ async def handle_edgeofember(url, max_pages=None):
                                 image_path = "N/A"
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")
 
+                if max_pages:
+                    load_more_clicks += 1
                 all_records.extend(records)
                 wb.save(file_path)
-                load_more_clicks += 1
                 
         except Exception as e:
             logging.error(f"Error during scraping: {str(e)}")

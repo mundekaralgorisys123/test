@@ -13,7 +13,8 @@ from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
 import httpx
-from playwright.async_api import async_playwright, TimeoutError
+from playwright.async_api import async_playwright
+from proxysetup import get_browser_with_proxy_strategy
 
 # Load .env variables
 load_dotenv()
@@ -55,13 +56,13 @@ async def handle_graff(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     current_date = datetime.now().strftime("%Y-%m-%d")
     time_only = datetime.now().strftime("%H.%M")
 
-    seen_ids = set()
+    
     records = []
     image_tasks = []
 
@@ -72,15 +73,8 @@ async def handle_graff(url, max_pages):
         while load_more_clicks <= max_pages:
             async with async_playwright() as p:
                 # Create a new browser instance for each page
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                page = await browser.new_page()
-
-                try:
-                    await page.goto(url, timeout=120000)
-                except Exception as e:
-                    logging.warning(f"Failed to load URL {url}: {e}")
-                    await browser.close()
-                    continue  # move to the next iteration
+                product_wrapper = '.b-product-tile__inner.js-product-tile-inner'
+                browser, page = await get_browser_with_proxy_strategy(p, url, product_wrapper)
 
                 # Simulate clicking 'Load More' number of times
                 for _ in range(load_more_clicks - 1):
@@ -130,23 +124,40 @@ async def handle_graff(url, max_pages):
                     except Exception as e:
                         print(f"Error fetching image URL: {e}")
                         image_url = "N/A"
+                        
+                    try:
+                        material_tag = await product.query_selector('div.b-product-tile__short-description.h-text--h3')
+                        kt = await material_tag.inner_text() if material_tag else "N/A"
+                    except Exception as e:
+                        print(f"Error fetching material: {e}")
+                        kt = "N/A"
+                        
+                    additional_info = []
 
+                    try:
+                        tag_els = await product.query_selector_all(".b-product-tile__badge span")
+                        if tag_els:
+                            for tag_el in tag_els:
+                                tag_text = await tag_el.inner_text()
+                                if tag_text:
+                                    additional_info.append(tag_text.strip())
+                        else:
+                            additional_info.append("N/A")
 
+                    except Exception as e:
+                        print(f"Error fetching additional info: {e}")
+                        additional_info.append("N/A")
 
-
-
-                    kt_match = re.search(r"\b\d{1,2}K\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSilver\b", product_name, re.IGNORECASE)
-                    kt = kt_match.group() if kt_match else "Not found"
-
-                    diamond_match = re.search(r"\b(\d+(\.\d+)?)\s*(?:ct|ctw|carat)\b", product_name, re.IGNORECASE)
+                    additional_info_str = " | ".join(additional_info)
+                    diamond_match = re.search(r"\b(\d+(\.\d+)?)\s*(?:ct|ctw|carat)\b", kt, re.IGNORECASE)
                     diamond_weight = f"{diamond_match.group(1)} ct" if diamond_match else "N/A"
 
                     unique_id = str(uuid.uuid4())
                     task = asyncio.create_task(download_image(session, image_url, product_name, timestamp, image_folder, unique_id))
                     image_tasks.append((len(sheet['A']) + 1, unique_id, task))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
 
                 # Process image downloads and attach them to Excel
                 for row, unique_id, task in image_tasks:
@@ -157,7 +168,7 @@ async def handle_graff(url, max_pages):
                         sheet.add_image(img, f"D{row}")
                     for i, record in enumerate(records):
                         if record[0] == unique_id:
-                            records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                            records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                             break
 
                 await browser.close()
@@ -166,17 +177,20 @@ async def handle_graff(url, max_pages):
         # Save Excel
         filename = f'handle_graff_{datetime.now().strftime("%Y-%m-%d_%H.%M")}.xlsx'
         file_path = os.path.join(EXCEL_DATA_PATH, filename)
+        if not records:
+            return None, None, None
+
+        # Save the workbook
         wb.save(file_path)
-        log_event(f"Data saved to {file_path} | IP: {ip_address}")
+        log_event(f"Data saved to {file_path}")
 
-        if records:
-            insert_into_db(records)
-        else:
-            logging.info("No data to insert into the database.")
+        # Encode the file in base64
+        with open(file_path, "rb") as file:
+            base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
-        update_product_count(len(seen_ids))
+        # Insert data into the database and update product count
+        insert_into_db(records)
+        update_product_count(len(records))
 
-        with open(file_path, "rb") as f:
-            base64_encoded = base64.b64encode(f.read()).decode("utf-8")
-
+        # Return necessary information
         return base64_encoded, filename, file_path
