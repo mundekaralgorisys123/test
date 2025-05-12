@@ -12,13 +12,12 @@ import httpx
 from PIL import Image as PILImage
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
-from flask import Flask
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError, Error
-from utils import get_public_ip, log_event, sanitize_filename
+from utils import get_public_ip, log_event
 from database import insert_into_db
 from limit_checker import update_product_count
-import json
+from proxysetup import get_browser_with_proxy_strategy
 import urllib
 
 # Load environment
@@ -50,7 +49,18 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
     image_filename = f"{unique_id}_{timestamp}.png"
     image_full_path = os.path.join(image_folder, image_filename)
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.birks.com/",
+    }
+
+    async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
         for attempt in range(retries):
             try:
                 response = await client.get(image_url)
@@ -62,6 +72,25 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
                 logging.warning(f"Retry {attempt + 1}/{retries} - Error downloading {product_name}: {e}")
     logging.error(f"Failed to download {product_name} after {retries} attempts.")
     return "N/A"
+# async def download_image_async(image_url, product_name, timestamp, image_folder, unique_id, retries=3):
+#     if not image_url or image_url == "N/A":
+#         return "N/A"
+
+#     image_filename = f"{unique_id}_{timestamp}.png"
+#     image_full_path = os.path.join(image_folder, image_filename)
+
+#     async with httpx.AsyncClient(timeout=10.0) as client:
+#         for attempt in range(retries):
+#             try:
+#                 response = await client.get(image_url)
+#                 response.raise_for_status()
+#                 with open(image_full_path, "wb") as f:
+#                     f.write(response.content)
+#                 return image_full_path
+#             except httpx.RequestError as e:
+#                 logging.warning(f"Retry {attempt + 1}/{retries} - Error downloading {product_name}: {e}")
+#     logging.error(f"Failed to download {product_name} after {retries} attempts.")
+#     return "N/A"
 
 # Human-like delay
 def random_delay(min_sec=1, max_sec=3):
@@ -109,7 +138,7 @@ async def handle_birks(url, max_pages=None):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -122,12 +151,8 @@ async def handle_birks(url, max_pages=None):
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(1200000)
-
-                await safe_goto_and_wait(page, url)
+                product_wrapper = '.product-grid'
+                browser, page = await get_browser_with_proxy_strategy(p, url, product_wrapper)
                 log_event(f"Successfully loaded: {url}")
 
                 # Scroll to load all items
@@ -200,6 +225,8 @@ async def handle_birks(url, max_pages=None):
                     except Exception as e:
                         log_event(f"Error getting image URL: {e}")
                         image_url = "N/A"
+                        
+                    print(image_url)    
 
                     # Extract gold type (kt) from product name/description
                     gold_type_pattern = r"\b\d{1,2}(?:K|kt|ct|Kt)\b|\bPlatinum\b|\bSilver\b|\bWhite Gold\b|\bYellow Gold\b|\bRose Gold\b|\bTri-Gold\b"
@@ -210,6 +237,9 @@ async def handle_birks(url, max_pages=None):
                     diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw|carat)\b"
                     diamond_weight_match = re.search(diamond_weight_pattern, description, re.IGNORECASE)
                     diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                    
+                    
+                    additional_info_str = description
 
                     unique_id = str(uuid.uuid4())
                     if image_url and image_url != "N/A":
@@ -217,8 +247,8 @@ async def handle_birks(url, max_pages=None):
                             download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                         )))
 
-                    records.append((unique_id, current_date, page_title, product_name, description, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, description, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
                             
                 # Process image downloads
                 for row_num, unique_id, task in image_tasks:
@@ -234,7 +264,7 @@ async def handle_birks(url, max_pages=None):
                                 image_path = "N/A"
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")
@@ -249,8 +279,11 @@ async def handle_birks(url, max_pages=None):
             if page: await page.close()
             if browser: await browser.close()
 
+    if not all_records:
+        return None, None, None    # Final save and database operations
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
+
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 

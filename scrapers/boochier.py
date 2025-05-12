@@ -18,8 +18,8 @@ from playwright.async_api import async_playwright, TimeoutError, Error
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
-import json
-import urllib
+from proxysetup import get_browser_with_proxy_strategy
+import re
 
 # Load environment
 load_dotenv()
@@ -110,7 +110,7 @@ async def handle_boochier(url, max_pages=None):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -123,12 +123,8 @@ async def handle_boochier(url, max_pages=None):
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(1200000)
-
-                await safe_goto_and_wait(page, url)
+                product_wrapper = '.col-lg-12'
+                browser, page = await get_browser_with_proxy_strategy(p, url, product_wrapper)
                 log_event(f"Successfully loaded: {url}")
 
                 # Scroll to load all items
@@ -180,55 +176,64 @@ async def handle_boochier(url, max_pages=None):
 
                     image_url = "N/A"
                     try:
-                        # Get the image container which contains multiple resolution options
-                        img_container = await product.query_selector(".pr_lazy_img.main-img")
+                        await product.scroll_into_view_if_needed()
+
+                        # Locate the image container with the background images
+                        img_container = await product.query_selector(".pr_lazy_img")
                         if img_container:
-                            # Get the data-bgset attribute which contains all image URLs
                             bgset = await img_container.get_attribute("data-bgset")
+                            image_options = []
+
                             if bgset:
-                                # Extract all image URLs and their sizes
-                                image_options = []
                                 for img_info in bgset.split(','):
                                     img_info = img_info.strip()
                                     if not img_info:
                                         continue
                                     parts = img_info.split()
-                                    if len(parts) >= 1:
-                                        img_url = parts[0]
-                                        # Get the size if available (e.g., "180w")
+                                    if parts:
+                                        url_part = parts[0]
                                         size = 0
-                                        if len(parts) > 1:
-                                            size_part = parts[-1]
-                                            if size_part.endswith('w'):
-                                                try:
-                                                    size = int(size_part[:-1])
-                                                except ValueError:
-                                                    pass
-                                        # Ensure URL is complete
-                                        if img_url.startswith("//"):
-                                            img_url = f"https:{img_url}"
-                                        elif img_url.startswith("/"):
-                                            img_url = f"https://boochier.com{img_url}"
-                                        image_options.append((size, img_url))
-                                
-                                # Select the highest resolution image available
-                                if image_options:
-                                    # Sort by size descending and take the first URL
-                                    image_options.sort(reverse=True, key=lambda x: x[0])
-                                    image_url = image_options[0][1]
+                                        if len(parts) > 1 and parts[-1].endswith('w'):
+                                            try:
+                                                size = int(parts[-1][:-1])
+                                            except ValueError:
+                                                pass
+                                        # Normalize the URL
+                                        if url_part.startswith("//"):
+                                            url_part = "https:" + url_part
+                                        elif url_part.startswith("/"):
+                                            url_part = "https://boochier.com" + url_part
+                                        image_options.append((size, url_part))
+
+                            # Fallback: try to get image from inline style
+                            if not image_options:
+                                style_attr = await img_container.get_attribute("style")
+                                if style_attr and "background-image" in style_attr:
+                                   
+                                    match = re.search(r'url\(&quot;(.*?)&quot;\)', style_attr)
+                                    if match:
+                                        image_options.append((0, match.group(1)))
+
+                            # Choose the image with the highest resolution
+                            if image_options:
+                                image_options.sort(key=lambda x: x[0], reverse=True)
+                                image_url = image_options[0][1]
+
                     except Exception as e:
-                        log_event(f"Error getting image URL: {e}")
+                        log_event(f"Error extracting image URL: {e}")
                         image_url = "N/A"
 
-                    # Extract gold type (kt) from product name/description
-                    gold_type_pattern = r"\b\d{1,2}(?:K|kt|ct|Kt)\b|\bPlatinum\b|\bSilver\b|\bWhite Gold\b|\bYellow Gold\b|\bRose Gold\b|\bBlack Enamel\b"
+
+                    
+                    gold_type_pattern = r"\b(?:\d{1,2}\s*(?:k|kt|ct)|platinum|silver|white gold|yellow gold|rose gold|black enamel|gold)\b"
                     gold_type_match = re.search(gold_type_pattern, description, re.IGNORECASE)
                     kt = gold_type_match.group() if gold_type_match else "Not found"
 
-                    # Extract diamond weight from description
-                    diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw|carat)\b"
+                    diamond_weight_pattern = r"\b\d+(?:\.\d+)?\s*(?:ct|cts|tcw|carat|carats)\b"
                     diamond_weight_match = re.search(diamond_weight_pattern, description, re.IGNORECASE)
                     diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                    
+                    additional_info_str = description
 
                     unique_id = str(uuid.uuid4())
                     if image_url and image_url != "N/A":
@@ -236,12 +241,12 @@ async def handle_boochier(url, max_pages=None):
                             download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                         )))
 
-                    records.append((unique_id, current_date, page_title, product_name, description, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, description, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
                 # Process image downloads
                 for row_num, unique_id, task in image_tasks:
                     try:
-                        image_path = await asyncio.wait_for(task, timeout=60)
+                        image_path = await asyncio.wait_for(task, timeout=30)
                         if image_path != "N/A":
                             try:
                                 img = ExcelImage(image_path)
@@ -252,7 +257,7 @@ async def handle_boochier(url, max_pages=None):
                                 image_path = "N/A"
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")
@@ -267,8 +272,11 @@ async def handle_boochier(url, max_pages=None):
             if page: await page.close()
             if browser: await browser.close()
 
+    if not all_records:
+        return None, None, None    # Final save and database operations
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
+
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 

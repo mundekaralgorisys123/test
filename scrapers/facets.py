@@ -18,8 +18,7 @@ from playwright.async_api import async_playwright, TimeoutError, Error
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
-import json
-import urllib
+from proxysetup import get_browser_with_proxy_strategy
 
 # Load environment
 load_dotenv()
@@ -80,23 +79,7 @@ async def scroll_to_bottom(page):
             break
         last_height = new_height
 
-# Reliable page.goto wrapper
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-            await page.wait_for_selector(".CollectionAjaxContent", state="attached", timeout=30000)
-            print("[Success] Product listing loaded.")
-            return
-        except (Error, TimeoutError) as e:
-            logging.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
-            if attempt < retries - 1:
-                random_delay(1, 3)
-            else:
-                raise
 
-# Main scraper function
 async def handle_facets(url, max_pages=None):
     ip_address = get_public_ip()
     logging.info(f"Scraping started for: {url} from IP: {ip_address}")
@@ -109,7 +92,7 @@ async def handle_facets(url, max_pages=None):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -122,12 +105,8 @@ async def handle_facets(url, max_pages=None):
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(1200000)
-
-                await safe_goto_and_wait(page, url)
+                product_wrapper = '.transition-body'
+                browser, page = await get_browser_with_proxy_strategy(p, url, product_wrapper)
                 log_event(f"Successfully loaded: {url}")
 
                 # Scroll to load all items
@@ -138,8 +117,9 @@ async def handle_facets(url, max_pages=None):
                 time_only = datetime.now().strftime("%H.%M")
 
                 # Get all product tiles
-                product_wrapper = await page.query_selector("div.CollectionAjaxContent")
-                products = await page.query_selector_all("div.grid-product") if product_wrapper else []
+                product_wrapper = await page.query_selector("div.products-on-page")
+
+                products = await page.query_selector_all("div.grid__item.grid-product") if product_wrapper else []
                 max_prod = len(products)
                 products = products[prev_prod_cout: min(max_prod, prev_prod_cout + 30)]
                 prev_prod_cout += len(products)
@@ -155,61 +135,69 @@ async def handle_facets(url, max_pages=None):
                 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
                     try:
-                        # Extract product name - from the grid-product__title element
                         name_tag = await product.query_selector(".grid-product__title")
-                        product_name = (await name_tag.inner_text()).strip() if name_tag else "N/A"
-                    except Exception:
+                        if name_tag:
+                            product_name = (await name_tag.inner_text()).strip()
+                        else:
+                            product_name = "N/A"
+                    except Exception as e:
+                        log_event(f"Error extracting product name: {e}")
                         product_name = "N/A"
 
+
                     try:
-                        # Extract price - from the grid-product__price span element
+                        # Extract price from span inside .grid-product__price
                         price_tag = await product.query_selector(".grid-product__price span")
-                        price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
-                        # Clean up price string
-                        price = re.sub(r'\s+', ' ', price).strip()
-                    except Exception:
+                        if price_tag:
+                            price = (await price_tag.inner_text()).strip()
+                            # Normalize whitespace (handles line breaks or multiple spaces)
+                            price = re.sub(r'\s+', ' ', price)
+                        else:
+                            price = "N/A"
+                    except Exception as e:
+                        log_event(f"Error extracting price: {e}")
                         price = "N/A"
+
 
                     # Description is same as product name in this case
                     description = product_name
 
                     image_url = "N/A"
                     try:
-                        # Get the first product slide image
-                        img_tag = await product.query_selector(".product-slide:first-child .grid-product__image")
+                        # Select the first product image element
+                        img_tag = await product.query_selector(".product-slide .grid-product__image")
+
                         if img_tag:
-                            # Get the srcset attribute which contains multiple resolutions
+                            # Try getting the srcset first (preferred)
                             srcset = await img_tag.get_attribute("srcset")
-                            
                             if srcset:
-                                # Extract all URLs and resolutions from srcset
-                                srcset_parts = [part.strip() for part in srcset.split(",")]
+                                # Split srcset into parts like ['url1 750w', 'url2 900w']
                                 urls_resolutions = []
-                                
-                                for part in srcset_parts:
-                                    url_res = part.split(" ")
-                                    if len(url_res) >= 2:
-                                        url = url_res[0]
-                                        resolution = int(url_res[1].replace("w", ""))
+                                for part in srcset.split(","):
+                                    url_res = part.strip().split(" ")
+                                    if len(url_res) == 2:
+                                        url, res = url_res
+                                        resolution = int(res.replace("w", ""))
                                         urls_resolutions.append((resolution, url))
-                                
-                                # Sort by resolution and get the highest one
-                                urls_resolutions.sort(reverse=True)
                                 if urls_resolutions:
-                                    image_url = urls_resolutions[0][1]
-                                    # Ensure URL is complete (add https: if needed)
-                                    if image_url.startswith("//"):
-                                        image_url = f"https:{image_url}"
-                                    # Remove any query parameters
-                                    image_url = image_url.split('?')[0]
+                                    # Get highest resolution URL
+                                    highest_res_url = sorted(urls_resolutions, reverse=True)[0][1]
+                                    if highest_res_url.startswith("//"):
+                                        highest_res_url = f"https:{highest_res_url}"
+                                    image_url = highest_res_url.split("?")[0]
                             else:
-                                # Fallback to src attribute if srcset not available
-                                image_url = await img_tag.get_attribute("src")
-                                if image_url and image_url.startswith("//"):
-                                    image_url = f"https:{image_url}"
+                                # Fallback to src attribute
+                                fallback_src = await img_tag.get_attribute("src")
+                                if fallback_src:
+                                    if fallback_src.startswith("//"):
+                                        fallback_src = f"https:{fallback_src}"
+                                    image_url = fallback_src.split("?")[0]
                     except Exception as e:
                         log_event(f"Error getting image URL: {e}")
                         image_url = "N/A"
+                        
+                    additional_info_str = description
+     
 
                     # Extract gold type (kt) from product name/description
                     gold_type_pattern = r"\b\d{1,2}(?:K|kt|ct|Kt)\b|\bPlatinum\b|\bSilver\b|\bWhite Gold\b|\bYellow Gold\b|\bRose Gold\b"
@@ -227,8 +215,8 @@ async def handle_facets(url, max_pages=None):
                             download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                         )))
 
-                    records.append((unique_id, current_date, page_title, product_name, description, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, description, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
                             
                 # Process image downloads
                 for row_num, unique_id, task in image_tasks:
@@ -244,7 +232,7 @@ async def handle_facets(url, max_pages=None):
                                 image_path = "N/A"
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")

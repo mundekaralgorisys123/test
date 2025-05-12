@@ -99,7 +99,6 @@ async def safe_goto_and_wait(page, url, retries=3):
 async def handle_jadetrau(url, max_pages=None):
     ip_address = get_public_ip()
     logging.info(f"Scraping started for: {url} from IP: {ip_address}")
-
     os.makedirs(EXCEL_DATA_PATH, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     image_folder = os.path.join(IMAGE_SAVE_PATH, timestamp)
