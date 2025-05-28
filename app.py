@@ -1,6 +1,21 @@
 
-from flask import Flask, render_template, request, send_from_directory, jsonify
+from flask import Flask, render_template, request,send_file, jsonify
+import os
+import re
+import openpyxl
+from PIL import Image
+from openpyxl.drawing.image import Image as XLImage
+import pymssql
+import tempfile
+from openpyxl.styles import Alignment, Font, Border, Side
+from io import BytesIO
+import openpyxl
+from PIL import Image
+from openpyxl.drawing.image import Image as XLImage
+import pymssql
+import tempfile
 from urllib.parse import urlparse
+from proxy import check_proxies
 from scrapers.ernest_jones import handle_ernest_jones
 from scrapers.shaneco import handle_shane_co
 from scrapers.fhinds import handle_fhinds
@@ -70,9 +85,7 @@ from scrapers.briju import handle_briju
 from scrapers.histoiredor import handle_histoiredor
 from scrapers.marcorian import handle_marcorian
 from scrapers.klenotyaurum import handle_klenotyaurum
-
 from scrapers.stroilioro import handle_stroilioro
-from scrapers.americanswiss import handle_americanswiss
 from scrapers.mariemass import handle_mariemass
 from scrapers.mattioli import handle_mattioli
 from scrapers.pomellato import handle_pomellato
@@ -99,10 +112,9 @@ from scrapers.tacori import handle_tacori
 from scrapers.vancleefarpels import handle_vancleefarpels
 from scrapers.davidyurman import handle_davidyurman
 from scrapers.chopard import handle_chopard
-
 from scrapers.jonehardy import handle_jonehardy
 from scrapers.anitako import handle_anitako
-from scrapers.jennifermeyer import handle_jennifermeyer
+from scrapers.jennifermeyer import handle_jennifermeyer 
 from scrapers.jacquieaiche import handle_jacquieaiche
 from scrapers.jacobandco import handle_jacobandco
 from scrapers.ferkos import handle_ferkos
@@ -135,7 +147,6 @@ from scrapers.louisvuitton import handle_louisvuitton
 from scrapers.piaget import handle_piaget
 from scrapers.harrods import handle_harrods
 from scrapers.cartier import handle_cartier
-# from scrapers.hannoush import handle_hannoush
 from scrapers.bulgari import handle_bulgari
 from scrapers.laurenbjewelry1 import handle_laurenbjewelry1
 from scrapers.ajaffe import handle_ajaffe
@@ -149,12 +160,22 @@ from utils import get_public_ip,log_event
 from limit_checker import check_monthly_limit
 import json
 from database import reset_scraping_limit,get_scraping_settings,get_all_scraped_products
-from ip_tracker import generate_unique_id,insert_scrape_log,update_scrape_status
+
+from dotenv import load_dotenv
+load_dotenv
 app = Flask(__name__)
 CORS(app)
 #############################################################################################################
 import logging
 import os
+
+DB_CONFIG = {
+    "server": os.getenv("DB_SERVER"),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "database": os.getenv("DB_NAME"),
+}
+
 os.makedirs("logs", exist_ok=True)
 
 # File to store request count
@@ -194,14 +215,20 @@ def main():
 
 @app.route('/fetch', methods=['POST'])
 def fetch_data():
+    
+    is_valid, message = check_proxies()
+    if not is_valid:
+        print("IN CODE")
+        print(message)
+        return jsonify({"errormsg": "Proxy validation failed"}), 502
+    
     # Check the daily limit
     if not check_monthly_limit():
-        return jsonify({"400": "Daily limit reached. Scraping is disabled."}), 400
+        return jsonify({"errormsg": "Daily limit reached. Scraping is disabled."}), 400
    
     # Get URL and pagination details
     url = request.form.get('url')
     max_pages = int(request.form.get('maxPages', 1))  # Ensure max_pages is an integer
-
 
     # print("Final URL:", final_url)
     domain = urlparse(url).netloc.lower()
@@ -227,7 +254,7 @@ def fetch_data():
         base64_encoded, filename, file_path = asyncio.run(handle_gabriel(url, max_pages)) 
     elif 'www.hsamuel.co.uk' in domain:
         base64_encoded, filename, file_path = asyncio.run(handle_h_samuel(url, max_pages)) 
-    elif 'www.tiffany.co.in' in domain:
+    elif 'www.tiffany.com' in domain:
         base64_encoded, filename, file_path = asyncio.run(handle_tiffany(url, max_pages)) 
     elif 'www.shaneco.com' in domain:
         base64_encoded, filename, file_path = asyncio.run(handle_shane_co(url, max_pages))
@@ -254,7 +281,7 @@ def fetch_data():
         base64_encoded, filename, file_path = asyncio.run(handle_thediamondstore(url, max_pages))
     elif 'www.prouds.com.au' in domain:
         base64_encoded, filename, file_path = asyncio.run(handle_prouds(url, max_pages)) 
-    elif 'www.goldmark.com.au' in domain:
+    elif 'goldmark.com.au' in domain:
         base64_encoded, filename, file_path = asyncio.run(handle_goldmark(url, max_pages))
     elif 'www.anguscoote.com.au' in domain:
         base64_encoded, filename, file_path = asyncio.run(handle_anguscoote(url, max_pages))   
@@ -350,8 +377,8 @@ def fetch_data():
         base64_encoded, filename, file_path = asyncio.run(handle_klenotyaurum(url, max_pages))       
     elif 'www.stroilioro.com' in domain:
         base64_encoded, filename, file_path = asyncio.run(handle_stroilioro(url, max_pages)) 
-    elif 'bash.com' in domain:
-        base64_encoded, filename, file_path = asyncio.run(handle_americanswiss(url, max_pages))  
+    # elif 'bash.com' in domain:
+    #     base64_encoded, filename, file_path = asyncio.run(handle_americanswiss(url, max_pages))  
     elif 'mariemas.com' in domain:
         base64_encoded, filename, file_path = asyncio.run(handle_mariemass(url, max_pages))
     elif 'mattioli.it' in domain:
@@ -360,8 +387,7 @@ def fetch_data():
         base64_encoded, filename, file_path = asyncio.run(handle_pomellato(url, max_pages))
     elif 'www.dior.com' in domain:
         base64_encoded, filename, file_path = asyncio.run(handle_dior(url, max_pages))
-    elif 'bybonniejewelry.com' in domain:
-        base64_encoded, filename, file_path = asyncio.run(handle_bonnie(url, max_pages))              
+        
                         
 ########################################### 24/07 ################################################################## 
     elif 'www.diamondsfactory.co.uk' in domain:
@@ -415,8 +441,7 @@ def fetch_data():
         base64_encoded, filename, file_path = asyncio.run(handle_ferkos(url, max_pages))
     elif "www.heartsonfire.com" in domain:
         base64_encoded, filename, file_path = asyncio.run(handle_heartsonfire(url, max_pages))
-         
-                                     
+                                             
 ################################################### 26 /04 ##########################################################
     elif 'www.chanel.com' in domain:
         base64_encoded, filename, file_path = asyncio.run(handle_chanel(url, max_pages)) 
@@ -466,34 +491,33 @@ def fetch_data():
         base64_encoded, filename, file_path = asyncio.run(handle_harrods(url, max_pages))
     elif "www.cartier.com" in domain:
         base64_encoded, filename, file_path = asyncio.run(handle_cartier(url, max_pages))
-    # elif "www.hannoush.com" in domain:
-    #     base64_encoded, filename, file_path = asyncio.run(handle_hannoush(url, max_pages))
+
     elif "www.bulgari.com" in domain:
         base64_encoded, filename, file_path = asyncio.run(handle_bulgari(url, max_pages))
-    elif "in.louisvuitton.com" in domain:
+    elif "www.laurenbjewelry.com" in domain:
         base64_encoded, filename, file_path = asyncio.run(handle_laurenbjewelry1(url, max_pages))
     elif "ajaffe.com" in domain:
         base64_encoded, filename, file_path = asyncio.run(handle_ajaffe(url, max_pages))
-    # elif "www.laurenbjewelry.com" in domain:
-    #     base64_encoded, filename, file_path = asyncio.run(handle_laurenbjewelry(url, max_pages))
+    
                             
 #############################################################################################################
     else:
         log_event(f"Unknown website attempted: {domain}")
-        return jsonify({"error": "Unknown website"}), 200
+        return jsonify({"error": "Unknown website"}), 500
     
     # Return file download link or error message
     if filename:
         # update_scrape_status(scrape_id, 'inactive')
         log_event(f"Successfully scraped {domain}. File generated: {filename}")
-        return jsonify({'file': base64_encoded, 'filename': filename, 'filepath': file_path})
+        return jsonify({'file': base64_encoded, 'filename': filename, 'filepath': file_path}),200
     else:
         # update_scrape_status(scrape_id, 'error')
+        print("output")
         log_event(f"Scraping failed for {domain}")
-        return jsonify({"error": "File generation failed"}), 500
+        return jsonify({"error": "Failed"}), 800
 
 
-#############################################################################################################
+
 #############################################################################################################
 
 @app.route("/reset-limit", methods=["GET"])
@@ -512,16 +536,555 @@ def get_data():
 def get_products():
     return jsonify(get_all_scraped_products())
 
-@app.route("/product_view")
-def product_view():
+
+
+@app.route("/productview")
+def productview():
     
-    products = get_all_scraped_products()
+    products1 = get_all_scraped_products()
     # print(products)
     # print(type(products))
-    return render_template("product_view.html", products=products)
+    return render_template("product_view.html", products1=products1)
 
 #############################################################################################################
+
+
+@app.route('/report', methods=['POST'])
+def generate_report():
+    data = request.get_json()
+    selected_date = data.get('date')
+    selected_header = data.get('header')
+
+    print(f"Received date: {selected_date}, header: {selected_header}")
+
+    try:
+        # Connect to SQL Server
+        conn = pymssql.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+
+        # Query to fetch data - verify this matches your table structure
+        query = """
+        SELECT CurrentDate, Header, ProductName, ImagePath, Kt, Price, TotalDiaWt, Time, AdditionalInfo
+        FROM IBM_Algo_Webstudy_Products
+        WHERE CONVERT(date, CurrentDate) = %s AND Header = %s
+        """
+        cursor.execute(query, (selected_date, selected_header))
+        records = cursor.fetchall()
+        
+        if not records:
+            return jsonify({"error": "No records found for the selected date and header"}), 404
+
+        # Create Excel workbook
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Product Report"
+
+        # Define headers and set column widths
+        headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", 
+                   "Total Dia wt", "Time", "ImagePath", "Additional Info"]
+        ws.append(headers)
+        
+        column_widths = {'A': 15, 'B': 20, 'C': 25, 'D': 15, 'E': 10, 
+                        'F': 15, 'G': 15, 'H': 15, 'I': 40, 'J': 40}
+        for col, width in column_widths.items():
+            ws.column_dimensions[col].width = width
+
+        # Create temporary directory for image processing
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Process records
+            for row_idx, record in enumerate(records, start=2):
+                try:
+                    # Unpack all 9 values at once
+                    (current_date, header, product_name, image_path, 
+                     kt, price, total_dia_wt, time, additional_info) = record
+                    
+                    # Add data row
+                    ws.append([
+                        current_date, header, product_name, 
+                        '',  # Placeholder for image
+                        kt, price, total_dia_wt, time, 
+                        image_path, additional_info
+                    ])
+
+                    # Set row height for image rows
+                    ws.row_dimensions[row_idx].height = 75
+
+                    # Handle image if path exists
+                    if image_path and os.path.exists(image_path):
+                        try:
+                            # Create unique temp filename
+                            temp_img_path = os.path.join(temp_dir, f"img_{row_idx}.jpg")
+                            
+                            # Process and save image
+                            with Image.open(image_path) as img:
+                                img.thumbnail((100, 100))
+                                img.save(temp_img_path)
+                            
+                            # Add to Excel
+                            excel_img = XLImage(temp_img_path)
+                            excel_img.anchor = f'D{row_idx}'
+                            ws.add_image(excel_img)
+                        except Exception as img_error:
+                            print(f"Error processing image {image_path}: {img_error}")
+                            ws.cell(row=row_idx, column=4, value="Image Error")
+                except Exception as row_error:
+                    print(f"Error processing row {row_idx}: {row_error}")
+                    continue
+
+            # Save workbook to BytesIO
+            output = BytesIO()
+            wb.save(output)
+            output.seek(0)
+
+        # Close database connection
+        cursor.close()
+        conn.close()
+
+        # Create response
+        response = send_file(
+            output,
+            as_attachment=True,
+            download_name=f"report_{selected_date}_{selected_header}.xlsx",
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+        return response
+    except Exception as e:
+        print(f"Error generating report: {e}")
+        return jsonify({"error": f"Failed to generate report: {str(e)}"}), 500
+
+
+
+#############################################################################################################
+
+
+def clean_price(price_str):
+    """
+    Extracts currency and sale/original prices from strings like:
+    '£349.00 off £450.00', '45 EUR', 'USD 199.00', '$149.99', '150.99 USD', etc.
+    Returns (sale_price, original_price, currency)
+    """
+    if not price_str:
+        return 0.0, 0.0, ""
+
+    price_str = str(price_str).replace(",", "").upper()
+
+    # Match both prefix and suffix currency patterns
+    currency_pattern = r'(?:([€£$₹])\s?|(\bUSD|\bEUR|\bGBP|\bCAD|\bAUD|\bINR)\s?)?(\d+(?:\.\d+)?)(?:\s?(USD|EUR|GBP|CAD|AUD|INR))?'
+
+    matches = re.findall(currency_pattern, price_str)
+
+    prices = []
+    currencies = []
+
+    for symbol1, code1, amount, code2 in matches:
+        currency = symbol1 or code1 or code2
+        if currency:
+            currencies.append(currency)
+        prices.append(float(amount))
+
+    # Use the most common currency found, or empty string
+    currency = currencies[0] if currencies else ""
+
+    if len(prices) >= 2:
+        return prices[0], prices[1], currency
+    elif len(prices) == 1:
+        return prices[0], 0.0, currency
+    else:
+        return 0.0, 0.0, currency
+
+# Determine how to format based on symbol/code position
+def format_currency(value, currency):
+    if not value:
+        return ""
+    if currency in ['£', '$', '€', '₹']:
+        return f"{currency}{value:.2f}"
+    elif currency:
+        return f"{value:.2f} {currency}"
+    else:
+        return f"{value:.2f}"
+
+
+def safe_str(value):
+    value = str(value).strip() if value else ""
+    return "'" + value if value.startswith("=") else value
+
+
+@app.route('/reportsummery', methods=['POST'])
+def reportsummary():
+    data = request.get_json()
+    selected_date = data.get('date')
+    selected_header = data.get('header')
+
+    print(f"Received date: {selected_date}, header: {selected_header}")
+
+    temp_dir = tempfile.mkdtemp()
+    conn = None
+    cursor = None
+
+    try:
+        conn = pymssql.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+
+        query = """
+        SELECT ProductName, ImagePath, Kt, Price, TotalDiaWt
+        FROM IBM_Algo_Webstudy_Products
+        WHERE CONVERT(date, CurrentDate) = %s AND Header = %s
+        """
+        cursor.execute(query, (selected_date, selected_header))
+        records = cursor.fetchall()
+
+        if not records:
+            print("No records found.")
+            return jsonify({"message": "No records found for the given date and header."}), 404
+
+        # Excel setup
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Visual Product Summery Report"
+
+        # Set column widths
+        for i in range(1, 10):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = 25
+
+        # Define styles
+        bold_font = Font(bold=True)
+        center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        left_align = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        thin_border = Border(
+            left=Side(style='thin'), right=Side(style='thin'),
+            top=Side(style='thin'), bottom=Side(style='thin')
+        )
+
+        products_per_row = 2
+        product_height = 8  # 1 image + 6 details + 1 spacing
+
+        for idx, (product_name, image_path, kt, price, total_dia_wt) in enumerate(records):
+            try:
+                row_offset = (idx // products_per_row) * product_height + 1
+                position_in_row = idx % products_per_row
+                col = (position_in_row * 2) + 1
+                col_val = col + 1
+                col_letter = openpyxl.utils.get_column_letter(col)
+
+                product_name = safe_str(product_name)
+                kt = safe_str(kt)
+                total_dia_wt = safe_str(total_dia_wt)
+                sale_price_value, price_value, currency = clean_price(price)
+                sale_price_str = format_currency(sale_price_value, currency)
+                price_str = format_currency(price_value, currency)
+
+                # Add Image
+                if image_path and os.path.exists(image_path):
+                    try:
+                        temp_img_path = os.path.join(temp_dir, f"img_{idx}.jpg")
+                        with Image.open(image_path) as img:
+                            img = img.convert("RGB")  # <-- This line is essential
+                            img.thumbnail((130, 130))
+                            img.save(temp_img_path, format="JPEG")  # Save as JPEG explicitly
+                            
+                        img_for_excel = XLImage(temp_img_path)
+                        img_for_excel.anchor = f'{col_letter}{row_offset}'
+                        ws.add_image(img_for_excel)
+                        ws.row_dimensions[row_offset].height = 110
+                        ws.merge_cells(start_row=row_offset, start_column=col,
+                                       end_row=row_offset, end_column=col_val)
+                    except Exception as img_err:
+                        print(f"Image error for product '{product_name}': {img_err}")
+                        ws.cell(row=row_offset, column=col, value="Image error")
+                        ws.merge_cells(start_row=row_offset, start_column=col,
+                                       end_row=row_offset, end_column=col_val)
+                else:
+                    ws.cell(row=row_offset, column=col, value="No image")
+                    ws.merge_cells(start_row=row_offset, start_column=col,
+                                   end_row=row_offset, end_column=col_val)
+
+                # Product Details
+                labels = ["Product Name", "Kt", "Sale Price", "Price", "Total Dia wt", "Gold wt"]
+                values = [
+                    product_name,
+                    kt,
+                    sale_price_str,
+                    price_str,
+                    total_dia_wt,
+                    ""
+                ]
+                for i, (label, val) in enumerate(zip(labels, values), start=1):
+                    label_cell = ws.cell(row=row_offset + i, column=col, value=label)
+                    val_cell = ws.cell(row=row_offset + i, column=col_val, value=val)
+
+                    label_cell.font = bold_font
+                    label_cell.alignment = left_align
+                    label_cell.border = thin_border
+
+                    val_cell.alignment = left_align
+                    val_cell.border = thin_border
+
+            except Exception as row_err:
+                print(f"Error processing record {idx + 1}: {row_err}")
+                ws.cell(row=row_offset + 1, column=col, value="ERROR")
+
+        # Save workbook to memory
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+
+        return send_file(
+            output,
+            as_attachment=True,
+            download_name=f"report_{selected_date}.xlsx",
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    except Exception as e:
+        print(f"Error generating report: {e}")
+        return jsonify({"error": f"Failed to generate report: {str(e)}"}), 500
+
+   
+#############################################################################################################
+@app.route("/summery")
+def summery():
+    
+    return render_template("summery.html")
+
+@app.route("/api/category-summary")
+def category_summary():
+    try:
+        with pymssql.connect(**DB_CONFIG) as conn:
+            with conn.cursor(as_dict=True) as cursor:
+                # Step 1: Get distinct portals from the Header field
+                cursor.execute("""
+                    SELECT DISTINCT
+                        CASE
+                            WHEN CHARINDEX('–', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, CHARINDEX('–', Header) + 1, LEN(Header))))
+                            WHEN CHARINDEX('|', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, CHARINDEX('|', Header) + 1, LEN(Header))))
+                            WHEN CHARINDEX(' I ', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, CHARINDEX(' I ', Header) + 3, LEN(Header))))
+                            WHEN CHARINDEX(' / ', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, CHARINDEX(' / ', Header) + 3, LEN(Header))))
+                            ELSE ''
+                        END AS Portal
+                    FROM IBM_Algo_Webstudy_Products
+                """)
+                
+                portals = [row['Portal'] for row in cursor.fetchall() if row['Portal']]
+
+                if not portals:
+                    return jsonify({"success": True, "data": []})
+
+                # Step 2: Construct dynamic SQL components
+                columns = ', '.join(f"[{portal}]" for portal in portals)
+                columns_with_isnull = ', '.join(f"ISNULL([{portal}], 0) AS [{portal}]" for portal in portals)
+                columns_for_total = ' + '.join(f"ISNULL([{portal}], 0)" for portal in portals)
+
+                # Step 3: Construct the final dynamic SQL
+                dynamic_query = f"""
+                    WITH Extracted AS (
+                        SELECT
+                            CASE
+                                WHEN CHARINDEX('–', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, CHARINDEX('–', Header) + 1, LEN(Header))))
+                                WHEN CHARINDEX('|', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, CHARINDEX('|', Header) + 1, LEN(Header))))
+                                WHEN CHARINDEX(' I ', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, CHARINDEX(' I ', Header) + 3, LEN(Header))))
+                                WHEN CHARINDEX(' / ', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, CHARINDEX(' / ', Header) + 3, LEN(Header))))
+                                ELSE ''
+                            END AS Portal,
+                            CASE
+                                WHEN CHARINDEX('–', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, 1, CHARINDEX('–', Header) - 1)))
+                                WHEN CHARINDEX('|', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, 1, CHARINDEX('|', Header) - 1)))
+                                WHEN CHARINDEX(' I ', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, 1, CHARINDEX(' I ', Header) - 1)))
+                                WHEN CHARINDEX(' / ', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, 1, CHARINDEX(' / ', Header) - 1)))
+                                ELSE ''
+                            END AS Category
+                        FROM IBM_Algo_Webstudy_Products
+                    ),
+                    Counts AS (
+                        SELECT Category, Portal, COUNT(*) AS Total
+                        FROM Extracted
+                        WHERE Portal <> ''
+                        GROUP BY Category, Portal
+                    ),
+                    Pivoted AS (
+                        SELECT Category, {columns}
+                        FROM Counts
+                        PIVOT (
+                            SUM(Total) FOR Portal IN ({columns})
+                        ) AS p
+                    )
+                    SELECT 
+                        Category,
+                        {columns_for_total} AS TOTAL,
+                        {columns_with_isnull}
+                    FROM Pivoted
+                    ORDER BY Category;
+                """
+
+                # Step 4: Execute the final query
+                cursor.execute(dynamic_query)
+                rows = cursor.fetchall()
+
+                return jsonify({"success": True, "data": rows})
+
+    except pymssql.Error as e:
+        return jsonify({"success": False, "error": str(e)})
+
+
+    
+#-----------------------------------------------------------------------------------------------------#    
+
+    
+@app.route("/api/diawt-summary")
+def diawt_summary():
+    try:
+        with pymssql.connect(**DB_CONFIG) as conn:
+            with conn.cursor(as_dict=True) as cursor:
+
+                # Step 1: Get distinct portals
+                cursor.execute("""
+                    SELECT DISTINCT
+                        CASE
+                            WHEN CHARINDEX('–', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, CHARINDEX('–', Header) + 1, LEN(Header))))
+                            WHEN CHARINDEX('|', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, CHARINDEX('|', Header) + 1, LEN(Header))))
+                            WHEN CHARINDEX(' I ', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, CHARINDEX(' I ', Header) + 3, LEN(Header))))
+                            WHEN CHARINDEX(' / ', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, CHARINDEX(' / ', Header) + 3, LEN(Header))))
+                            ELSE NULL
+                        END AS portal
+                    FROM IBM_Algo_Webstudy_Products
+                    WHERE Header IS NOT NULL AND Header <> ''
+                """)
+                portals = sorted({row['portal'] for row in cursor if row['portal']})
+
+                if not portals:
+                    return jsonify({"success": False, "error": "No portal headers found."})
+
+                cols = ','.join(f"[{p}]" for p in portals)
+                cols_isnull_sum = ' + '.join(f"ISNULL([{p}], 0)" for p in portals)
+                cols_isnull_select = ', '.join(f"ISNULL([{p}], 0) AS [{p}]" for p in portals)
+
+                # Step 2: Run the dynamic pivot query
+                dynamic_sql = f"""
+                    WITH Cleaned AS (
+                        SELECT
+                            CASE
+                                WHEN CHARINDEX('–', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, CHARINDEX('–', Header) + 1, LEN(Header))))
+                                WHEN CHARINDEX('|', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, CHARINDEX('|', Header) + 1, LEN(Header))))
+                                WHEN CHARINDEX(' I ', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, CHARINDEX(' I ', Header) + 3, LEN(Header))))
+                                WHEN CHARINDEX(' / ', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, CHARINDEX(' / ', Header) + 3, LEN(Header))))
+                                ELSE NULL
+                            END AS portal,
+                            TRY_CAST(NULLIF(REPLACE(REPLACE(REPLACE(TotalDiaWt, 'ct', ''), 'tw', ''), ' ', ''), '') AS FLOAT) AS DiaWt
+                        FROM IBM_Algo_Webstudy_Products
+                    ),
+                    Binned AS (
+                        SELECT
+                            portal,
+                            CASE
+                                WHEN DiaWt IS NOT NULL AND DiaWt < 0.10 THEN 'Below 0.10ct'
+                                WHEN DiaWt >= 0.10 AND DiaWt < 0.25 THEN '0.10ct - 0.24ct'
+                                WHEN DiaWt >= 0.25 AND DiaWt < 0.50 THEN '0.25ct - 0.49ct'
+                                WHEN DiaWt >= 0.50 AND DiaWt < 0.75 THEN '0.50ct - 0.74ct'
+                                WHEN DiaWt >= 0.75 AND DiaWt < 1.00 THEN '0.75ct - 0.99ct'
+                                WHEN DiaWt >= 1.00 AND DiaWt < 1.50 THEN '1.00ct - 1.49ct'
+                                WHEN DiaWt >= 1.50 AND DiaWt <= 2.00 THEN '1.50ct - 2.00ct'
+                                WHEN DiaWt > 2.00 THEN 'Above 2.00ct'
+                                ELSE 'TOTAL'
+                            END AS WeightRange
+                        FROM Cleaned
+                        WHERE portal IS NOT NULL
+                    ),
+                    Counts AS (
+                        SELECT WeightRange, portal, COUNT(*) AS cnt
+                        FROM Binned
+                        GROUP BY WeightRange, portal
+                    ),
+                    Pivoted AS (
+                        SELECT
+                            WeightRange,
+                            {cols},
+                            {cols_isnull_sum} AS TOTAL
+                        FROM Counts
+                        PIVOT (
+                            SUM(cnt) FOR portal IN ({cols})
+                        ) AS P
+                    )
+                    SELECT
+                        WeightRange AS [DIA WTS],
+                        {cols_isnull_select},
+                        ISNULL(TOTAL, 0) AS TOTAL
+                    FROM Pivoted
+                    ORDER BY
+                        CASE WeightRange
+                            WHEN 'Below 0.10ct' THEN 1
+                            WHEN '0.10ct - 0.24ct' THEN 2
+                            WHEN '0.25ct - 0.49ct' THEN 3
+                            WHEN '0.50ct - 0.74ct' THEN 4
+                            WHEN '0.75ct - 0.99ct' THEN 5
+                            WHEN '1.00ct - 1.49ct' THEN 6
+                            WHEN '1.50ct - 2.00ct' THEN 7
+                            WHEN 'Above 2.00ct' THEN 8
+                            ELSE 9
+                        END
+                """
+
+                cursor.execute(dynamic_sql)
+                rows = cursor.fetchall()
+                return jsonify({"success": True, "data": rows})
+
+    except pymssql.Error as e:
+        return jsonify({"success": False, "error": str(e)})
+
+
+
+#-----------------------------------------------------------------------------------------------------#
+@app.route("/api/combined-summary")
+def combined_summary():
+    try:
+        with pymssql.connect(**DB_CONFIG) as conn:
+            with conn.cursor(as_dict=True) as cursor:
+                # Step 1: Build the dynamic parts (column names)
+                cursor.execute("""SELECT
+                    Category,
+                    SUM(CASE WHEN DiaWt IS NOT NULL AND DiaWt < 0.10 THEN 1 ELSE 0 END) AS [Below 0.10ct],
+                    SUM(CASE WHEN DiaWt >= 0.10 AND DiaWt < 0.25 THEN 1 ELSE 0 END) AS [0.10ct - 0.24ct],
+                    SUM(CASE WHEN DiaWt >= 0.25 AND DiaWt < 0.50 THEN 1 ELSE 0 END) AS [0.25ct - 0.49ct],
+                    SUM(CASE WHEN DiaWt >= 0.50 AND DiaWt < 0.75 THEN 1 ELSE 0 END) AS [0.50ct - 0.74ct],
+                    SUM(CASE WHEN DiaWt >= 0.75 AND DiaWt < 1.00 THEN 1 ELSE 0 END) AS [0.75ct - 0.99ct],
+                    SUM(CASE WHEN DiaWt >= 1.00 AND DiaWt < 1.50 THEN 1 ELSE 0 END) AS [1.00ct - 1.49ct],
+                    SUM(CASE WHEN DiaWt >= 1.50 AND DiaWt <= 2.00 THEN 1 ELSE 0 END) AS [1.50ct - 2.00ct],
+                    SUM(CASE WHEN DiaWt > 2.00 THEN 1 ELSE 0 END) AS [Above 2.00ct],
+                    COUNT(*) AS Total
+                FROM (
+                    SELECT
+                        CASE
+                            WHEN CHARINDEX('–', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, 1, CHARINDEX('–', Header) - 1)))
+                            WHEN CHARINDEX('|', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, 1, CHARINDEX('|', Header) - 1)))
+                            WHEN CHARINDEX(' I ', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, 1, CHARINDEX(' I ', Header) - 1)))
+                            WHEN CHARINDEX(' / ', Header) > 0 THEN LTRIM(RTRIM(SUBSTRING(Header, 1, CHARINDEX(' / ', Header) - 1)))
+                            ELSE Header
+                        END AS Category,
+
+                        TRY_CAST(
+                            REPLACE(
+                                REPLACE(
+                                    REPLACE(TotalDiaWt, 'ct', ''), 
+                                    'tw', ''
+                                ),
+                                ' ', ''
+                            ) AS FLOAT
+                        ) AS DiaWt
+
+                    FROM IBM_Algo_Webstudy_Products
+                ) AS Converted
+                GROUP BY Category
+                ORDER BY Category;
+                """)
+
+                rows = cursor.fetchall()
+                
+                
+                return jsonify({"success": True, "data": rows})
+
+    except pymssql.Error as e:
+        return jsonify({"success": False, "error": str(e)})
+    
 #############################################################################################################
 if __name__ == '__main__':
     # app.run(debug=True)
-    app.run(host="0.0.0.0", port=8001)
+    app.run(host="0.0.0.0", port=5008)

@@ -194,9 +194,8 @@ async def handle_fernandojorge(url, max_pages=None):
     try:
         async with async_playwright() as p:
             # Browser setup
-            # browser, page = await get_browser_with_proxy_strategy(p, url, "div.grid")
-            product_wrapper = 'div.grid'
-            browser, page = await get_browser_with_proxy_strategy(p, url, product_wrapper)
+            product_wrapper = "div.grid"
+            browser, page = await get_browser_with_proxy_strategy(p, url,product_wrapper)
             await scroll_to_bottom(page)
             
             # Enhanced product data extraction with more fields
@@ -344,11 +343,20 @@ async def handle_fernandojorge(url, max_pages=None):
         wb.save(file_path)
     
     # Database operations
-    if all_records:
-        insert_into_db(all_records)
-    update_product_count(len(all_records))
+    if not all_records:
+        return None, None, None
 
+    # Save the workbook
+    wb.save(file_path)
+    log_event(f"Data saved to {file_path}")
+
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
+    insert_into_db(all_records)
+    update_product_count(len(all_records))
+
+    # Return necessary information
     return base64_encoded, filename, file_path

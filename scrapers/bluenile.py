@@ -101,7 +101,7 @@ async def safe_goto_and_wait(page, url,isbri_data, retries=2):
             if isbri_data:
                 await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
             else:
-                await page.goto(url, wait_until="networkidle", timeout=180000)
+                await page.goto(url, wait_until="domcontentloaded", timeout=180000)
 
             # Wait for the selector with a longer timeout
             product_cards = await page.wait_for_selector('.gallery-grid-container--vJWMdFUhYMhp1TP3jIfs', state="attached", timeout=60000) # 60 seconds
@@ -176,7 +176,7 @@ async def get_browser_with_proxy_strategy(p, url: str):
                     headless=True,
                     args=[
                         '--disable-blink-features=AutomationControlled',
-                        '--disable-web-security'
+                        '--disable-web-security',
                     ]
                 )
 
@@ -332,27 +332,20 @@ async def handle_bluenile(url, max_pages):
                         # Extract sale price and original price
                         sale_price_el = await product.query_selector('[data-qa="sale-price"]')
                         regular_price_el = await product.query_selector('[data-qa="price"]')
-                        discount_el = await product.query_selector('div[class^="discount--"]')
 
                         if sale_price_el and regular_price_el:
                             sale_price_text = await sale_price_el.inner_text()
                             regular_price_text = await regular_price_el.inner_text()
 
-                            # Convert prices to numbers
+                            # Convert prices to float
                             sale_price = float(sale_price_text.replace('$', '').replace(',', ''))
                             regular_price = float(regular_price_text.replace('$', '').replace(',', ''))
 
                             # Calculate discount amount
                             discount_amount = regular_price - sale_price
 
-                            # Check if discount percent is provided, else calculate
-                            if discount_el:
-                                discount_percent = await discount_el.inner_text()
-                            else:
-                                discount_percent = f"-{round((discount_amount / regular_price) * 100)}%"
-
-                            # Format price output
-                            price = f"${discount_amount:,.0f} off {discount_percent}    ${sale_price:,.0f}"
+                            # Format price string: "$1,065 off  $2,485"
+                            price = f"${discount_amount:,.0f} off  ${sale_price:,.0f}"
 
                         elif regular_price_el:
                             regular_price_text = await regular_price_el.inner_text()
@@ -361,6 +354,7 @@ async def handle_bluenile(url, max_pages):
                             price = "N/A"
                     except:
                         price = "N/A"
+
 
 
                     try:
@@ -396,10 +390,18 @@ async def handle_bluenile(url, max_pages):
                                 additional_info.append(f"{review_count} reviews")
                     except:
                         pass
+                    
+                    # Extract discount percentage
+                    try:
+                        discount_el = await product.query_selector('div[class^="discount--"]')
+                        if discount_el:
+                            discount_percent = await discount_el.inner_text()
+                            additional_info.append(f"{discount_percent} off")
+                    except:
+                        pass
 
                     # Final string
                     additional_info_str = " | ".join(additional_info)
-                        
 
                     gold_type_match = re.findall(r"(\d{1,2}ct\s*(?:Yellow|White|Rose)?\s*Gold|Platinum)", product_name, re.IGNORECASE)
                     kt = ", ".join(gold_type_match) if gold_type_match else "N/A"

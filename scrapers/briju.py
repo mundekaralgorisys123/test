@@ -175,7 +175,7 @@ async def get_browser_with_proxy_strategy(p, url: str):
                 logging.info("Attempting with oxylabs proxy (required by robots.txt)")
                 browser = await p.chromium.launch(
                     proxy=proxy_config,
-                    headless=False,
+                    headless=True,
                     args=[
                         '--disable-blink-features=AutomationControlled',
                         '--disable-web-security'
@@ -373,13 +373,14 @@ async def handle_briju(url, max_pages):
                             continue
 
 
-                    # Extract additional info
-                    additional_info = []
                     
-                    if product_name == "N/A" or image_url == "N/A":
+                    
+                    if product_name == "N/A" and image_url == "N/A":
                             print(f"Skipping product due to missing data: Name: {product_name}, Image: {image_url}")
                             continue
 
+                    # Extract additional info
+                    additional_info = []
 
                     # Check for discount label
                     try:

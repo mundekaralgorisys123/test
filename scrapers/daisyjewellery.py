@@ -122,9 +122,9 @@ async def safe_goto_and_wait(page, url, retries=3):
                 logging.error(f"Failed to navigate to {url} after {retries} attempts.")
                 raise
 
-            
-
-
+def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    separator = '?' if '?' in base_url else '?'
+    return f"{base_url}{separator}page={page_count}"   
 
 async def handle_daisyjewellery(url, max_pages):
     ip_address = get_public_ip()
@@ -151,7 +151,8 @@ async def handle_daisyjewellery(url, max_pages):
     success_count = 0
     prev_prod = 0
     while page_count <= max_pages:
-        current_url = f"{url}?page={page_count}"
+        # current_url = f"{url}?page={page_count}"
+        current_url = build_url_with_loadmore(url, page_count)
         logging.info(f"Processing page {page_count}: {current_url}")
         
         # Create a new browser instance for each page
@@ -159,7 +160,8 @@ async def handle_daisyjewellery(url, max_pages):
         page = None
         try:
             async with async_playwright() as p:
-                browser, page = await get_browser_with_proxy_strategy(p, current_url, ".product-items")
+                product_wrapper = ".product-items"
+                browser, page = await get_browser_with_proxy_strategy(p, current_url,product_wrapper)
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all products
@@ -190,43 +192,34 @@ async def handle_daisyjewellery(url, max_pages):
                     additional_info = []
                     
                     try:
-                        # Get product name and variant
-                        product_name = await (await product.query_selector("h3")).inner_text()
-                        variant_tag = await product.query_selector("p.ais-hit--variant span")
-                        variant_text = await variant_tag.inner_text() if variant_tag else None
-                        
-                        # Merge product name with variant if available
-                        if variant_text and variant_text != "N/A":
-                            product_name = f"{product_name}, {variant_text}"
-                            
+                        h3_tag = await product.query_selector("h3")
+                        if h3_tag:
+                            # Extract full text first
+                            full_text = (await h3_tag.inner_text()).strip()
+
+                            # Try extracting variant from nested span
+                            span_tag = await h3_tag.query_selector("span")
+                            variant = (await span_tag.inner_text()).strip() if span_tag else None
+
+                            if variant and variant in full_text:
+                                base_name = full_text.replace(variant, "").strip()
+                                product_name = f"{base_name}, {variant}"
+                            else:
+                                product_name = full_text
+                        else:
+                            product_name = "N/A"
                     except Exception as e:
                         print(f"Error fetching product name: {e}")
                         product_name = "N/A"
 
+
                     try:
-                        # Handle price information
-                        standard_price_tag = await product.query_selector("p.ais-hit--price b.standard-price")
-                        standard_price = await standard_price_tag.inner_text() if standard_price_tag else None
-                        
-                        discounted_price_tag = await product.query_selector("p.ais-hit--price b.full-price")
-                        discounted_price = await discounted_price_tag.inner_text() if discounted_price_tag else None
-                        
-                        if standard_price and discounted_price:
-                            price = f"{discounted_price}|{standard_price}"
-                        elif standard_price:
-                            price = standard_price
-                        else:
-                            price = "N/A"
-                            
-                        # Add discount info to additional info if available
-                        discount_percent_tag = await product.query_selector('span.ais-hit--price-discount')
-                        if discount_percent_tag:
-                            discount_text = await discount_percent_tag.inner_text()
-                            additional_info.append(f"Discount: {discount_text}")
-                            
+                        price_tag = await product.query_selector("span.price__amount strong.money")
+                        price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
                     except Exception as e:
                         print(f"Error fetching price: {e}")
                         price = "N/A"
+
                         
                     try:
                         # Get image URL
@@ -241,6 +234,8 @@ async def handle_daisyjewellery(url, max_pages):
                     if product_name == "N/A" or price == "N/A" or image_url == "N/A":
                         print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
                         continue
+                    
+                    
 
                     # Extract gold type
                     gold_type_match = re.findall(r"(\d{1,2}ct\s*(?:Yellow|White|Rose)?\s*Gold|Platinum)", product_name, re.IGNORECASE)

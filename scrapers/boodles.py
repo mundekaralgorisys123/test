@@ -12,8 +12,7 @@ from openpyxl import Workbook
 from openpyxl.drawing.image import Image
 from flask import Flask
 from PIL import Image as PILImage
-import requests
-import concurrent.futures
+from proxysetup import get_browser_with_proxy_strategy
 from utils import get_public_ip, log_event, sanitize_filename
 from dotenv import load_dotenv
 from database import insert_into_db
@@ -22,8 +21,7 @@ import aiohttp
 from io import BytesIO
 from openpyxl.drawing.image import Image as XLImage
 import httpx
-# Load environment variables from .env file
-from functools import partial
+
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
 
@@ -113,39 +111,6 @@ async def scroll_and_wait(page):
     new_height = await page.evaluate("document.body.scrollHeight")
     return new_height > previous_height  # Returns True if more content is loaded
 
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-
-
-            # Wait for the selector with a longer timeout
-            product_cards = await page.wait_for_selector("#product-grid", state="attached", timeout=30000)
-
-            # Optionally validate at least 1 is visible (Playwright already does this)
-            if product_cards:
-                print("[Success] Product cards loaded.")
-                return
-        except Error as e:
-            logging.error(f"Error navigating to {url} on attempt {attempt + 1}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
-        except TimeoutError as e:
-            logging.warning(f"TimeoutError on attempt {attempt + 1} navigating to {url}: {e}")
-            if attempt < retries - 1:
-                logging.info("Retrying after waiting a bit...")
-                random_delay(1, 3)  # Add a delay before retrying
-            else:
-                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-                raise
-
-            
-
 
 
 async def handle_boodles(url, max_pages):
@@ -181,12 +146,9 @@ async def handle_boodles(url, max_pages):
         page = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(120000)  # 2 minute timeout
                 
-                await safe_goto_and_wait(page, current_url)
+                product_wrapper="#product-grid"
+                browser, page = await get_browser_with_proxy_strategy(p, current_url ,product_wrapper)
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all products
@@ -302,13 +264,11 @@ async def handle_boodles(url, max_pages):
                         logging.error(f"Error extracting image URL: {e}")
                         image_url = "N/A"
                     
-                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
-                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
-                        continue
+                   
 
-                    if product_name == "N/A" or price_text == "N/A" or image_url == "N/A":
-                        logging.warning(f"Skipping product due to missing data: Name: {product_name}, Price: {price_text}, Image: {image_url}")
-                        continue
+                    # if product_name == "N/A" or price_text == "N/A" or image_url == "N/A":
+                    #     logging.warning(f"Skipping product due to missing data: Name: {product_name}, Price: {price_text}, Image: {image_url}")
+                    #     continue
                     
                     # Combine all additional info
                     additional_info_text = " | ".join(additional_info) if additional_info else "N/A"
@@ -366,13 +326,20 @@ async def handle_boodles(url, max_pages):
         page_count += 1
 
     # Final save and database operations
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
 
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

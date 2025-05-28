@@ -196,6 +196,9 @@ async def handle_davidyurman(url, max_pages):
                                 download_image(session, image_url, product_name, timestamp, image_folder, unique_id)
                             )
                             image_tasks.append((len(sheet['A']) + 1, unique_id, task))
+                            
+                            
+                            product_name = f"{product_name} {kt}"
 
                             records.append((unique_id, current_date, await page.title(), product_name, None, kt, price, diamond_weight,additional_info_str))
                             sheet.append([current_date, await page.title(), product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])

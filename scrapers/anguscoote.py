@@ -148,7 +148,7 @@ async def handle_anguscoote(url, max_pages):
                         try:
                             # Try to get both discounted and original prices
                             offer_elem = await product.query_selector("span.s-price__now")
-                            was_elem = await product.query_selector("span.s-price__was")
+                            was_elem = await product.query_selector("div.s-product__price")
 
                             offer_price = await offer_elem.inner_text() if offer_elem else ""
                             original_price = await was_elem.inner_text() if was_elem else ""

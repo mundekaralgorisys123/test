@@ -299,7 +299,7 @@ async def handle_grahams(url, max_pages):
                 total_products = len(all_products)
                 new_products = all_products[previous_count:]
                 logging.info(f"Page {load_more_clicks}: Total = {total_products}, New = {len(new_products)}")
-                previous_count += new_products
+                previous_count += len(new_products)
 
                 print(f"Page {load_more_clicks}: Scraping {len(new_products)} new products.")
                 page_title = await page.title()
@@ -336,10 +336,7 @@ async def handle_grahams(url, max_pages):
                         print(f"[Price] Error: {e}")
                         price = "N/A"
 
-                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
-                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
-                        continue
-
+                    
                     # Handle discount badges
                     try:
                         discount_badges = await product.query_selector_all(".badge.onsale")
@@ -406,6 +403,11 @@ async def handle_grahams(url, max_pages):
                         image_url = "N/A"
 
                     image_url = modify_image_url(image_url)
+                    
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue
+
 
                     # Extract Gold Type
                     gold_type_match = re.findall(r"(\d{1,2}ct\s*(?:Yellow|White|Rose)?\s*Gold|Platinum|Cubic Zirconia)", product_name, re.IGNORECASE)

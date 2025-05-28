@@ -87,37 +87,6 @@ def random_delay(min_sec=1, max_sec=3):
     time.sleep(random.uniform(min_sec, max_sec))
 
 
-# async def safe_goto_and_wait(page, url, retries=3):
-#     for attempt in range(retries):
-#         try:
-#             print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-#             await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-
-
-#             # Wait for the selector with a longer timeout
-#             product_cards = await page.wait_for_selector(".product-scroll-wrapper", state="attached", timeout=30000)
-
-#             # Optionally validate at least 1 is visible (Playwright already does this)
-#             if product_cards:
-#                 print("[Success] Product cards loaded.")
-#                 return
-#         except Error as e:
-#             logging.error(f"Error navigating to {url} on attempt {attempt + 1}: {e}")
-#             if attempt < retries - 1:
-#                 logging.info("Retrying after waiting a bit...")
-#                 random_delay(1, 3)  # Add a delay before retrying
-#             else:
-#                 logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-#                 raise
-#         except TimeoutError as e:
-#             logging.warning(f"TimeoutError on attempt {attempt + 1} navigating to {url}: {e}")
-#             if attempt < retries - 1:
-#                 logging.info("Retrying after waiting a bit...")
-#                 random_delay(1, 3)  # Add a delay before retrying
-#             else:
-#                 logging.error(f"Failed to navigate to {url} after {retries} attempts.")
-#                 raise
-
             
 ########################################  safe_goto_and_wait ####################################################################
 
@@ -130,10 +99,10 @@ async def safe_goto_and_wait(page, url,isbri_data, retries=2):
             if isbri_data:
                 await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
             else:
-                await page.goto(url, wait_until="networkidle", timeout=180_000)
+                await page.goto(url, wait_until="domcontentloaded", timeout=180_000)
 
             # Wait for the selector with a longer timeout
-            product_cards = await page.wait_for_selector(".current-filters-wrapper", state="attached", timeout=30000)
+            product_cards = await page.wait_for_selector(".list-group-horizontal", state="attached", timeout=30000)
 
             # Optionally validate at least 1 is visible (Playwright already does this)
             if product_cards:
@@ -503,14 +472,12 @@ async def handle_apart(url, max_pages):
                 page_count += 1
                 await asyncio.sleep(random.uniform(2, 5))
                 
-            except Exception as e:
-                logging.error(f"Error processing page {page_count}: {str(e)}")
-                if page:
-                    await page.close()
+            finally:
                 if browser:
-                    await browser.close()
-                wb.save(file_path)
-                continue
+                    try:
+                        await browser.close()
+                    except Exception as e:
+                        logging.warning(f"Error closing browser: {e}")
             
             # Add delay between pages
             await asyncio.sleep(random.uniform(2, 5))

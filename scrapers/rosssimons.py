@@ -108,14 +108,19 @@ def random_delay(min_sec=1, max_sec=3):
     """Introduce a random delay to mimic human-like behavior."""
     time.sleep(random.uniform(min_sec, max_sec))
 
+async def scroll_and_wait(page: Page, delay: float = 2.0) -> bool:
+    """
+    Scrolls down and waits to see if new content loads (based on page height change).
 
-async def scroll_and_wait(page: Page):
-    """Scroll down to load lazy-loaded products."""
-    previous_height = await page.evaluate("document.body.scrollHeight")
-    await page.evaluate("window.scrollBy(0, document.body.scrollHeight);")
-    await asyncio.sleep(2)  # Allow time for content to load
-    new_height = await page.evaluate("document.body.scrollHeight")
-    return new_height > previous_height  # Returns True if more content is loaded
+    Returns:
+        bool: True if new content was loaded (height increased), False otherwise.
+    """
+    previous_height = await page.evaluate("() => document.body.scrollHeight")
+    await page.evaluate("() => window.scrollBy(0, document.body.scrollHeight)")
+    await asyncio.sleep(delay)
+    new_height = await page.evaluate("() => document.body.scrollHeight")
+    return new_height > previous_height
+
 
 ########################################  safe_goto_and_wait ####################################################################
 
@@ -126,12 +131,12 @@ async def safe_goto_and_wait(page, url,isbri_data, retries=2):
             print(f"[Attempt {attempt + 1}] Navigating to: {url}")
             
             if isbri_data:
-                await page.goto(url, timeout=180_000, wait_until="load")
+                await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
             else:
-                await page.goto(url, wait_until="load", timeout=180_000)
+                await page.goto(url, wait_until="networkidle", timeout=180_000)
 
             # Wait for the selector with a longer timeout
-            product_cards = await page.wait_for_selector("div.row.product-grid", state="attached", timeout=60000)
+            product_cards = await page.wait_for_selector(".breadcrumb-wrapper, #maincontent, body", state="attached", timeout=30_000)
 
 
             # Optionally validate at least 1 is visible (Playwright already does this)
@@ -203,15 +208,24 @@ async def get_browser_with_proxy_strategy(p, url: str):
                     headless=True,
                     args=[
                         '--disable-blink-features=AutomationControlled',
-                        '--disable-web-security'
+                        '--disable-web-security',
+                        '--no-sandbox',
+                        '--disable-dev-shm-usage'
                     ]
                 )
 
-            context = await browser.new_context()
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800},
+                locale="en-US",
+            )
+
+            # Stealth: Hide navigator.webdriver
             await context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', {
                     get: () => undefined
-                })
+                });
             """)
             page = await context.new_page()
             
@@ -276,7 +290,6 @@ def check_url_against_rules(url: str, disallowed_patterns: List[str]) -> bool:
     return False
 
 
-
 async def handle_rosssimons(url, max_pages):
     """Scrape product data from Ross Simons website using fresh browser instances for each page."""
     ip_address = get_public_ip()
@@ -315,19 +328,19 @@ async def handle_rosssimons(url, max_pages):
                 browser, page = await get_browser_with_proxy_strategy(p, current_url)
                 log_event(f"Successfully loaded: {current_url}")
 
-                # Scroll to load lazy-loaded content
-                scroll_attempts = 0
-                max_scroll_attempts = 5
-                while scroll_attempts < max_scroll_attempts and await scroll_and_wait(page):
-                    scroll_attempts += 1
-                    await random_delay(1, 3)
+                # # Scroll to load lazy-loaded content
+                # scroll_attempts = 0
+                # max_scroll_attempts = 5
+                # while scroll_attempts < max_scroll_attempts and await scroll_and_wait(page):
+                #     scroll_attempts += 1
+                #     await random_delay(1, 3)
 
                 # Get page title
                 page_title = await page.title()
 
                 # Extract products
                 product_wrapper = await page.query_selector("div.row.product-grid")
-                products = await product_wrapper.query_selector_all("div.col-6.col-sm-3") if product_wrapper else []
+                products = await product_wrapper.query_selector_all("div.product-tile") if product_wrapper else []
                 logging.info(f"Found {len(products)} products on page {pages_processed}")
 
                 # Use httpx.AsyncClient for downloading images

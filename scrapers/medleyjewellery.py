@@ -385,13 +385,15 @@ async def handle_medleyjewellery(url, max_pages):
                         image_element = await product.query_selector("span.snize-thumbnail img")
                         image_url = await image_element.get_attribute("src") if image_element else "N/A"
 
-                        # Extract gold type from product name
-                        kt = "N/A"
-                        try:
-                            gold_type_match = re.findall(r"(\d{1,2}k\s*(?:Yellow|White|Rose)?\s*Gold|Platinum)", product_name, re.IGNORECASE)
-                            kt = ", ".join(gold_type_match) if gold_type_match else "N/A"
-                        except re.error as regex_error:
-                            logging.error(f"Regex error extracting gold type for product {row_num}: {str(regex_error)}")
+                       
+                        # Extract metal type
+                        metal_element = await product.query_selector("span.snize-custom-swatch-title")
+                        kt = await metal_element.inner_text() if metal_element else "N/A"
+                        
+                        
+                        
+                        
+                        
 
                         # Extract Diamond Weight
                         diamond_weight = "N/A"
@@ -438,6 +440,8 @@ async def handle_medleyjewellery(url, max_pages):
                         image_tasks.append((row_num, unique_id, asyncio.create_task(
                             download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                         )))
+                        
+                        product_name = f"{product_name} {kt}"
 
                         records.append((
                             unique_id, current_date, page_title, product_name, None, 

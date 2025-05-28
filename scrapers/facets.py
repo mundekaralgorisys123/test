@@ -162,9 +162,11 @@ async def handle_facets(url, max_pages=None):
                     # Description is same as product name in this case
                     description = product_name
 
+
                     image_url = "N/A"
                     try:
                         # Select the first product image element
+                        await product.scroll_into_view_if_needed()
                         img_tag = await product.query_selector(".product-slide .grid-product__image")
 
                         if img_tag:
@@ -247,8 +249,13 @@ async def handle_facets(url, max_pages=None):
             if page: await page.close()
             if browser: await browser.close()
 
+    if not all_records:
+        return None, None, None
+
+    # Final save and database operations
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
+
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 

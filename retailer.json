@@ -879,11 +879,579 @@
       "available": "available for scrapping"
     },
     {
-      "id": "zamels",
-      "name": "zamels",
-      "url": "https://www.zamels.com.au/",
-      "region": "AU",
+      "id": "helzberg",
+      "name": "helzberg",
+      "url": "https://www.helzberg.com/",
+      "region": "US",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "fredmeyerjewelers",
+      "name": "fredmeyerjewelers",
+      "url": "https://www.fredmeyerjewelers.com/",
+      "region": "US",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "jcpenney",
+      "name": "jcpenney",
+      "url": "https://www.jcpenney.com/",
+      "region": "US",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "macys",
+      "name": "macys",
+      "url": "https://www.macys.com/",
+      "region": "US",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "reeds",
+      "name": "reeds",
+      "url": "https://www.reeds.com/",
+      "region": "US",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "walmart",
+      "name": "walmart",
+      "url": "https://www.walmart.com/",
+      "region": "US",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "benbridge",
+      "name": "benbridge",
+      "url": "https://www.benbridge.com/",
+      "region": "US",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "finks",
+      "name": "finks",
+      "url": "https://www.finks.com/",
+      "region": "US",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "smilingrocks",
+      "name": "smilingrocks",
+      "url": "https://smilingrocks.com/",
+      "region": "US",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "jcojewellery",
+      "name": "jcojewellery",
+      "url": "https://www.jcojewellery.com/",
+      "region": "US",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "77diamonds",
+      "name": "77diamonds",
+      "url": "https://www.77diamonds.com/",
+      "region": "US",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "hannoush",
+      "name": "hannoush",
+      "url": "https://www.hannoush.com/",
+      "region": "US",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "anitako",
+      "name": "anitako",
+      "url": "https://www.anitako.com/",
+      "region": "US",
+      "type": "designer",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "johnhardy",
+      "name": "johnhardy",
+      "url": "https://johnhardy.com/",
+      "region": "US",
+      "type": "designer",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "jacobandco",
+      "name": "jacobandco",
+      "url": "https://jacobandco.shop/",
+      "region": "US",
+      "type": "designer",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "jennifermeyer",
+      "name": "jennifermeyer",
+      "url": "https://jennifermeyer.com/",
+      "region": "US",
+      "type": "designer",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "jacquieaiche",
+      "name": "jacquieaiche",
+      "url": "https://jacquieaiche.com/",
+      "region": "US",
+      "type": "designer",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "tacori",
+      "name": "tacori",
+      "url": "https://www.tacori.com/",
+      "region": "US",
       "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "davidyurman",
+      "name": "davidyurman",
+      "url": "https://www.davidyurman.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "chopard",
+      "name": "chopard",
+      "url": "https://www.chopard.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "vancleefarpels",
+      "name": "vancleefarpels",
+      "url": "https://www.vancleefarpels.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "chanel",
+      "name": "chanel",
+      "url": "https://www.chanel.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "buccellati",
+      "name": "buccellati",
+      "url": "https://www.buccellati.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "graff",
+      "name": "graff",
+      "url": "https://www.graff.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "mejuri",
+      "name": "mejuri",
+      "url": "https://mejuri.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "boucheron",
+      "name": "boucheron",
+      "url": "https://www.boucheron.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "chaumet",
+      "name": "chaumet",
+      "url": "https://www.chaumet.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "brilliantearth",
+      "name": "brilliantearth",
+      "url": "https://www.brilliantearth.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "bulgari",
+      "name": "bulgari",
+      "url": "https://www.bulgari.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "cartier",
+      "name": "cartier",
+      "url": "https://www.cartier.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "harrods",
+      "name": "harrods",
+      "url": "https://www.harrods.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "piaget",
+      "name": "piaget",
+      "url": "https://www.piaget.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "forevermark",
+      "name": "forevermark",
+      "url": "https://www.forevermark.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "boochier",
+      "name": "boochier",
+      "url": "https://boochier.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "birks",
+      "name": "birks",
+      "url": "https://www.birks.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "64facets",
+      "name": "64facets",
+      "url": "https://64facets.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "eastwestgemco",
+      "name": "eastwestgemco",
+      "url": "https://eastwestgemco.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "louisvuitton",
+      "name": "louisvuitton",
+      "url": "https://in.louisvuitton.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "ringconcierge",
+      "name": "ringconcierge",
+      "url": "https://ringconcierge.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "ajaffe",
+      "name": "ajaffe",
+      "url": "https://ajaffe.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "marcobicego",
+      "name": "marcobicego",
+      "url": "https://marcobicego.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "stephaniegottlieb",
+      "name": "stephaniegottlieb",
+      "url": "https://stephaniegottlieb.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "vrai",
+      "name": "vrai",
+      "url": "https://www.vrai.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "jadetrau",
+      "name": "jadetrau",
+      "url": "https://jadetrau.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "heartsonfire",
+      "name": "heartsonfire",
+      "url": "https://www.heartsonfire.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "ferkosfinejewelry",
+      "name": "ferkosfinejewelry",
+      "url": "https://ferkosfinejewelry.com/",
+      "region": "US",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "fraserhart",
+      "name": "fraserhart",
+      "url": "https://www.fraserhart.co.uk/",
+      "region": "UK",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "fields",
+      "name": "fields",
+      "url": "https://www.fields.ie/",
+      "region": "UK",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "warrenjames",
+      "name": "warrenjames",
+      "url": "https://www.warrenjames.co.uk/",
+      "region": "UK",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "goldsmiths",
+      "name": "goldsmiths",
+      "url": "https://www.goldsmiths.co.uk/",
+      "region": "UK",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "beaverbrooks",
+      "name": "beaverbrooks",
+      "url": "https://www.beaverbrooks.co.uk/",
+      "region": "UK",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "diamondsfactory",
+      "name": "diamondsfactory",
+      "url": "https://www.diamondsfactory.co.uk/",
+      "region": "UK",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "londonjewelers",
+      "name": "londonjewelers",
+      "url": "https://www.londonjewelers.com/",
+      "region": "UK",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "davidmarshalllondon",
+      "name": "davidmarshalllondon",
+      "url": "https://www.davidmarshalllondon.com/",
+      "region": "UK",
+      "type": "designer",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "monicavinader",
+      "name": "monicavinader",
+      "url": "https://www.monicavinader.com/",
+      "region": "UK",
+      "type": "designer",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "boodles",
+      "name": "boodles",
+      "url": "https://www.boodles.com/",
+      "region": "UK",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "pandora",
+      "name": "pandora",
+      "url": "https://us.pandora.net/",
+      "region": "UK",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "daisyjewellery",
+      "name": "daisyjewellery",
+      "url": "https://www.daisyjewellery.com/",
+      "region": "UK",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "missoma",
+      "name": "missoma",
+      "url": "https://www.missoma.com/",
+      "region": "UK",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "maria",
+      "name": "maria",
+      "url": "https://www.maria-black.com/",
+      "region": "UK",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "astleyclarke",
+      "name": "astleyclarke",
+      "url": "https://www.astleyclarke.com/",
+      "region": "UK",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "edgeofember",
+      "name": "edgeofember",
+      "url": "https://edgeofember.com/",
+      "region": "UK",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "mateonewyork",
+      "name": "mateonewyork",
+      "url": "https://mateonewyork.com/",
+      "region": "UK",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "bybonniejewelry",
+      "name": "bybonniejewelry",
+      "url": "https://bybonniejewelry.com/",
+      "region": "UK",
+      "type": "brand",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "michaelhill",
+      "name": "michaelhill",
+      "url": "https://www.michaelhill.com.au/",
+      "region": "AU",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "prouds",
+      "name": "prouds",
+      "url": "https://www.prouds.com.au/",
+      "region": "AU",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "goldmark",
+      "name": "goldmark",
+      "url": "https://www.goldmark.com.au/",
+      "region": "AU",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "shiels",
+      "name": "shiels",
+      "url": "https://www.shiels.com.au/",
+      "region": "AU",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "wallacebishop",
+      "name": "wallacebishop",
+      "url": "https://www.wallacebishop.com.au/",
+      "region": "AU",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "thediamondstore",
+      "name": "thediamondstore",
+      "url": "https://www.thediamondstore.co.uk/",
+      "region": "UK",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "ross",
+      "name": "ross",
+      "url": "https://www.ross-simons.com/",
+      "region": "UK",
+      "type": "retail",
+      "available": "available for scrapping"
+    },
+    {
+      "id": "mazzucchellis",
+      "name": "mazzucchellis",
+      "url": "https://mazzucchellis.com.au/",
+      "region": "AU",
+      "type": "retail",
       "available": "available for scrapping"
     }
   ]

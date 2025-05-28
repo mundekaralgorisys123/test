@@ -107,11 +107,17 @@ def random_delay(min_sec=1, max_sec=3):
     time.sleep(random.uniform(min_sec, max_sec))
 
 
-
-
 def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    # If page_count is 1, return the base URL without appending page param
+    if page_count == 1:
+        return re.sub(r'([&?])page=\d+', '', base_url).rstrip('?&')
+    
+    # Remove existing page param if present
+    base_url = re.sub(r'([&?])page=\d+', '', base_url).rstrip('?&')
+    
+    # Add the new page parameter
     separator = '&' if '?' in base_url else '?'
-    return f"{base_url}{separator}page={page_count}"              
+    return f"{base_url}{separator}page={page_count}"           
 
 async def handle_mejuri(url, max_pages):
     ip_address = get_public_ip()
@@ -175,15 +181,15 @@ async def handle_mejuri(url, max_pages):
 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
                     try:
-                        # Extract the product name
                         name_tag = await product.query_selector('a[data-testid="internal-link"]')
                         if name_tag:
-                            product_name = await name_tag.inner_text()
+                            product_name = (await name_tag.inner_text()).strip()
                         else:
                             product_name = "N/A"
                     except Exception as e:
                         print(f"Error fetching product name: {e}")
                         product_name = "N/A"
+
 
 
 
@@ -250,7 +256,9 @@ async def handle_mejuri(url, max_pages):
                     additional_info_str = " | ".join(additional_info)    
                     if product_name == "N/A" or price == "N/A" or image_url == "N/A":
                         print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
-                        continue    
+                        continue  
+                    
+                      
                     
 
 
@@ -261,7 +269,7 @@ async def handle_mejuri(url, max_pages):
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
-
+                    product_name = f"{product_name} {kt}"
                     records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
                     sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
 

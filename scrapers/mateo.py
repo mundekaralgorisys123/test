@@ -229,30 +229,19 @@ async def handle_mateo(url, max_pages=None):
                     except Exception:
                         product_name = "N/A"
 
+                    
                     # Handle prices - collect all price information
                     price_text = "N/A"
                     try:
                         # Get regular price
                         regular_price_tag = await product.query_selector(".price-item--regular")
-                        regular_price = (await regular_price_tag.inner_text()).strip() if regular_price_tag else None
-                        
-                        # Get sale price
-                        sale_price_tag = await product.query_selector(".price-item--sale")
-                        sale_price = (await sale_price_tag.inner_text()).strip() if sale_price_tag else None
-                        
-                        # Format price text
-                        if regular_price and sale_price:
-                            price_text = f"Regular: {regular_price} | Sale: {sale_price}"
-                        elif regular_price:
-                            price_text = f"Regular: {regular_price}"
-                        elif sale_price:
-                            price_text = f"Sale: {sale_price}"
-                            
-                        # Clean up price string
-                        price_text = re.sub(r'\s+', ' ', price_text).strip()
+                        if regular_price_tag:
+                            price_text = (await regular_price_tag.inner_text()).strip()
                     except Exception as e:
-                        logging.warning(f"Error getting prices: {str(e)}")
+                        logging.warning(f"Error getting regular price: {str(e)}")
                         price_text = "N/A"
+
+
 
                     # Get additional product information
                     try:
@@ -351,8 +340,13 @@ async def handle_mateo(url, max_pages=None):
             if page: await page.close()
             if browser: await browser.close()
 
+    if not all_records:
+        return None, None, None
+
+    # Final save and database operations
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
+
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 

@@ -7,7 +7,6 @@ import base64
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image
-from flask import Flask
 from dotenv import load_dotenv
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
@@ -111,29 +110,55 @@ async def handle_warrenjames(url, max_pages):
                         product_name = "N/A"
 
                     try:
-                        # Current price (discounted)
-                        price_tag = await product.query_selector('span.price_copy_large.text_copy_bold')
-                        price = await price_tag.inner_text() if price_tag else None
+                        price = None
+                        was_price = None
+                        rrp = None
+                        discount = None
 
-                        # Discount info
+                        # Extract all price spans excluding "SALE"
+                        price_tags = await product.query_selector_all('span.price_copy_large.text_copy_bold')
+                        for tag in price_tags:
+                            text = (await tag.inner_text()).strip()
+                            if "SALE" not in text.upper():
+                                price = text
+                                break
+
+                        # Extract WAS price from strikethrough <s>
+                        was_tag = await product.query_selector('span.price_copy_small.text_copy_medium s')
+                        was_price = (await was_tag.inner_text()).strip() if was_tag else None
+
+                        # Extract RRP from relevant spans
+                        rrp_tags = await product.query_selector_all('span.price_copy_small.text_copy_medium, span.price_copy_medium.text_copy_medium')
+                        for tag in rrp_tags:
+                            text = (await tag.inner_text()).strip()
+                            if "RRP" in text.upper():
+                                rrp = text
+                                break
+
+                        # Extract discount (SAVE %) if present
                         discount_tag = await product.query_selector('span.text-gold')
-                        discount = await discount_tag.inner_text() if discount_tag else None
+                        discount = (await discount_tag.inner_text()).strip() if discount_tag else None
 
-                        # RRP price (original price)
-                        rrp_tag = await product.query_selector('span.price_copy_medium:not(.text-gold)')
-                        rrp = await rrp_tag.inner_text() if rrp_tag else None
-
-                        # Format output
-                        if price and discount and rrp:
+                        # Format the output
+                        if price and was_price and rrp:
+                            price = f"{price} (WAS £{was_price}) {rrp}"
+                        elif price and discount and rrp:
                             price = f"{price} ({discount}) {rrp}"
+                        elif price and rrp:
+                            price = f"{price} {rrp}"
                         elif rrp:
                             price = rrp
+                        elif price:
+                            price = price
                         else:
                             price = "N/A"
 
                     except Exception as e:
                         print(f"Error fetching price info: {e}")
                         price = "N/A"
+
+                        
+                    # print(price)    
 
 
                     try:
@@ -232,16 +257,3 @@ async def handle_warrenjames(url, max_pages):
         return base64_encoded, filename, file_path
         
         
-        
-
-        # if records:
-        #     insert_into_db(records)
-        # else:
-        #     logging.info("No data to insert into the database.")
-
-        # update_product_count(len(records))
-
-        # with open(file_path, "rb") as f:
-        #     base64_encoded = base64.b64encode(f.read()).decode("utf-8")
-
-        # return base64_encoded, filename, file_path

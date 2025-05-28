@@ -20,7 +20,7 @@ from database import insert_into_db
 from limit_checker import update_product_count
 from proxysetup import get_browser_with_proxy_strategy
 import re
-
+from urllib.parse import urljoin
 # Load environment
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
@@ -98,7 +98,14 @@ async def safe_goto_and_wait(page, url, retries=3):
                 raise
 
 # Main scraper function
-async def handle_boochier(url, max_pages=None):
+
+
+def build_url_with_loadmore(base_url: str, load_more_clicks: int) -> str:
+    separator = '&' if '?' in base_url else '?'
+    return f"{base_url}{separator}page={load_more_clicks}"   
+
+
+async def handle_boochier(url, max_pages):
     ip_address = get_public_ip()
     logging.info(f"Scraping started for: {url} from IP: {ip_address}")
 
@@ -119,16 +126,17 @@ async def handle_boochier(url, max_pages=None):
     prev_prod_cout = 0
     load_more_clicks = 1
     while load_more_clicks <= max_pages:
+        current_url = build_url_with_loadmore(url, load_more_clicks)
         browser = None
         page = None
         try:
             async with async_playwright() as p:
                 product_wrapper = '.col-lg-12'
-                browser, page = await get_browser_with_proxy_strategy(p, url, product_wrapper)
-                log_event(f"Successfully loaded: {url}")
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, product_wrapper)
+                log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all items
-                await scroll_to_bottom(page)
+                # await scroll_to_bottom(page)
                 
                 page_title = await page.title()
                 current_date = datetime.now().strftime("%Y-%m-%d")
@@ -159,13 +167,26 @@ async def handle_boochier(url, max_pages=None):
                         product_name = "N/A"
 
                     try:
-                        # Extract price - from the price element
-                        price_tag = await product.query_selector(".price")
-                        price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
-                        # Clean up price string
-                        price = re.sub(r'\s+', ' ', price).strip()
+                        # 1️⃣ Grab the raw text
+                        price_tag = await product.query_selector("span.price")
+                        raw = (await price_tag.inner_text()).strip() if price_tag else ""
+
+                        # 2️⃣ Normalize whitespace
+                        raw = re.sub(r'\s+', ' ', raw)
+
+                        # 3️⃣ Extract currency and number, preserving decimals
+                        m = re.search(r'(Rs\.?)\s*([\d,]+(?:\.\d+)?)', raw, re.IGNORECASE)
+                        if m:
+                            currency = m.group(1)
+                            number   = m.group(2).replace(",", "")   # remove thousands‐sep commas
+                            price     = f"{currency} {number}"
+                        else:
+                            # Fallback to raw if it doesn’t match
+                            price = raw or "N/A"
+
                     except Exception:
                         price = "N/A"
+                        
 
                     try:
                         # Extract description - from the rte > p element (hidden in this HTML)
@@ -173,65 +194,71 @@ async def handle_boochier(url, max_pages=None):
                         description = (await desc_tag.inner_text()).strip() if desc_tag else product_name
                     except Exception:
                         description = product_name
-
+                        
+                     
+                    
                     image_url = "N/A"
+
                     try:
                         await product.scroll_into_view_if_needed()
+                        await page.wait_for_timeout(1000)  # Ensure lazy loading happens
 
-                        # Locate the image container with the background images
                         img_container = await product.query_selector(".pr_lazy_img")
-                        if img_container:
-                            bgset = await img_container.get_attribute("data-bgset")
-                            image_options = []
+                        image_options = []
 
-                            if bgset:
-                                for img_info in bgset.split(','):
-                                    img_info = img_info.strip()
-                                    if not img_info:
-                                        continue
-                                    parts = img_info.split()
-                                    if parts:
-                                        url_part = parts[0]
-                                        size = 0
-                                        if len(parts) > 1 and parts[-1].endswith('w'):
-                                            try:
-                                                size = int(parts[-1][:-1])
-                                            except ValueError:
-                                                pass
-                                        # Normalize the URL
-                                        if url_part.startswith("//"):
-                                            url_part = "https:" + url_part
-                                        elif url_part.startswith("/"):
-                                            url_part = "https://boochier.com" + url_part
-                                        image_options.append((size, url_part))
+                        if not img_container:
+                            log_event(f"[Staging] No .pr_lazy_img found at {await product.inner_html()}")
+                            
+                        else:
+                            tag_name = await img_container.evaluate("(el) => el.tagName.toLowerCase()")
 
-                            # Fallback: try to get image from inline style
-                            if not image_options:
-                                style_attr = await img_container.get_attribute("style")
-                                if style_attr and "background-image" in style_attr:
-                                   
-                                    match = re.search(r'url\(&quot;(.*?)&quot;\)', style_attr)
-                                    if match:
-                                        image_options.append((0, match.group(1)))
+                            if tag_name == "div":
+                                bgset = await img_container.get_attribute("data-bgset")
+                                if bgset:
+                                    for img_info in bgset.split(','):
+                                        parts = img_info.strip().split()
+                                        if parts:
+                                            url_part = parts[0]
+                                            size = int(parts[1][:-1]) if len(parts) > 1 and parts[1].endswith('w') else 0
+                                            full_url = urljoin(page.url, url_part)
+                                            image_options.append((size, full_url))
 
-                            # Choose the image with the highest resolution
+                                # Try background-image style
+                                if not image_options:
+                                    style_attr = await img_container.get_attribute("style")
+                                    if style_attr:
+                                        match = re.search(r'background-image:\s*url\(["\']?(.*?)["\']?\)', style_attr)
+                                        if match:
+                                            full_url = urljoin(page.url, match.group(1))
+                                            image_options.append((0, full_url))
+
+                            elif tag_name == "img":
+                                src = await img_container.get_attribute("src")
+                                if src:
+                                    full_url = urljoin(page.url, src)
+                                    image_options.append((0, full_url))
+
                             if image_options:
                                 image_options.sort(key=lambda x: x[0], reverse=True)
                                 image_url = image_options[0][1]
+                            else:
+                                log_event(f"[Staging] No valid image URLs extracted for {page.url}")
 
                     except Exception as e:
-                        log_event(f"Error extracting image URL: {e}")
+        
+                        log_event(f"[Staging] Exception while extracting image URL: {str(e)}")
                         image_url = "N/A"
 
 
                     
-                    gold_type_pattern = r"\b(?:\d{1,2}\s*(?:k|kt|ct)|platinum|silver|white gold|yellow gold|rose gold|black enamel|gold)\b"
+                    gold_type_pattern = r"\b(?:\d{1,2}\s*(?:k|kt|ct)\s*gold|platinum|silver|white gold|yellow gold|rose gold|black enamel|gold)\b"
                     gold_type_match = re.search(gold_type_pattern, description, re.IGNORECASE)
-                    kt = gold_type_match.group() if gold_type_match else "Not found"
+                    kt = gold_type_match.group().strip() if gold_type_match else "Not found"
 
-                    diamond_weight_pattern = r"\b\d+(?:\.\d+)?\s*(?:ct|cts|tcw|carat|carats)\b"
+                    # Diamond weight pattern - captures values like "1.8-carat", "0.2 ct", etc.
+                    diamond_weight_pattern = r"\b\d+(?:\.\d+)?\s*[-]?\s*(?:ct|cts|tcw|carat|carats)\b"
                     diamond_weight_match = re.search(diamond_weight_pattern, description, re.IGNORECASE)
-                    diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                    diamond_weight = diamond_weight_match.group().strip() if diamond_weight_match else "N/A"
                     
                     additional_info_str = description
 

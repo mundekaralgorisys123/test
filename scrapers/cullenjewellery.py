@@ -144,56 +144,60 @@ async def handle_cullenjewellery(url, max_pages):
                 for idx, product in enumerate(new_products):
                    # --- Product Name ---
                     try:
-                        # First try to get the full name from h3 (which might be hidden but contains more details)
-                        product_name_tag = await product.query_selector('h3.svelte-yv4ygw')
+                        # Try to get the detailed product name from <h3 class="hide_caption">
+                        product_name_tag = await product.query_selector('h3.hide_caption')
+                        
                         if product_name_tag:
                             product_name = await product_name_tag.inner_text()
-                        else:  # Fallback to h2 if h3 isn't found
-                            product_name_tag = await product.query_selector('h2.svelte-yv4ygw')
+                        else:
+                            # Fallback to <h2> if <h3.hide_caption> is not available
+                            product_name_tag = await product.query_selector('h2.svelte-1j4gv6v')
                             product_name = await product_name_tag.inner_text() if product_name_tag else "N/A"
-                        
-                        # Clean up the product name
-                        product_name = product_name.replace('hide_caption', '').strip()
+
+                        product_name = product_name.strip()
                     except Exception as e:
                         logging.error(f"[Product Name] Error: {e}")
                         product_name = "N/A"
 
+
                     # --- Price ---
                     try:
-                        price_tag = await product.query_selector('div.price.svelte-yv4ygw')
-                        if price_tag:
-                            price_text = await price_tag.inner_text()
-                            # Extract numeric value from price text
-                            price = ''.join(filter(lambda x: x.isdigit() or x == '.', price_text))
-                            price = f"${price}" if price else "N/A"
+                        price_element = await product.query_selector('h3.price')
+                        if price_element:
+                            price_text = await price_element.inner_text()
+                            # Extract numeric value from the price string
+                            price_value = ''.join(filter(lambda x: x.isdigit() or x == '.', price_text))
+                            price = f"${price_value}" if price_value else "N/A"
                         else:
                             price = "N/A"
                     except Exception as e:
                         logging.error(f"[Price] Error: {e}")
                         price = "N/A"
 
+
+
                     # --- Image URL ---
                     try:
-                        # First try to find visible images in the slider
+                        # Scroll into view to ensure lazy-loaded image loads
                         await product.scroll_into_view_if_needed()
-                        
-                        # Wait for image container to load
-                        image_container = await product.wait_for_selector('div.images.svelte-yv4ygw', timeout=5000)
-                        
-                        # Get first image in the container (might need to wait for lazy loading)
-                        img_element = await image_container.wait_for_selector('img', timeout=5000)
-                        
-                        # Get high-resolution image URL
-                        image_url = await img_element.get_attribute('src')
-                        if image_url and 'placeholder' not in image_url:
-                            # Modify URL to get higher resolution if needed
-                            image_url = modify_image_url(image_url)
+
+                        # Find the image inside the hidden slider container
+                        img_element = await product.query_selector('div.slider img.fillimage')
+
+                        if img_element:
+                            image_url = await img_element.get_attribute('src')
+                            
+                            # Optional: Check if it's a valid image (not a placeholder)
+                            if not image_url or 'placeholder' in image_url:
+                                image_url = "N/A"
                         else:
                             image_url = "N/A"
+
                     except Exception as e:
                         logging.error(f"[Image URL] Error: {e}")
                         image_url = "N/A"
-                        
+
+
                         
                     print(product_name)
                     print(price)

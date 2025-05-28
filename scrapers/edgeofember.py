@@ -7,9 +7,7 @@ import base64
 import random
 import time
 from datetime import datetime
-from io import BytesIO
 import httpx
-from PIL import Image as PILImage
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
 from flask import Flask
@@ -18,8 +16,6 @@ from playwright.async_api import async_playwright, TimeoutError, Error
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
-import json
-import mimetypes
 from proxysetup import get_browser_with_proxy_strategy
 # Load environment
 load_dotenv()

@@ -265,13 +265,20 @@ async def handle_fields(initial_url, max_pages):
     now_time = datetime.now().strftime("%H.%M")
     filename = f"handle_fields_{now_date}_{now_time}.xlsx"
     file_path = os.path.join(EXCEL_DATA_PATH, filename)
-    wb.save(file_path)
-    logging.info(f"Excel saved to {file_path}")
+    if not records:
+        return None, None, None
 
-    # — encode & batch insert —
-    with open(file_path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode("utf-8")
+    # Save the workbook
+    wb.save(file_path)
+    log_event(f"Data saved to {file_path}")
+
+    # Encode the file in base64
+    with open(file_path, "rb") as file:
+        base64_encoded = base64.b64encode(file.read()).decode("utf-8")
+
+    # Insert data into the database and update product count
     insert_into_db(records)
     update_product_count(len(records))
 
-    return b64, filename, file_path
+    # Return necessary information
+    return base64_encoded, filename, file_path

@@ -96,21 +96,6 @@ async def scroll_and_wait(page, max_attempts=10, wait_time=1):
     logging.info("Finished scrolling.")
     return True
 
-# async def safe_goto_and_wait(page, url, retries=3):
-#     for attempt in range(retries):
-#         try:
-#             print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-#             await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-#             product_cards = await page.wait_for_selector(".ss__has-results", timeout=15000)
-#             if product_cards:
-#                 print("[Success] Product cards loaded.")
-#                 return True
-#         except Exception as e:
-#             print(f"[Retry {attempt + 1}] Error: {e}")
-#             await asyncio.sleep(2)
-#     raise Exception(f"[Error] Failed to load product cards on {url} after {retries} attempts.")
-
-
 ########################################  safe_goto_and_wait ####################################################################
 
 

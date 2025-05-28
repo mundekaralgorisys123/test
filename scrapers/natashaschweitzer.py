@@ -23,10 +23,12 @@ from proxysetup import get_browser_with_proxy_strategy
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
 
-
+# Flask and paths
+app = Flask(__name__)
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
+EXCEL_DATA_PATH = os.path.join(app.root_path, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
+
 # Resize image if needed
 def resize_image(image_data, max_size=(100, 100)):
     try:
@@ -123,7 +125,7 @@ async def handle_natasha(url, max_pages):
         try:
             async with async_playwright() as p:
                 product_wrapper = ".collection__grid"
-                browser, page = await get_browser_with_proxy_strategy(p, current_url,product_wrapper )
+                browser, page = await get_browser_with_proxy_strategy(p, current_url,product_wrapper)
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all items
@@ -306,12 +308,20 @@ async def handle_natasha(url, max_pages):
 
         page_count += 1
 
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
+
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

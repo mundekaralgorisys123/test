@@ -130,7 +130,6 @@ async def handle_chaumet(url, max_pages):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     image_folder = os.path.join(IMAGE_SAVE_PATH, timestamp)
     os.makedirs(image_folder, exist_ok=True)
-
     # Create workbook and setup
     wb = Workbook()
     sheet = wb.active

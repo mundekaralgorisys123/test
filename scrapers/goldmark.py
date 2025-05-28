@@ -97,6 +97,11 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
     logging.error(f"Failed to download {product_name} after {retries} attempts.")
     return "N/A"
 
+
+def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    separator = '&' if '?' in base_url else '?'
+    return f"{base_url}{separator}p={page_count}"   
+
 async def handle_goldmark(url, max_pages):
     ip_address = get_public_ip()
     logging.info(f"Scraping started for: {url} from IP: {ip_address}, max_pages: {max_pages}")
@@ -118,15 +123,12 @@ async def handle_goldmark(url, max_pages):
     filename = f"handle_goldmark_{datetime.now().strftime('%Y-%m-%d_%H.%M')}.xlsx"
     file_path = os.path.join(EXCEL_DATA_PATH, filename)
 
+
     page_count = 1
     success_count = 0
     current_url = url
     while page_count <= max_pages:
-        if page_count > 1:
-            if '?' in current_url:
-                current_url = url + f"&p={page_count}"
-            else:
-                current_url = url + f"?p={page_count}"
+        current_url = build_url_with_loadmore(url, page_count)
         logging.info(f"Processing page {page_count}: {current_url}")
         
         # Create a new browser instance for each page
@@ -171,24 +173,36 @@ async def handle_goldmark(url, max_pages):
                         product_name = "N/A"
 
                     try:
+                        price = "N/A"
+
+                        # Try discounted price with "now" and optionally "was"
                         price_now_tag = await product.query_selector("span.s-price__now")
                         price_was_tag = await product.query_selector("span.s-price__was")
-                        price_regular_tag = await product.query_selector("div.s-product__price span")
 
                         if price_now_tag:
-                            # Discounted product
-                            price_now = await price_now_tag.inner_text()
-                            price_was = await price_was_tag.inner_text() if price_was_tag else None
+                            price_now = (await price_now_tag.inner_text()).strip()
+                            price_was = (await price_was_tag.inner_text()).strip() if price_was_tag else None
                             price = f"{price_now} offer {price_was}" if price_was else price_now
-                        elif price_regular_tag:
-                            # Regular price only
-                            price = await price_regular_tag.inner_text()
+
                         else:
-                            price = "N/A"
+                            # Try getting regular price (in case no now/was tags)
+                            price_container = await product.query_selector("div.s-product__price")
+                            if price_container:
+                                text = (await price_container.inner_text()).strip()
+                                if text:
+                                    price = text
+
+                        # Final fallback: any span with price class
+                        if price == "N/A":
+                            fallback_span = await product.query_selector("span.s-price__now, span.s-price__was")
+                            if fallback_span:
+                                price = (await fallback_span.inner_text()).strip()
 
                     except Exception as e:
                         logging.warning(f"⚠️ Error extracting price: {e}")
                         price = "N/A"
+
+
 
 
                     try:
@@ -207,14 +221,19 @@ async def handle_goldmark(url, max_pages):
                     additional_info = []
 
                     try:
-                       
-
-                        # Additionally check for 'Sale' flag
+                        # Check for 'Sale' flag
                         sale_flag_el = await product.query_selector("div.s-product__flag.s-flag--sale")
                         if sale_flag_el:
                             sale_text = await sale_flag_el.inner_text()
                             if sale_text:
                                 additional_info.append(sale_text.strip())
+
+                        # Check for promotional offer (e.g., "Buy 2 Save 30%*")
+                        offer_el = await product.query_selector("div.s-product__offer")
+                        if offer_el:
+                            offer_text = await offer_el.inner_text()
+                            if offer_text:
+                                additional_info.append(offer_text.strip())
 
                         if not additional_info:
                             additional_info.append("N/A")
@@ -224,15 +243,9 @@ async def handle_goldmark(url, max_pages):
                         additional_info.append("N/A")
 
                     additional_info_str = " | ".join(additional_info)
+
     
-                        
-                        
-                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
-                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
-                        continue      
-
-
-
+                      
                     # Extract KT
                     gold_type_match = re.search(r"\b\d{1,2}CT(?:\s+(?:WHITE|YELLOW|ROSE|TWO TONE))?\s+GOLD\b", product_name, re.IGNORECASE)
                     kt = gold_type_match.group().upper() if gold_type_match else "Not found"

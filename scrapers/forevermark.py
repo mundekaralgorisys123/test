@@ -9,56 +9,26 @@ import base64
 from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError, Error
 from openpyxl import Workbook
-from openpyxl.drawing.image import Image
-from flask import Flask
+from openpyxl.drawing.image import Image as ExcelImage
+
 from PIL import Image as PILImage
 from proxysetup import get_browser_with_proxy_strategy
 from utils import get_public_ip, log_event, sanitize_filename
 from dotenv import load_dotenv
 from database import insert_into_db
 from limit_checker import update_product_count
-from io import BytesIO
-from openpyxl.drawing.image import Image as XLImage
+from openpyxl.drawing.image import Image
+
 import httpx
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
-
-app = Flask(__name__)
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
 
-async def download_and_resize_image(session, image_url):
-    try:
-        async with session.get(modify_image_url(image_url), timeout=10) as response:
-            if response.status != 200:
-                return None
-            content = await response.read()
-            image = PILImage.open(BytesIO(content))
-            image.thumbnail((200, 200))
-            img_byte_arr = BytesIO()
-            image.save(img_byte_arr, format='JPEG', optimize=True, quality=85)
-            return img_byte_arr.getvalue()
-    except Exception as e:
-        logging.warning(f"Error downloading/resizing image: {e}")
-        return None
 
-def modify_image_url(image_url):
-    """Modify the image URL to replace '_260' with '_1200' while keeping query parameters."""
-    if not image_url or image_url == "N/A":
-        return image_url
 
-    # Extract and preserve query parameters
-    query_params = ""
-    if "?" in image_url:
-        image_url, query_params = image_url.split("?", 1)
-        query_params = f"?{query_params}"
-
-    # Replace '_260' with '_1200' while keeping the rest of the URL intact
-    modified_url = re.sub(r'(_260)(?=\.\w+$)', '_1200', image_url)
-
-    return modified_url + query_params  # Append query parameters if they exist
 
 async def download_image_async(image_url, product_name, timestamp, image_folder, unique_id, retries=3):
     if not image_url or image_url == "N/A":
@@ -156,7 +126,9 @@ def random_delay(min_sec=1, max_sec=3):
 
 
 
-
+def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    separator = '?' if '?' in base_url else '?'
+    return f"{base_url}{separator}pageNo={page_count}"   
 
 async def handle_forevermark(url, max_pages):
     ip_address = get_public_ip()
@@ -176,61 +148,35 @@ async def handle_forevermark(url, max_pages):
     sheet.append(headers)
 
     all_records = []
-    filename = f"handle_forevermark_{datetime.now().strftime('%Y-%m-%d_%H.%M')}.xlsx"
+    now_date = datetime.now().strftime("%Y-%m-%d")
+    now_time = datetime.now().strftime("%H.%M")
+    filename = f"handle_forevermark_{now_date}_{now_time}.xlsx"
     file_path = os.path.join(EXCEL_DATA_PATH, filename)
 
     page_count = 1
     success_count = 0
 
     while page_count <= max_pages:
-        # current_url = f"{url}?pageNo={page_count}"  
+        current_url = build_url_with_loadmore(url, page_count)
         logging.info(f"Processing page {page_count}: {url}")
-        prev_prod_cout = 0
+       
         # Create a new browser instance for each page
         browser = None
         page = None
         try:
             async with async_playwright() as p:
-                product_wrapper = '.filters-wrapper'
-                browser, page = await get_browser_with_proxy_strategy(p, url, product_wrapper)
+                product_wrapper = '.container.finder-filters'
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, product_wrapper)
                 log_event(f"Successfully loaded: {url}")
 
-                
-                # Simulate clicking 'Load More' number of times
-                # for _ in range(page_count - 1):
-                #     try:
-                #         load_more_button = page.locator("button#load-more.show")
-                #         if await load_more_button.is_visible():
-                #             await load_more_button.click()
-                #             await asyncio.sleep(2)  # Wait for new products to load
-                #         else:
-                #             logging.info("'Load More' button not visible.")
-                #             break
-                #     except Exception as e:
-                #         logging.warning(f"Could not click 'Load More': {e}")
-                #         break
+                # Use locator instead of query_selector/query_selector_all
+                product_wrapper = page.locator("div.row")
+                products = product_wrapper.locator("div.col-4_of_12")
 
-
-
-                # After scrolling, get the products
-                product_wrapper = await page.query_selector("div.row.filter-search-results-container")
-                products = await product_wrapper.query_selector_all("div.search-results-col") if product_wrapper else []
-                logging.info(f"New products found: {len(products)}")
-                print(f"New products found: {len(products)}")
-
-                
-                max_prod = len(products)
-                products = products[prev_prod_cout: min(max_prod, prev_prod_cout + 30)]
-                prev_prod_cout += len(products)
-
-                if len(products) == 0:
-                    log_event("No new products found, stopping the scraper.")
-                    break
-
-                logging.info(f"New products found: {len(products)}")
-                print(f"New products found: {len(products)}")
-
-                
+                # Count products
+                product_count = await products.count()
+                logging.info(f"New products found: {product_count}")
+                print(f"New products found: {product_count}")
 
                 page_title = await page.title()
                 current_date = datetime.now().strftime("%Y-%m-%d")
@@ -239,33 +185,36 @@ async def handle_forevermark(url, max_pages):
                 records = []
                 image_tasks = []
 
-                for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
+                for row_num in range(product_count):
+                    product = products.nth(row_num)
                     try:
-                        name_tag = await product.query_selector("p.item-title")
-                        product_name = (await name_tag.inner_text()).strip() if name_tag else "N/A"
+                        # Use locator to get the <h2> tag text
+                        name_tag = product.locator("h2")
+                        product_name = (await name_tag.text_content()).strip() if await name_tag.count() > 0 else "N/A"
                     except Exception:
                         product_name = "N/A"
 
-                    try:
-                        price_tag = await product.query_selector("p.discover-jewelry-block__content__footer__price")
-                        price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
-                    except Exception:
-                        price = "N/A"
+                    price = "N/A"
 
                     try:
-                        # Extract from style background-image first
-                        img_div = await product.query_selector("div.discover-jewelry-block__content__img")
-                        if img_div:
-                            style = await img_div.get_attribute("style")
-                            match = re.search(r'url\((.*?)\)', style)
-                            image_url = match.group(1) if match else "N/A"
-                        else:
-                            image_url = "N/A"
+                        # Try to get from <source> with type="image/jpeg" using locator
+                        source_tag = product.locator('picture source[type="image/jpeg"]')
+                        image_url = await source_tag.get_attribute("srcset") if await source_tag.count() > 0 else "N/A"
 
+                        # Fallback to <img> if <source> not found
+                        if not image_url or image_url == "N/A":
+                            img_tag = product.locator("picture img")
+                            image_url = await img_tag.get_attribute("srcset") if await img_tag.count() > 0 else "N/A"
+
+                        # Ensure the URL is complete
                         if image_url and image_url.startswith("/"):
                             image_url = "https://www.forevermark.com" + image_url.split("?")[0]
                     except Exception:
                         image_url = "N/A"
+
+                    # print(product_name)
+                    # print(image_url)
+
 
 
 

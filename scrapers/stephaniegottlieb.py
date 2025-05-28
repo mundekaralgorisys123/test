@@ -12,14 +12,13 @@ import httpx
 from PIL import Image as PILImage
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
-from flask import Flask
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError, Error
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
-import json
-import mimetypes
+from proxysetup import get_browser_with_proxy_strategy
 
 # Load environment
 load_dotenv()
@@ -80,23 +79,38 @@ async def scroll_to_bottom(page):
         last_height = new_height
 
 # Reliable page.goto wrapper
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-            await page.wait_for_selector(".product-list", state="attached", timeout=30000)
-            print("[Success] Product listing loaded.")
-            return
-        except (Error, TimeoutError) as e:
-            logging.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
-            if attempt < retries - 1:
-                random_delay(1, 3)
-            else:
-                raise
+def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    """
+    Builds a paginated URL, preserving existing parameters and correctly encoding query strings.
+    Skips adding ?page=1 to keep the base URL clean.
+    """
+    # If first page, return base URL as-is
+    if page_count == 1:
+        return base_url
+
+    # Parse URL components
+    parsed = urlparse(base_url)
+    query_params = parse_qs(parsed.query)
+
+    # Update the 'page' parameter
+    query_params['page'] = [str(page_count)]
+
+    # Re-encode the query string
+    new_query = urlencode(query_params, doseq=True)
+
+    # Rebuild and return the full URL
+    return urlunparse((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        parsed.params,
+        new_query,
+        parsed.fragment
+    ))
+
 
 # Main scraper function
-async def handle_stephaniegottlieb(url, max_pages=None):
+async def handle_stephaniegottlieb(url, max_pages):
     ip_address = get_public_ip()
     logging.info(f"Scraping started for: {url} from IP: {ip_address}")
 
@@ -110,36 +124,42 @@ async def handle_stephaniegottlieb(url, max_pages=None):
     sheet.title = "Products"
     headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
     sheet.append(headers)
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    time_only = datetime.now().strftime("%H.%M")
+
 
     all_records = []
     filename = f"handle_stephaniegottlieb_{datetime.now().strftime('%Y-%m-%d_%H.%M')}.xlsx"
     file_path = os.path.join(EXCEL_DATA_PATH, filename)
     load_more_clicks = 1
     while load_more_clicks <= max_pages:
+        current_url = build_url_with_loadmore(url, load_more_clicks)
         browser = None
         page = None
-        if load_more_clicks > 1:
-            url = f"{url}?page={load_more_clicks}"
+        # if load_more_clicks > 1:
+        #     url = f"{url}?page={load_more_clicks}"
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(1200000)
+                # browser = await p.chromium.connect_over_cdp(PROXY_URL)
+                # context = await browser.new_context()
+                # page = await context.new_page()
+                # page.set_default_timeout(1200000)
 
-                await safe_goto_and_wait(page, url)
+                # await safe_goto_and_wait(page, url)
+                product_wrapper = ".product-list"
+                browser, page = await get_browser_with_proxy_strategy(p, current_url,product_wrapper)
                 log_event(f"Successfully loaded: {url}")
 
                 # Scroll to load all items
                 await scroll_to_bottom(page)
-                
                 page_title = await page.title()
-                current_date = datetime.now().strftime("%Y-%m-%d")
-                time_only = datetime.now().strftime("%H.%M")
+               
 
                 # Get all product tiles
                 product_wrapper = await page.query_selector("div.product-list")
                 products = await page.query_selector_all("div.ns-product") if product_wrapper else []
+
+
 
                 logging.info(f"New products found: {len(products)}")
                 print(f"New products found: {len(products)}")
@@ -187,6 +207,11 @@ async def handle_stephaniegottlieb(url, max_pages=None):
                     diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw|carat)\b"
                     diamond_weight_match = re.search(diamond_weight_pattern, description, re.IGNORECASE)
                     diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                    
+                    
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue   
 
                     unique_id = str(uuid.uuid4())
                     if image_url and image_url != "N/A":
@@ -226,12 +251,21 @@ async def handle_stephaniegottlieb(url, max_pages=None):
             if page: await page.close()
             if browser: await browser.close()
 
+    # # Final save and database operations
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
+
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

@@ -12,14 +12,13 @@ import httpx
 from PIL import Image as PILImage
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
-from flask import Flask
+from urllib.parse import urlparse, parse_qs, urlunparse, quote_plus
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError, Error
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
-import json
-import mimetypes
+from proxysetup import get_browser_with_proxy_strategy
 
 # Load environment
 load_dotenv()
@@ -93,9 +92,38 @@ async def safe_goto_and_wait(page, url, retries=3):
                 random_delay(1, 3)
             else:
                 raise
+            
+
+def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    """
+    Builds a paginated URL with 'page' parameter appearing first in the query string.
+    Preserves existing parameters and handles multi-valued keys.
+    """
+    parsed = urlparse(base_url)
+    query_params = parse_qs(parsed.query)
+
+    # Prepare new query string with 'page' first
+    new_query_parts = [f"page={page_count}"]
+
+    for key, values in query_params.items():
+        if key == "page":
+            continue  # Skip old page value
+        for value in values:
+            new_query_parts.append(f"{quote_plus(key)}={quote_plus(value)}")
+
+    # Reconstruct the full URL
+    new_query = "&".join(new_query_parts)
+    return urlunparse((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        parsed.params,
+        new_query,
+        parsed.fragment
+    ))            
 
 # Main scraper function
-async def handle_ringconcierge(url, max_pages=None):
+async def handle_ringconcierge(url, max_pages):
     ip_address = get_public_ip()
     logging.info(f"Scraping started for: {url} from IP: {ip_address}")
 
@@ -116,18 +144,16 @@ async def handle_ringconcierge(url, max_pages=None):
     load_more_clicks = 1
     current_url = url
     while load_more_clicks <= max_pages:
+        current_url = build_url_with_loadmore(url, load_more_clicks)
         browser = None
         page = None
-        if load_more_clicks > 1:
-            current_url = f"{url}?page={load_more_clicks}"
+        # if load_more_clicks > 1:
+        #     current_url = f"{url}?page={load_more_clicks}"
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(1200000)
-
-                await safe_goto_and_wait(page, current_url)
+    
+                product_wrapper = '.ProductListWrapper'
+                browser, page = await get_browser_with_proxy_strategy(p, current_url, product_wrapper)
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all items
@@ -148,62 +174,91 @@ async def handle_ringconcierge(url, max_pages=None):
                 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
                     try:
-                        # Extract product name - from the ProductItem__Title element
-                        name_tag = await product.query_selector(".ProductItem__Title")
+                        # Extract product name from anchor inside h2 with both classes
+                        name_tag = await product.query_selector(".ProductItem__Title.Heading a")
                         product_name = (await name_tag.inner_text()).strip() if name_tag else "N/A"
                     except Exception:
                         product_name = "N/A"
 
+
+
                     try:
-                        # Extract price - from the money element
-                        price_tag = await product.query_selector(".money")
-                        price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
-                        # Clean up price string
-                        price = re.sub(r'\s+', ' ', price).strip()
+                        # Locate the outer span containing the price phrase
+                        price_container = product.locator(".ProductItem__PriceList .ProductItem__Price")
+                        if await price_container.count() > 0:
+                            full_price_text = await price_container.inner_text()
+                            # full_price_text example: "Starting at $398"
+                            # Extract the dollar amount (or just use full text)
+                            price_match = re.search(r"\$\d+(?:\.\d{2})?", full_price_text)
+                            price = price_match.group() if price_match else full_price_text.strip()
+                        else:
+                            price = "N/A"
                     except Exception:
                         price = "N/A"
 
-                    # Description is same as product name in this case
-                    description = product_name
+
+
+                    
 
                     image_url = "N/A"
                     try:
-                        # Get the second image tag (index 1) which is the main product image
-                        img_tags = await product.query_selector_all(".ProductItem__Image")
-                        if len(img_tags) > 1:  # Ensure there is a second image
-                            img_tag = img_tags[1]
+                        # Get all product image elements
+                        img_tags = await product.query_selector_all("img.ProductItem__Image")
+                        
+                        if img_tags:
+                            # Use the first image tag
+                            img_tag = img_tags[0]
+
+                            # Try to get the 'srcset' attribute
                             srcset = await img_tag.get_attribute("srcset")
-                            
+
                             if srcset:
-                                # Extract all URLs and resolutions from srcset
+                                # Parse all entries in srcset
                                 srcset_parts = [part.strip() for part in srcset.split(",")]
                                 urls_resolutions = []
-                                
+
                                 for part in srcset_parts:
-                                    img_url, resolution = part.split(" ")
-                                    resolution = int(resolution.replace("w", ""))
-                                    urls_resolutions.append((resolution, img_url))
-                                
-                                # Sort by resolution and get the highest one
+                                    if " " in part:
+                                        img_url, resolution = part.split(" ")
+                                        resolution = int(resolution.replace("w", ""))
+                                        urls_resolutions.append((resolution, img_url))
+
+                                # Sort by highest resolution
                                 urls_resolutions.sort(reverse=True)
                                 if urls_resolutions:
                                     image_url = urls_resolutions[0][1]
-                                    # Ensure URL is complete (add https: if needed)
-                                    if image_url.startswith("//"):
-                                        image_url = f"https:{image_url}"
+
+                            # Fallback: use 'src' attribute if srcset not found or empty
+                            if not image_url or image_url == "N/A":
+                                image_url = await img_tag.get_attribute("src")
+
+                            # Ensure URL is complete
+                            if image_url and image_url.startswith("//"):
+                                image_url = f"https:{image_url}"
+
                     except Exception as e:
                         log_event(f"Error getting image URL: {e}")
                         image_url = "N/A"
+                        
+                        
+                    print(product_name) 
+                    print(price) 
+                    print(image_url)    
+
 
                     # Extract gold type (kt) from product name/description
                     gold_type_pattern = r"\b\d{1,2}(?:K|kt|ct|Kt)\b|\bPlatinum\b|\bSilver\b|\bWhite Gold\b|\bYellow Gold\b|\bRose Gold\b"
-                    gold_type_match = re.search(gold_type_pattern, description, re.IGNORECASE)
+                    gold_type_match = re.search(gold_type_pattern, product_name, re.IGNORECASE)
                     kt = gold_type_match.group() if gold_type_match else "Not found"
 
                     # Extract diamond weight from description
                     diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw|carat)\b"
-                    diamond_weight_match = re.search(diamond_weight_pattern, description, re.IGNORECASE)
+                    diamond_weight_match = re.search(diamond_weight_pattern, product_name, re.IGNORECASE)
                     diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                    
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue  
 
                     unique_id = str(uuid.uuid4())
                     if image_url and image_url != "N/A":
@@ -211,8 +266,8 @@ async def handle_ringconcierge(url, max_pages=None):
                             download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                         )))
 
-                    records.append((unique_id, current_date, page_title, product_name, description, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, description, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, product_name, kt, price, diamond_weight))
+                    sheet.append([current_date, page_title, product_name, product_name, kt, price, diamond_weight, time_only, image_url])
                             
                 # Process image downloads
                 for row_num, unique_id, task in image_tasks:
@@ -243,12 +298,20 @@ async def handle_ringconcierge(url, max_pages=None):
             if page: await page.close()
             if browser: await browser.close()
 
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
+
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

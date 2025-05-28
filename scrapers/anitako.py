@@ -12,12 +12,12 @@ import httpx
 from PIL import Image as PILImage
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as ExcelImage
-from flask import Flask
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError, Error
-from utils import get_public_ip, log_event, sanitize_filename
+from utils import get_public_ip, log_event
 from database import insert_into_db
 from limit_checker import update_product_count
+from proxysetup import get_browser_with_proxy_strategy
 
 # Load environment
 load_dotenv()
@@ -46,46 +46,47 @@ def modify_image_url(image_url):
     return image_url
 
 # Async image downloader
-async def download_image_async(image_url, product_name, timestamp, image_folder, unique_id, retries=3):
+async def download_image_async(image_url, product_name, timestamp, image_folder, unique_id):
     if not image_url or image_url == "N/A":
         return "N/A"
-
-    image_filename = f"{unique_id}_{timestamp}.jpg"
-    image_full_path = os.path.join(image_folder, image_filename)
-    modified_url = modify_image_url(image_url)
-
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        for attempt in range(retries):
-            try:
-                response = await client.get(modified_url)
-                response.raise_for_status()
-                with open(image_full_path, "wb") as f:
-                    f.write(response.content)
-                return image_full_path
-            except httpx.RequestError as e:
-                logging.warning(f"Retry {attempt + 1}/{retries} - Error downloading {product_name}: {e}")
-    logging.error(f"Failed to download {product_name} after {retries} attempts.")
-    return "N/A"
-
-# Human-like delay
-def random_delay(min_sec=1, max_sec=3):
-    time.sleep(random.uniform(min_sec, max_sec))
-
-# Reliable page.goto wrapper
-async def safe_goto_and_wait(page, url, retries=3):
-    for attempt in range(retries):
-        try:
-            print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-            await page.wait_for_selector("div#CollectionSection", state="attached", timeout=30000)
-            print("[Success] Product cards loaded.")
-            return
-        except (Error, TimeoutError) as e:
-            logging.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
-            if attempt < retries - 1:
-                random_delay(1, 3)
-            else:
-                raise
+    
+    try:
+        # Ensure the URL is properly formatted
+        if image_url.startswith('//'):
+            image_url = f"https:{image_url}"
+        elif image_url.startswith('/'):
+            image_url = f"https://www.anitako.com{image_url}"
+        
+        # Clean up the URL by removing query parameters and fragments
+        clean_url = image_url.split('?')[0].split('#')[0]
+        
+        # Create a safe filename
+        safe_product_name = re.sub(r'[^\w\-_. ]', '', product_name)[:100]
+        extension = clean_url.split('.')[-1].lower()
+        if extension not in ['jpg', 'jpeg', 'png', 'webp']:
+            extension = 'jpg'  # default extension
+            
+        filename = f"{safe_product_name}_{unique_id}.{extension}"
+        filepath = os.path.join(image_folder, filename)
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(clean_url)
+            response.raise_for_status()
+            
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            
+            with open(filepath, 'wb') as f:
+                f.write(response.content)
+                
+            return filepath
+            
+    except httpx.RequestException as e:
+        logging.warning(f"Failed to download image {image_url}: {str(e)}")
+        return "N/A"
+    except Exception as e:
+        logging.warning(f"Unexpected error downloading image {image_url}: {str(e)}")
+        return "N/A"
 
 # Main scraper function
 async def handle_anitako(url, max_pages):
@@ -100,7 +101,7 @@ async def handle_anitako(url, max_pages):
     wb = Workbook()
     sheet = wb.active
     sheet.title = "Products"
-    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath"]
+    headers = ["Current Date", "Header", "Product Name", "Image", "Kt", "Price", "Total Dia wt", "Time", "ImagePath", "Additional Info"]
     sheet.append(headers)
 
     all_records = []
@@ -114,15 +115,14 @@ async def handle_anitako(url, max_pages):
         browser = None
         context = None
         if page_count > 1:
-            current_url = f"{url}?page={page_count}"
+            if '?' in current_url:
+                current_url = f"{url}&page={page_count}"
+            else:
+                current_url = f"{url}?page={page_count}"
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                context = await browser.new_context()
-                page = await context.new_page()
-                page.set_default_timeout(120000)
-
-                await safe_goto_and_wait(page, current_url)
+                product_wrapper = ".collection-grid__wrapper"
+                browser, page = await get_browser_with_proxy_strategy(p, current_url,product_wrapper )
                 log_event(f"Successfully loaded: {current_url}")
             
                 # Scroll to load all items
@@ -146,36 +146,51 @@ async def handle_anitako(url, max_pages):
                 image_tasks = []
 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
+                    additional_info = []
+                    
                     try:
                         name_tag = await product.query_selector("div.grid-product__title")
                         product_name = (await name_tag.inner_text()).strip() if name_tag else "N/A"
                     except Exception:
                         product_name = "N/A"
 
+                    # Enhanced price extraction
                     try:
                         price_tag = await product.query_selector("div.grid-product__price")
-                        price = (await price_tag.inner_text()).strip() if price_tag else "N/A"
+                        price_text = (await price_tag.inner_text()).strip() if price_tag else "N/A"
+                        
+                        # Check for sale price
+                        sale_price_tag = await product.query_selector("div.grid-product__price--sale")
+                        if sale_price_tag:
+                            sale_price_text = (await sale_price_tag.inner_text()).strip()
+                            if sale_price_text:
+                                additional_info.append(f"Sale Price: {sale_price_text}")
+                                price = f"{price_text} | {sale_price_text}"
+                            else:
+                                price = price_text
+                        else:
+                            price = price_text
+                            
+                        # Clean price text
+                        price = price.replace('Rs.', '').replace(',', '').strip()
                     except Exception:
                         price = "N/A"
 
+                    # Enhanced image extraction
                     try:
-                        # Get the main image container which contains multiple image sizes
                         image_container = await product.query_selector("div.grid__image-ratio")
                         if image_container:
-                            # Extract the data-bgset attribute which contains all image sizes
                             bgset = await image_container.get_attribute("data-bgset")
                             if bgset:
-                                # Split the URLs and get the highest resolution one (last in the list)
-                                image_urls = [url.strip() for url in bgset.split(',') if url.strip()]
+                                # Extract all image URLs and get the highest resolution
+                                image_urls = [url.strip().split(' ')[0] for url in bgset.split(',') if url.strip()]
                                 if image_urls:
-                                    # Take the last URL (highest resolution) and clean it
-                                    highest_res_url = image_urls[-1].split(' ')[0]
-                                    # Ensure it's a complete URL
+                                    highest_res_url = image_urls[-1]
                                     if highest_res_url.startswith('//'):
                                         highest_res_url = f"https:{highest_res_url}"
                                     elif highest_res_url.startswith('/'):
                                         highest_res_url = f"https://www.anitako.com{highest_res_url}"
-                                    image_url = highest_res_url.split('?v=')[0]  # Remove version parameter
+                                    image_url = highest_res_url.split('?v=')[0]
                                 else:
                                     image_url = "N/A"
                             else:
@@ -185,21 +200,68 @@ async def handle_anitako(url, max_pages):
                     except Exception:
                         image_url = "N/A"
 
+                    if product_name == "N/A" or price == "N/A" or image_url == "N/A":
+                        print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
+                        continue
+                    
+                    # Check for product status (sold out, etc.)
+                    try:
+                        status_tag = await product.query_selector("div.grid-product__tag")
+                        if status_tag:
+                            status_text = (await status_tag.inner_text()).strip()
+                            if status_text:
+                                additional_info.append(f"Status: {status_text}")
+                    except Exception:
+                        pass
+
+                    # Extract metal type and gemstone information
                     gold_type_pattern = r"\b\d{1,2}(?:K|ct)?\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSterling Silver\b"
                     gold_type_match = re.search(gold_type_pattern, product_name, re.IGNORECASE)
                     kt = gold_type_match.group() if gold_type_match else "Not found"
 
-                    diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw)\b"
-                    diamond_weight_match = re.search(diamond_weight_pattern, product_name, re.IGNORECASE)
-                    diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                    # Extract diamond weight and gemstone details
+                    diamond_weight = "N/A"
+                    try:
+                        diamond_weight_pattern = r"\b\d+(\.\d+)?\s*(?:ct|tcw|carat)\b"
+                        diamond_weight_match = re.search(diamond_weight_pattern, product_name, re.IGNORECASE)
+                        diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                        
+                        # Extract gemstone information
+                        gemstone_pattern = r"\b(?:Diamond|Emerald|Ruby|Sapphire|Topaz|Amethyst|Aquamarine|Pearl)\b"
+                        gemstones = re.findall(gemstone_pattern, product_name, re.IGNORECASE)
+                        if gemstones:
+                            additional_info.append(f"Gemstones: {', '.join(gemstones)}")
+                            
+                        # Extract special cuts (Marquis, Emerald Cut, etc.)
+                        cut_pattern = r"\b(?:Marquis|Emerald Cut|Round Brilliant|Princess|Oval|Pear|Cushion|Radiant)\b"
+                        cuts = re.findall(cut_pattern, product_name, re.IGNORECASE)
+                        if cuts:
+                            additional_info.append(f"Cut: {', '.join(cuts)}")
+                    except Exception:
+                        pass
+
+                    # Check for product categories
+                    try:
+                        category_tag = await product.query_selector("a.grid-product__link")
+                        if category_tag:
+                            href = await category_tag.get_attribute("href")
+                            if href:
+                                categories = [part for part in href.split('/') if part and part not in ['products', 'collections']]
+                                if categories:
+                                    additional_info.append(f"Categories: {', '.join(categories)}")
+                    except Exception:
+                        pass
+
+                    # Join all additional info with | delimiter
+                    additional_info_text = " | ".join(additional_info) if additional_info else "N/A"
 
                     unique_id = str(uuid.uuid4())
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight))
-                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight, additional_info_text))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url, additional_info_text])
 
                 for row_num, unique_id, task in image_tasks:
                     try:
@@ -214,7 +276,7 @@ async def handle_anitako(url, max_pages):
                                 image_path = "N/A"
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
-                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7])
+                                records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
                     except asyncio.TimeoutError:
                         logging.warning(f"Image download timed out for row {row_num}")
@@ -232,12 +294,21 @@ async def handle_anitako(url, max_pages):
 
         page_count += 1
 
+     # Final save and database operations
+    if not all_records:
+        return None, None, None
+
+    # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
+
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
+    # Insert data into the database and update product count
     insert_into_db(all_records)
     update_product_count(len(all_records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path

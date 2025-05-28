@@ -3,6 +3,7 @@ import pymssql
 import logging
 from dotenv import load_dotenv
 from utils import log_event
+from pattern_checking import process_row
 
 # Load environment variables
 load_dotenv()
@@ -24,7 +25,7 @@ def create_table():
                 # Step 1: Create the table if it doesn't exist
                 create_table_query = """
                 IF NOT EXISTS (
-                    SELECT * FROM EmrUsrRep.INFORMATION_SCHEMA.TABLES 
+                    SELECT * FROM Webstudy.INFORMATION_SCHEMA.TABLES 
                     WHERE TABLE_NAME = 'IBM_Algo_Webstudy_Products' 
                     AND TABLE_SCHEMA = 'dbo'
                 )
@@ -67,10 +68,11 @@ def create_table():
 
 
 def insert_into_db(data):
-    """Insert scraped data into the MSSQL database."""
+    """Insert scraped data into the MSSQL database with enhanced Kt and TotalDiaWt validation."""
     if not data:
         log_event("No data to insert into the database.")
         return
+    
     try:
         with pymssql.connect(**DB_CONFIG) as conn:
             with conn.cursor() as cursor:
@@ -79,15 +81,17 @@ def insert_into_db(data):
                     (unique_id, CurrentDate, Header, ProductName, ImagePath, Kt, Price, TotalDiaWt, AdditionalInfo)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """
-
-                # Normalize each row to ensure it has exactly 9 elements (pad with None if shorter)
-                normalized_data = [tuple(row) + (None,) * (9 - len(row)) if len(row) < 9 else tuple(row) for row in data]
-
-                cursor.executemany(query, normalized_data)
+                
+                processed_data = [process_row(row) for row in data]
+                
+                cursor.executemany(query, processed_data)
                 conn.commit()
-                logging.info(f"Inserted {len(normalized_data)} records successfully.")
+                logging.info(f"Inserted {len(processed_data)} records successfully.")
+                
     except pymssql.DatabaseError as e:
         logging.error(f"Database error: {e}")
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
 
 # Function to fetch scraping settings
 def get_scraping_settings():
@@ -136,7 +140,7 @@ def get_all_scraped_products():
         with pymssql.connect(**DB_CONFIG) as conn:
             with conn.cursor(as_dict=True) as cursor:
                 cursor.execute("""
-                    SELECT TOP (1000) [unique_id], [CurrentDate], [Header], [ProductName],
+                    SELECT [unique_id], [CurrentDate], [Header], [ProductName],
                         [ImagePath], [Kt], [Price], [TotalDiaWt], [Time]
                     FROM dbo.IBM_Algo_Webstudy_Products
                     ORDER BY CurrentDate DESC

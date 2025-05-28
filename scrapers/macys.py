@@ -344,41 +344,41 @@ async def handle_macys(url, max_pages):
                 image_tasks = []
 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
-                    additional_info = []
+                    
                     
                     try:
-                        # Product Name
-                        product_name_tag = product.locator("div.product-name.medium")
+                        # Correct tag selector: h3 instead of div
+                        product_name_tag = product.locator("h3.product-name.medium")
                         product_name = await product_name_tag.text_content() if await product_name_tag.count() > 0 else "N/A"
                         product_name = product_name.strip() if product_name else "N/A"
-                    except:
+                    except Exception as e:
+                        print(f"Product name extraction error: {e}")
                         product_name = "N/A"
 
+
                     price_info = []
+
                     try:
-                        # Current price and discount percentage
+                        # Current price
                         current_price_tag = product.locator("span.discount.is-tier2")
                         if await current_price_tag.count() > 0:
-                            current_price_text = await current_price_tag.text_content()
-                            current_price = current_price_text.strip().split(" ")[1]  # Extract price, ignore the "INR" part
-                            discount_pct = current_price_text.strip().split("(")[-1].replace(")", "").strip()  # Extract discount percent
-                            if current_price:
+                            current_price_text = await current_price_tag.first.text_content()
+                            if current_price_text:
+                                current_price = current_price_text.strip().split()[1]  # INR 433,003.00 → 433,003.00
                                 price_info.append(f"Current price: INR {current_price}")
-                            if discount_pct:
-                                price_info.append(f"Discount: {discount_pct}")
 
                         # Original price (strikethrough)
                         original_price_tag = product.locator("span.price-strike-sm")
                         if await original_price_tag.count() > 0:
-                            original_price = await original_price_tag.text_content()
+                            original_price = await original_price_tag.first.text_content()
                             if original_price:
                                 price_info.append(f"Original price: INR {original_price.strip()}")
 
-                        # Fallback to regular price if no sale price is found
+                        # Fallback to regular price
                         if not price_info:
                             regular_price_tag = product.locator("span.price-reg.is-tier1")
                             if await regular_price_tag.count() > 0:
-                                regular_price = await regular_price_tag.text_content()
+                                regular_price = await regular_price_tag.first.text_content()
                                 if regular_price:
                                     price_info.append(f"Regular price: INR {regular_price.strip()}")
 
@@ -386,8 +386,9 @@ async def handle_macys(url, max_pages):
                         logging.warning(f"Error extracting price: {e}")
                         price_info = ["N/A"]
 
-                    # Final formatted price output
+                    # Final output
                     price = " | ".join(price_info) if price_info else "N/A"
+
 
 
                     # Image extraction with fallbacks
@@ -400,45 +401,89 @@ async def handle_macys(url, max_pages):
                     except Exception as e:
                         image_url = "N/A"
 
+                   
+
+                    gold_type_match = re.search(r"\b\d{1,2}K\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSilver\b", product_name, re.IGNORECASE)
+                    kt = gold_type_match.group() if gold_type_match else "Not found"
+
+
+                    diamond_weight_match = re.search(r"\d+(?:[-/]\d+)?(?:\s+\d+/\d+)?\s*ct\s+tw", product_name, re.IGNORECASE)
+                    diamond_weight = diamond_weight_match.group() if diamond_weight_match else "N/A"
+                    
+                    
+                    additional_info = []
+                    
+                    try:
+                        # Extract discount tags like "(35% off)"
+                        discount_locator = product.locator("span.sale-percent.percent-small")
+                        discount_count = await discount_locator.count()
+
+                        if discount_count > 0:
+                            for i in range(discount_count):
+                                discount_text = await discount_locator.nth(i).inner_text()
+                                if discount_text and discount_text.strip():
+                                    additional_info.append(discount_text.strip())
+                        else:
+                            additional_info.append("N/A")
+                    except Exception as e:
+                        print(f"Discount extraction error: {e}")
+                        additional_info.append("N/A")
+
+
+                    try:
+                        # Extract promotional tags: "New", "Bonus Offer", etc.
+                        tag_locator = product.locator("div.tile-buttons span, div.badge-wrapper span")
+                        tag_count = await tag_locator.count()
+
+                        if tag_count > 0:
+                            for i in range(tag_count):
+                                tag_text = await tag_locator.nth(i).inner_text()
+                                if tag_text and tag_text.strip():
+                                    additional_info.append(tag_text.strip())
+                        else:
+                            additional_info.append("N/A")
+                    except Exception as e:
+                        print(f"Tag extraction error: {e}")
+                        additional_info.append("N/A")
+
+                    # Extract Rating (e.g., "Rated 3.625 out of 5")
+                    try:
+                        rating_locator = product.locator("div.rating span[aria-label]")
+                        if await rating_locator.count() > 0:
+                            rating_text = await rating_locator.first.get_attribute("aria-label")
+                            if rating_text:
+                                additional_info.append(rating_text.strip())
+                    except Exception as e:
+                        print(f"Rating extraction error: {e}")
+
+                    # Extract Review Count (e.g., "8 reviews")
+                    try:
+                        review_locator = product.locator("div.rating .rating-description span[aria-label]")
+                        if await review_locator.count() > 0:
+                            review_text = await review_locator.first.get_attribute("aria-label")
+                            if review_text:
+                                additional_info.append(review_text.strip())
+                    except Exception as e:
+                        print(f"Review count extraction error: {e}")
+
+                    # Join all into a single string
+                    additional_info_str = " | ".join(additional_info) if additional_info else "N/A"
+
+
+                    
                     if product_name == "N/A" and price == "N/A" and image_url == "N/A":
                         print(f"Skipping product due to missing data: Name: {product_name}, Price: {price}, Image: {image_url}")
                         continue
-
-                    material_pattern = r"\b\d{1,2}K\s*(?:White|Yellow|Rose)?\s*Gold\b|\bPlatinum\b|\bSterling Silver\b|\bTitanium\b"
-                    material_match = re.search(material_pattern, product_name, re.IGNORECASE)
-                    material = material_match.group() if material_match else "N/A"
-
-                    size_weight_pattern = r"(\d+(?:\.\d+)?\s*(?:ct|ctw|carat|inch|cm|mm)\b)"
-                    size_weight_match = re.search(size_weight_pattern, product_name, re.IGNORECASE)
-                    size_weight = size_weight_match.group() if size_weight_match else "N/A"
-
-                    additional_info_str = " | ".join(additional_info) if additional_info else ""
 
                     unique_id = str(uuid.uuid4())
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
 
-                    records.append((unique_id, current_date, page_title, product_name, None, material, price, size_weight, additional_info_str))
-                    sheet.append([
-                        current_date, 
-                        page_title, 
-                        product_name, 
-                        None, 
-                        material, 
-                        price, 
-                        size_weight, 
-                        time_only, 
-                        image_url,
-                        additional_info_str
-                    ])
+                    records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
+                    sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
 
-                # import asyncio
-                # import logging
-                # from openpyxl.drawing.image import Image as XLImage
-                # from PIL import Image
-                # from io import BytesIO
-
+                
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
                     try:

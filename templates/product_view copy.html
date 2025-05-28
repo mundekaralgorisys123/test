@@ -177,25 +177,21 @@
         const itemCountDiv = document.getElementById('itemCount');
         const pageControls = document.getElementById('pageControls');
 
+        // 1️⃣ On date pick, filter products→filteredByDate, populate header dropdown, then refine
         function applyDateFilter() {
             const sel = dateInput.value;
-
             if (!sel) {
-                // If no date selected, show all products
-                filteredByDate = [...products];
+                filteredByDate = [];
             } else {
-                // Convert both sides to local date string 'YYYY-MM-DD'
                 filteredByDate = products.filter(p => {
-                    const d = new Date(p.CurrentDate).toLocaleDateString('en-CA'); // 'YYYY-MM-DD'
+                    const d = new Date(p.CurrentDate).toISOString().split('T')[0];
                     return d === sel;
                 });
             }
-
             currentPage = 1;
             populateHeaders();
             applyHeaderAndSearchFilter();
         }
-
 
         // Fill header dropdown with unique Header values from filteredByDate
         function populateHeaders() {

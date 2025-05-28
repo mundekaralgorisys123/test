@@ -1,6 +1,8 @@
 import asyncio
 import re
 import os
+import traceback
+from typing import List
 import uuid
 import logging
 import base64
@@ -18,12 +20,15 @@ from playwright.async_api import async_playwright, TimeoutError, Error
 from utils import get_public_ip, log_event, sanitize_filename
 from database import insert_into_db
 from limit_checker import update_product_count
-import json
-import mimetypes
-from proxysetup import get_browser_with_proxy_strategy
+
+# from proxysetup import get_browser_with_proxy_strategy
 # Load environment
 load_dotenv()
 PROXY_URL = os.getenv("PROXY_URL")
+
+PROXY_SERVER = os.getenv("PROXY_SERVER")
+PROXY_USERNAME = os.getenv("PROXY_USERNAME")
+PROXY_PASSWORD = os.getenv("PROXY_PASSWORD")
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
@@ -67,37 +72,186 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
 def random_delay(min_sec=1, max_sec=3):
     time.sleep(random.uniform(min_sec, max_sec))
 
-# Scroll to bottom of page to load all products
-async def scroll_to_bottom(page):
-    last_height = await page.evaluate("document.body.scrollHeight")
-    while True:
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await asyncio.sleep(random.uniform(1, 3))  # Random delay between scrolls
-        
-        # Check if we've reached the bottom
-        new_height = await page.evaluate("document.body.scrollHeight")
-        if new_height == last_height:
-            break
-        last_height = new_height
 
-# Reliable page.goto wrapper
-async def safe_goto_and_wait(page, url, retries=3):
+
+
+async def safe_goto_and_wait(page, url,isbri_data, retries=2):
     for attempt in range(retries):
         try:
             print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-            await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-            await page.wait_for_selector(".small-product-grid", state="attached", timeout=30000)
-            print("[Success] Product listing loaded.")
-            return
-        except (Error, TimeoutError) as e:
-            logging.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
-            if attempt < retries - 1:
-                random_delay(1, 3)
+            
+            if isbri_data:
+                await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
             else:
+                await page.goto(url, wait_until="networkidle", timeout=180_000)
+
+            # Wait for the selector with a longer timeout
+            product_cards = await page.wait_for_selector(".sc-8ae8284e-0.bGimDX", state="attached", timeout=30000)
+
+            # Optionally validate at least 1 is visible (Playwright already does this)
+            if product_cards:
+                print("[Success] Product cards loaded.")
+                return
+        except Error as e:
+            logging.error(f"Error navigating to {url} on attempt {attempt + 1}: {e}")
+            if attempt < retries - 1:
+                logging.info("Retrying after waiting a bit...")
+                random_delay(1, 3)  # Add a delay before retrying
+            else:
+                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
+                raise
+        except TimeoutError as e:
+            logging.warning(f"TimeoutError on attempt {attempt + 1} navigating to {url}: {e}")
+            if attempt < retries - 1:
+                logging.info("Retrying after waiting a bit...")
+                random_delay(1, 3)  # Add a delay before retrying
+            else:
+                logging.error(f"Failed to navigate to {url} after {retries} attempts.")
                 raise
 
+
+########################################  get browser with proxy ####################################################################
+      
+
+async def get_browser_with_proxy_strategy(p, url: str):
+    """
+    Dynamically checks robots.txt and selects proxy accordingly
+    Always uses proxies - never scrapes directly
+    """
+    parsed_url = httpx.URL(url)
+    base_url = f"{parsed_url.scheme}://{parsed_url.host}"
+    
+    # 1. Fetch and parse robots.txt
+    disallowed_patterns = await get_robots_txt_rules(base_url)
+    
+    # 2. Check if URL matches any disallowed pattern
+    is_disallowed = check_url_against_rules(str(parsed_url), disallowed_patterns)
+    
+    # 3. Try proxies in order (bri-data first if allowed, oxylabs if disallowed)
+    proxies_to_try = [
+        PROXY_URL if not is_disallowed else {
+            "server": PROXY_SERVER,
+            "username": PROXY_USERNAME,
+            "password": PROXY_PASSWORD
+        },
+        {  # Fallback to the other proxy
+            "server": PROXY_SERVER,
+            "username": PROXY_USERNAME,
+            "password": PROXY_PASSWORD
+        } if not is_disallowed else PROXY_URL
+    ]
+
+    last_error = None
+    for proxy_config in proxies_to_try:
+        browser = None
+        try:
+            isbri_data = False
+            if proxy_config == PROXY_URL:
+                logging.info("Attempting with bri-data proxy (allowed by robots.txt)")
+                browser = await p.chromium.connect_over_cdp(PROXY_URL)
+                isbri_data = True
+            else:
+                logging.info("Attempting with oxylabs proxy (required by robots.txt)")
+                browser = await p.chromium.launch(
+                    proxy=proxy_config,
+                    headless=True,  # You can toggle to False for debugging
+                    args=[
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-web-security',
+                        '--no-sandbox',
+                        '--disable-dev-shm-usage'
+                    ]
+                )
+
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800},
+                locale="en-US",
+            )
+
+            # Stealth: Hide navigator.webdriver
+            await context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+            """)
+
+            page = await context.new_page()
+
+            await safe_goto_and_wait(page, url, isbri_data)
+            return browser, page
+
+        except Exception as e:
+            last_error = e
+            error_trace = traceback.format_exc()
+            logging.error(f"Proxy attempt failed:\n{error_trace}")
+            if browser:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass  # Don't raise new exception during cleanup
+            continue
+
+
+    error_msg = (f"Failed to load {url} using all proxy options. "
+                f"Last error: {str(last_error)}\n"
+                f"URL may be disallowed by robots.txt or proxies failed.")
+    logging.error(error_msg)
+    raise RuntimeError(error_msg)
+
+
+
+
+
+
+async def get_robots_txt_rules(base_url: str) -> List[str]:
+    """Dynamically fetch and parse robots.txt rules"""
+    robots_url = f"{base_url}/robots.txt"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(robots_url, timeout=10)
+            if resp.status_code == 200:
+                return [
+                    line.split(":", 1)[1].strip()
+                    for line in resp.text.splitlines()
+                    if line.lower().startswith("disallow:")
+                ]
+    except Exception as e:
+        logging.warning(f"Couldn't fetch robots.txt: {e}")
+    return []
+
+
+def check_url_against_rules(url: str, disallowed_patterns: List[str]) -> bool:
+    """Check if URL matches any robots.txt disallowed pattern"""
+    for pattern in disallowed_patterns:
+        try:
+            # Handle wildcard patterns
+            if "*" in pattern:
+                regex_pattern = pattern.replace("*", ".*")
+                if re.search(regex_pattern, url):
+                    return True
+            # Handle path patterns
+            elif url.startswith(f"{pattern}"):
+                return True
+            # Handle query parameters
+            elif ("?" in url) and any(
+                f"{param}=" in url 
+                for param in pattern.split("=")[0].split("*")[-1:]
+                if "=" in pattern
+            ):
+                return True
+        except Exception as e:
+            logging.warning(f"Error checking pattern {pattern}: {e}")
+    return False
+
+
+def build_url_with_loadmore(base_url: str, page_count: int) -> str:
+    separator = '?' if '?' in base_url else '?'
+    return f"{base_url}{separator}page={page_count}"     
+
 # Main scraper function
-async def handle_vrai(url, max_pages=None):
+async def handle_vrai(url, max_pages):
     ip_address = get_public_ip()
     logging.info(f"Scraping started for: {url} from IP: {ip_address}")
 
@@ -119,12 +273,17 @@ async def handle_vrai(url, max_pages=None):
     load_more_clicks = 1
     
     while load_more_clicks <= max_pages:
+        current_url = build_url_with_loadmore(url, load_more_clicks)
         browser = None
         page = None
         try:
             async with async_playwright() as p:
-                browser, page = await get_browser_with_proxy_strategy(p, url, ".small-product-grid")
-                log_event(f"Successfully loaded: {url}")
+                # product_wrapper = ".small-product-grid"
+                # browser, page = await get_browser_with_proxy_strategy(p, current_url, product_wrapper)
+                # browser, page = await get_browser_with_proxy_strategy(p, url, ".small-product-grid")
+                browser, page = await get_browser_with_proxy_strategy(p, current_url)
+                log_event(f"Successfully loaded: {current_url}")
+                
 
                 try:
                     # Handle overlay if present
@@ -146,8 +305,8 @@ async def handle_vrai(url, max_pages=None):
                 except Exception as e:
                     log_event(f"Error handling overlay: {e}. Continuing anyway...")
 
-                # Scroll to load all items
-                await scroll_to_bottom(page)
+                # # Scroll to load all items
+                # await scroll_to_bottom(page)
                 
                 page_title = await page.title()
                 current_date = datetime.now().strftime("%Y-%m-%d")
@@ -156,9 +315,9 @@ async def handle_vrai(url, max_pages=None):
                 # Get all product tiles
                 product_wrapper = await page.query_selector("div.small-product-grid")
                 products = await page.query_selector_all("div.plp-product-item") if product_wrapper else []
-                max_prod = len(products)
-                products = products[prev_prod_count: min(max_prod, prev_prod_count + 30)]
-                prev_prod_count += len(products)
+                # max_prod = len(products)
+                # products = products[prev_prod_count: min(max_prod, prev_prod_count + 30)]
+                # prev_prod_count += len(products)
 
                 if len(products) == 0:
                     log_event("No new products found, stopping the scraper.")
@@ -171,24 +330,28 @@ async def handle_vrai(url, max_pages=None):
                 
                 for row_num, product in enumerate(products, start=len(sheet["A"]) + 1):
                     additional_info = []
+                    product_name = "N/A"
                     try:
-                        # Extract product name
-                        name_tag = await product.query_selector(".title-m")
-                        product_name = (await name_tag.inner_text()).strip() if name_tag else "N/A"
+                        # Try selecting by the full class string (if it's unique enough)
+                        name_tag = await product.query_selector(".body-m.md\\:title-m")
+                        if not name_tag:
+                            # Fallback: partial class match if full selector fails
+                            name_tag = await product.query_selector(".title-m")
+                        if name_tag:
+                            product_name = (await name_tag.inner_text()).strip()
                     except Exception:
                         product_name = "N/A"
+
 
                     # Price handling
                     price = "N/A"
                     try:
-                        # Extract price element
-                        price_tag = await product.query_selector(".body-m")
+                        # Properly target element with all the required classes
+                        price_tag = await product.query_selector(".mendes.text-content-primary-mid.body-m")
                         if price_tag:
                             price_text = (await price_tag.inner_text()).strip()
-                            # Clean up price string
                             price_text = re.sub(r'\s+', ' ', price_text).strip()
                             
-                            # Check if it's a "From" price
                             if price_text.startswith("From"):
                                 price = price_text.replace("From", "").strip()
                                 additional_info.append("Multiple price points available")
@@ -196,6 +359,7 @@ async def handle_vrai(url, max_pages=None):
                                 price = price_text
                     except Exception:
                         price = "N/A"
+
 
                     # Extract product description and style info
                     description = product_name
@@ -309,12 +473,21 @@ async def handle_vrai(url, max_pages=None):
             if page: await page.close()
             if browser: await browser.close()
 
+    if not records:
+        return None, None, None
+
+        # Save the workbook
     wb.save(file_path)
     log_event(f"Data saved to {file_path}")
+
+    # Encode the file in base64
     with open(file_path, "rb") as file:
         base64_encoded = base64.b64encode(file.read()).decode("utf-8")
 
-    insert_into_db(all_records)
-    update_product_count(len(all_records))
+    # Insert data into the database and update product count
+    insert_into_db(records)
+    update_product_count(len(records))
 
+    # Return necessary information
     return base64_encoded, filename, file_path
+

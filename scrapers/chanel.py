@@ -39,6 +39,79 @@ EXCEL_DATA_PATH = os.path.join(BASE_DIR, 'static', 'ExcelData')
 IMAGE_SAVE_PATH = os.path.join(BASE_DIR, 'static', 'Images')
 
 
+# async def download_image_async(image_url, product_name, timestamp, image_folder, unique_id, retries=3):
+#     if not image_url or image_url.strip().lower() == "n/a":
+#         return "N/A"
+
+#     try:
+#         parsed_url = urlparse(image_url)
+#         if not all([parsed_url.scheme, parsed_url.netloc]):
+#             logging.error(f"Invalid URL format for {product_name}: {image_url}")
+#             return "N/A"
+#     except Exception as e:
+#         logging.error(f"URL parsing failed for {product_name}: {str(e)}")
+#         return "N/A"
+
+#     headers = {
+#         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+#         "Accept": "image/webp,image/apng,image/*,*/*;q=0.8"
+#     }
+
+#     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=30.0)) as client:
+#         for attempt in range(1, retries + 1):
+#             try:
+#                 response = await client.get(image_url, headers=headers, follow_redirects=True)
+                
+#                 if response.status_code != 200:
+#                     raise httpx.HTTPStatusError(f"Bad status code: {response.status_code}", request=response.request, response=response)
+
+#                 content_type = response.headers.get("Content-Type", "")
+#                 if "image" not in content_type:
+#                     raise ValueError(f"Unexpected content type: {content_type}")
+
+#                 # Determine extension
+#                 if "webp" in content_type:
+#                     extension = ".jpg"  # we'll convert
+#                 elif "jpeg" in content_type or "jpg" in content_type:
+#                     extension = ".jpg"
+#                 elif "png" in content_type:
+#                     extension = ".png"
+#                 else:
+#                     extension = ".jpg"  # fallback
+                
+#                 image_filename = f"{unique_id}_{timestamp}{extension}"
+#                 image_full_path = os.path.join(image_folder, image_filename)
+
+#                 if "webp" in content_type:
+#                     # Convert webp to jpg
+#                     image = Image.open(io.BytesIO(response.content)).convert("RGB")
+#                     await asyncio.to_thread(image.save, image_full_path, format="JPEG", quality=90)
+#                 else:
+#                     async with aiofiles.open(image_full_path, "wb") as f:
+#                         await f.write(response.content)
+
+#                 if os.path.exists(image_full_path) and os.path.getsize(image_full_path) > 0:
+#                     logging.info(f"Successfully downloaded {product_name}")
+#                     return image_full_path
+#                 raise IOError("Empty file or write failure")
+
+#             except (httpx.RequestError, httpx.HTTPStatusError, IOError, ValueError) as e:
+#                 logging.warning(
+#                     f"Retry {attempt}/{retries} - Error downloading {product_name}: "
+#                     f"{type(e).__name__}: {str(e)} | URL: {image_url}"
+#                 )
+
+#                 if attempt < retries:
+#                     await asyncio.sleep(2 ** (attempt - 1))
+
+#                 if isinstance(e, httpx.HTTPStatusError):
+#                     logging.debug(f"Response headers: {e.response.headers}")
+#                     logging.debug(f"Response text: {e.response.text[:200]}")
+
+#     logging.error(f"Permanent failure downloading {product_name} after {retries} attempts")
+#     return "N/A"
+
+
 async def download_image_async(image_url, product_name, timestamp, image_folder, unique_id, retries=3):
     if not image_url or image_url.strip().lower() == "n/a":
         return "N/A"
@@ -61,7 +134,7 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
         for attempt in range(1, retries + 1):
             try:
                 response = await client.get(image_url, headers=headers, follow_redirects=True)
-                
+
                 if response.status_code != 200:
                     raise httpx.HTTPStatusError(f"Bad status code: {response.status_code}", request=response.request, response=response)
 
@@ -69,30 +142,27 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
                 if "image" not in content_type:
                     raise ValueError(f"Unexpected content type: {content_type}")
 
-                # Determine extension
+                # Determine the file extension based on content type
                 if "webp" in content_type:
-                    extension = ".jpg"  # we'll convert
+                    extension = ".webp"
                 elif "jpeg" in content_type or "jpg" in content_type:
                     extension = ".jpg"
                 elif "png" in content_type:
                     extension = ".png"
                 else:
-                    extension = ".jpg"  # fallback
-                
+                    extension = ".img"  # fallback for unknown types
+
                 image_filename = f"{unique_id}_{timestamp}{extension}"
                 image_full_path = os.path.join(image_folder, image_filename)
 
-                if "webp" in content_type:
-                    # Convert webp to jpg
-                    image = Image.open(io.BytesIO(response.content)).convert("RGB")
-                    await asyncio.to_thread(image.save, image_full_path, format="JPEG", quality=90)
-                else:
-                    async with aiofiles.open(image_full_path, "wb") as f:
-                        await f.write(response.content)
+                # Save image as-is without any conversion
+                async with aiofiles.open(image_full_path, "wb") as f:
+                    await f.write(response.content)
 
                 if os.path.exists(image_full_path) and os.path.getsize(image_full_path) > 0:
                     logging.info(f"Successfully downloaded {product_name}")
                     return image_full_path
+
                 raise IOError("Empty file or write failure")
 
             except (httpx.RequestError, httpx.HTTPStatusError, IOError, ValueError) as e:
@@ -110,6 +180,10 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
 
     logging.error(f"Permanent failure downloading {product_name} after {retries} attempts")
     return "N/A"
+
+
+
+
 
 def random_delay(min_sec=1, max_sec=3):
     """Introduce a random delay to mimic human-like behavior."""
@@ -129,7 +203,7 @@ async def safe_goto_and_wait(page, url,isbri_data, retries=2):
                 await page.goto(url, wait_until="domcontentloaded", timeout=180_000)
 
             # Wait for the selector with a longer timeout
-            product_cards = await page.wait_for_selector(".pdp-grid__main.pdp-desktop", state="attached", timeout=30000)
+            product_cards = await page.wait_for_selector(".pdp-grid__row", state="attached", timeout=30000)
 
             # Optionally validate at least 1 is visible (Playwright already does this)
             if product_cards:
@@ -155,79 +229,59 @@ async def safe_goto_and_wait(page, url,isbri_data, retries=2):
 
 ########################################  get browser with proxy ####################################################################
       
-
 async def get_browser_with_proxy_strategy(p, url: str):
     """
-    Dynamically checks robots.txt and selects proxy accordingly
-    Always uses proxies - never scrapes directly
+    Always use Oxylabs proxy (ignore robots.txt)
     """
     parsed_url = httpx.URL(url)
-    base_url = f"{parsed_url.scheme}://{parsed_url.host}"
-    
-    # 1. Fetch and parse robots.txt
-    disallowed_patterns = await get_robots_txt_rules(base_url)
-    
-    # 2. Check if URL matches any disallowed pattern
-    is_disallowed = check_url_against_rules(str(parsed_url), disallowed_patterns)
-    
-    # 3. Try proxies in order (bri-data first if allowed, oxylabs if disallowed)
-    proxies_to_try = [
-        PROXY_URL if not is_disallowed else {
-            "server": PROXY_SERVER,
-            "username": PROXY_USERNAME,
-            "password": PROXY_PASSWORD
-        },
-        {  # Fallback to the other proxy
-            "server": PROXY_SERVER,
-            "username": PROXY_USERNAME,
-            "password": PROXY_PASSWORD
-        } if not is_disallowed else PROXY_URL
-    ]
+    # Oxylabs proxy config (replace with your actual Oxylabs proxy details)
+    proxy_config = {
+        "server": PROXY_SERVER,
+        "username": PROXY_USERNAME,
+        "password": PROXY_PASSWORD
+    }
 
-    last_error = None
-    for proxy_config in proxies_to_try:
-        browser = None
-        try:
-            isbri_data = False
-            if proxy_config == PROXY_URL:
-                logging.info("Attempting with bri-data proxy (allowed by robots.txt)")
-                browser = await p.chromium.connect_over_cdp(PROXY_URL)
-                isbri_data = True
-            else:
-                logging.info("Attempting with oxylabs proxy (required by robots.txt)")
-                browser = await p.chromium.launch(
-                    proxy=proxy_config,
-                    headless=False,
-                    args=[
-                        '--disable-blink-features=AutomationControlled',
-                        '--disable-web-security'
-                    ]
-                )
+    try:
+        logging.info("Using Oxylabs proxy for all requests")
 
-            context = await browser.new_context()
-            await context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                })
-            """)
-            page = await context.new_page()
-            
-            await safe_goto_and_wait(page, url,isbri_data)
-            return browser, page
+        browser = await p.chromium.launch(
+            proxy=proxy_config,
+            headless=True,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--disable-web-security',
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-http2',  # ✅ attempt to avoid HTTP2 protocol errors
+                '--ignore-certificate-errors',  # ✅ if SSL issues are involved
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--log-level=0',  # ✅ lower level logging to debug more
+            ]
+        )
 
-        except Exception as e:
-            last_error = e
-            error_trace = traceback.format_exc()
-            logging.error(f"Proxy attempt failed:\n{error_trace}")
-            if browser:
-                await browser.close()
-            continue
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800},
+            locale="en-US",
+        )
 
-    error_msg = (f"Failed to load {url} using all proxy options. "
-                f"Last error: {str(last_error)}\n"
-                f"URL may be disallowed by robots.txt or proxies failed.")
-    logging.error(error_msg)
-    raise RuntimeError(error_msg)
+        # Stealth: Hide navigator.webdriver
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+        """)
+
+        page = await context.new_page()
+
+        await safe_goto_and_wait(page, url, isbri_data=False)
+        return browser, page
+
+    except Exception as e:
+        error_trace = traceback.format_exc()
+        logging.error(f"Failed to launch browser with Oxylabs proxy:\n{error_trace}")
+        raise RuntimeError(f"Oxylabs proxy failed for {url}: {e}")
 
 
 
@@ -275,27 +329,21 @@ def check_url_against_rules(url: str, disallowed_patterns: List[str]) -> bool:
 
 def build_url_with_loadmore(base_url: str, page_count: int) -> str:
     parsed_url = urlparse(base_url)
-    path = parsed_url.path
+    path = parsed_url.path.rstrip('/')  # remove trailing slash for uniform handling
     query = parse_qs(parsed_url.query)
 
     page_str = f"page-{page_count}"
 
-    # Update path pagination regardless of query
-    if '/page-' in path:
-        # Replace existing /page-x with new page
+    # If page already exists in the path, replace it
+    if re.search(r'/page-\d+', path):
         path = re.sub(r'/page-\d+', f'/{page_str}', path)
     else:
-        # Append /page-x/ if not already present
-        if not path.endswith('/'):
-            path += '/'
-        path += f"{page_str}/"
+        path += f'/{page_str}'
 
-    # If it's a filter URL (has ?q=...), don't touch query except preserve it
+    # Reconstruct the query
     new_query = urlencode(query, doseq=True)
 
-    return urlunparse(parsed_url._replace(path=path, query=new_query))
-
-
+    return urlunparse(parsed_url._replace(path=path + '/', query=new_query))
 
 
 
@@ -334,19 +382,19 @@ async def handle_chanel(url, max_pages):
         
         try:
             async with async_playwright() as p:
-                product_wrapper = '.pdp-grid__main.pdp-desktop'
+                product_wrapper = '.pdp-grid__main'
                 browser, page = await get_browser_with_proxy_strategy(p, current_url)
                 log_event(f"Successfully loaded: {current_url}")
 
                 # Scroll to load all products
-                prev_product_count = 0
-                for _ in range(10):
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await asyncio.sleep(random.uniform(1, 2))  # Random delay between scrolls
-                    current_product_count = await page.locator('.product-grid__item').count()
-                    if current_product_count == prev_product_count:
-                        break
-                    prev_product_count = current_product_count
+                # prev_product_count = 0
+                # for _ in range(10):
+                #     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                #     await asyncio.sleep(random.uniform(1, 2))  # Random delay between scrolls
+                #     current_product_count = await page.locator('.product-grid__item').count()
+                #     if current_product_count == prev_product_count:
+                #         break
+                #     prev_product_count = current_product_count
 
 
                 products = await page.query_selector_all(".product-grid__item.js-product-edito")
@@ -445,6 +493,9 @@ async def handle_chanel(url, max_pages):
                     image_tasks.append((row_num, unique_id, asyncio.create_task(
                         download_image_async(image_url, product_name, timestamp, image_folder, unique_id)
                     )))
+                    
+                    product_name = f"{product_name} {kt}"
+
 
                     records.append((unique_id, current_date, page_title, product_name, None, kt, price, diamond_weight,additional_info_str))
                     sheet.append([current_date, page_title, product_name, None, kt, price, diamond_weight, time_only, image_url,additional_info_str])
@@ -452,42 +503,20 @@ async def handle_chanel(url, max_pages):
                 # Process images and update records
                 for row_num, unique_id, task in image_tasks:
                     try:
-                        # Download image asynchronously with timeout
                         image_path = await asyncio.wait_for(task, timeout=60)
-                        
                         if image_path != "N/A":
                             try:
-                                # Open the image using PIL for processing
-                                pil_image = PILImage.open(image_path)
-                                
-                                # Resize the image if needed
-                                pil_image = pil_image.resize((100, 100))
-
-                                # Save the processed image temporarily to a new file
-                                # temp_image_path = f"temp_{unique_id}.jpg"
-                               
-                                
-                                image_filename = f"temp_{unique_id}.jpg"
-                                image_full_path = os.path.join(image_folder, image_filename)
-                                pil_image.save(image_full_path, format="JPEG", quality=90)
-                                
-                                
-
-                                # Use openpyxl's Image to add the image to Excel
-                                img = ExcelImage(image_full_path)  # This uses openpyxl.drawing.image.Image for Excel
-                                img.width, img.height = 100, 100  # Resize for Excel
-                                sheet.add_image(img, f"D{row_num}")  # Insert the image into the Excel sheet
-                                
+                                img = Image(image_path)
+                                img.width, img.height = 100, 100
+                                sheet.add_image(img, f"D{row_num}")
                             except Exception as img_error:
                                 logging.error(f"Error adding image to Excel: {img_error}")
                                 image_path = "N/A"
-
-                        # Update the records with the image path
+                        
                         for i, record in enumerate(records):
                             if record[0] == unique_id:
                                 records[i] = (record[0], record[1], record[2], record[3], image_path, record[5], record[6], record[7], record[8])
                                 break
-
                     except asyncio.TimeoutError:
                         logging.warning(f"Timeout downloading image for row {row_num}")
 

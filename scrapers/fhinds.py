@@ -68,22 +68,6 @@ async def download_image_async(image_url, product_name, timestamp, image_folder,
 def random_delay(min_sec=1, max_sec=3):
     time.sleep(random.uniform(min_sec, max_sec))
 
-# Reliable page.goto wrapper
-# async def safe_goto_and_wait(page, url, retries=3):
-#     for attempt in range(retries):
-#         try:
-#             print(f"[Attempt {attempt + 1}] Navigating to: {url}")
-#             await page.goto(url, timeout=180_000, wait_until="domcontentloaded")
-#             await page.wait_for_selector(".product-display-box", state="attached", timeout=30000)
-#             print("[Success] Product cards loaded.")
-#             return
-#         except (Error, TimeoutError) as e:
-#             logging.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
-#             if attempt < retries - 1:
-#                 await asyncio.sleep(random.uniform(1, 3))
-#             else:
-#                 raise
-
 
 ########################################  safe_goto_and_wait ####################################################################
 

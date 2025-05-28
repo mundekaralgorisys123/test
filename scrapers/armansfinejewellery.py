@@ -10,7 +10,6 @@ from datetime import datetime
 from playwright.async_api import async_playwright, TimeoutError, Error
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image
-from flask import Flask
 from PIL import Image as PILImage
 from utils import get_public_ip, log_event, sanitize_filename
 from dotenv import load_dotenv
